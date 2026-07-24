@@ -12,8 +12,11 @@ import { ArkTeamError } from "./errors.js";
 import { assertManagedWorkspace } from "./managed-session.js";
 import {
   type CreateAssignmentInput,
+  type CorrectAssignmentInput,
   type ListAssignmentsInput,
+  type RequestAssignmentRetryInput,
   type ResumeAssignmentInput,
+  type RetryAssignmentInput,
   RunStore,
 } from "./state-store.js";
 
@@ -30,6 +33,8 @@ export interface ManagedAssignmentSchedulerOptions {
   session_factory?: () => ApprovalSessionHandle;
   codex_path?: string;
 }
+
+export type RetryDecision = "retry_once" | "cancel_run";
 
 interface LiveAssignment {
   run_id: string;
@@ -65,41 +70,7 @@ export class ManagedAssignmentScheduler {
       working_directory: workingDirectory,
     });
 
-    let session: ApprovalSessionHandle;
-    try {
-      session = this.sessionFactory();
-    } catch (error) {
-      await this.recordSessionFailure(assignment, error);
-      throw sessionFailure("Unable to create a managed assignment session", error);
-    }
-    this.liveAssignments.set(assignment.assignment_id, {
-      run_id: assignment.run_id,
-      session,
-    });
-
-    try {
-      const update = await session.start({
-        role: assignment.role,
-        assignment: assignment.assignment,
-        working_directory: assignment.working_directory,
-        ...(assignment.output_contract === null
-          ? {}
-          : { output_contract: assignment.output_contract }),
-      });
-      const persisted = await this.store.recordAssignmentUpdate(
-        assignment.run_id,
-        assignment.assignment_id,
-        update,
-      );
-      if (persisted.state !== "waiting_user") {
-        this.liveAssignments.delete(assignment.assignment_id);
-      }
-      return persisted;
-    } catch (error) {
-      this.liveAssignments.delete(assignment.assignment_id);
-      await this.recordSessionFailure(assignment, error);
-      throw normalizeSessionFailure(error);
-    }
+    return this.launch(assignment);
   }
 
   async resume(input: ResumeAssignmentInput): Promise<AssignmentRecord> {
@@ -112,42 +83,107 @@ export class ManagedAssignmentScheduler {
       current.working_directory,
     );
     const assignment = await this.store.resumeAssignment(input);
-    let session: ApprovalSessionHandle;
-    try {
-      session = this.sessionFactory();
-    } catch (error) {
-      await this.recordSessionFailure(assignment, error);
-      throw sessionFailure("Unable to create a resumed managed session", error);
-    }
-    this.liveAssignments.set(assignment.assignment_id, {
-      run_id: assignment.run_id,
-      session,
-    });
-
-    try {
-      const update = await session.start({
-        role: assignment.role,
-        assignment: assignment.assignment,
+    return this.launch(
+      {
+        ...assignment,
         working_directory: workingDirectory,
-        ...(current.session_id === null
-          ? {}
-          : { resume_session_id: current.session_id }),
-        output_contract: input.output_contract,
-      });
-      const persisted = await this.store.recordAssignmentUpdate(
-        assignment.run_id,
-        assignment.assignment_id,
-        update,
+      },
+      current.session_id ?? undefined,
+    );
+  }
+
+  async retry(input: RetryAssignmentInput): Promise<AssignmentRecord> {
+    const current = await this.store.getAssignment(
+      input.run_id,
+      input.assignment_id,
+    );
+    const workingDirectory = await assertManagedWorkspace(
+      current.role,
+      current.working_directory,
+    );
+    const assignment = await this.store.retryAssignment(input);
+    return this.launch({
+      ...assignment,
+      working_directory: workingDirectory,
+    });
+  }
+
+  async correct(input: CorrectAssignmentInput): Promise<AssignmentRecord> {
+    const current = await this.store.getAssignment(
+      input.run_id,
+      input.assignment_id,
+    );
+    const workingDirectory = await assertManagedWorkspace(
+      current.role,
+      current.working_directory,
+    );
+    const resumeSessionId = current.session_id;
+    if (resumeSessionId === null) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "Correction requires a resumable managed session",
       );
-      if (persisted.state !== "waiting_user") {
-        this.liveAssignments.delete(assignment.assignment_id);
-      }
-      return persisted;
-    } catch (error) {
-      this.liveAssignments.delete(assignment.assignment_id);
-      await this.recordSessionFailure(assignment, error);
-      throw normalizeSessionFailure(error);
     }
+    const assignment = await this.store.correctAssignment(input);
+    return this.launch(
+      {
+        ...assignment,
+        working_directory: workingDirectory,
+      },
+      resumeSessionId,
+    );
+  }
+
+  async requestRetry(
+    input: RequestAssignmentRetryInput,
+  ): Promise<AssignmentRecord> {
+    return this.store.requestAssignmentRetry(input);
+  }
+
+  async decideRetry(
+    runId: string,
+    assignmentId: string,
+    retryRequestId: string,
+    decision: RetryDecision,
+  ): Promise<AssignmentRecord> {
+    if (decision !== "retry_once" && decision !== "cancel_run") {
+      throw new ArkTeamError("INVALID_INPUT", "invalid retry decision");
+    }
+    const current = await this.store.getAssignment(runId, assignmentId);
+    if (
+      current.state !== "waiting_user" ||
+      current.pending_retry?.retry_request_id !== retryRequestId
+    ) {
+      throw new ArkTeamError(
+        "INVALID_INPUT",
+        "retry_request_id is unknown or already resolved",
+      );
+    }
+    if (decision === "retry_once") {
+      return current.pending_retry.mode === "fresh_session"
+        ? this.retry({
+            run_id: runId,
+            assignment_id: assignmentId,
+            retry_request_id: retryRequestId,
+          })
+        : this.correct({
+            run_id: runId,
+            assignment_id: assignmentId,
+            assignment: current.assignment,
+            retry_request_id: retryRequestId,
+          });
+    }
+
+    await this.stopRun(
+      runId,
+      "cancelled",
+      "User cancelled the run after retry exhaustion",
+    );
+    await this.store.cancelRun(
+      runId,
+      "User cancelled the run after retry exhaustion",
+    );
+    return this.store.getAssignment(runId, assignmentId);
   }
 
   async decide(
@@ -218,6 +254,13 @@ export class ManagedAssignmentScheduler {
     assignmentId: string,
     reason?: string,
   ): Promise<AssignmentRecord> {
+    const current = await this.store.getAssignment(runId, assignmentId);
+    if (current.pending_retry !== null) {
+      throw new ArkTeamError(
+        "INVALID_INPUT",
+        "Use the current retry_request_id to choose retry_once or cancel_run",
+      );
+    }
     const live = this.liveAssignments.get(assignmentId);
     this.liveAssignments.delete(assignmentId);
     const assignment = await this.store.stopAssignment(
@@ -255,6 +298,50 @@ export class ManagedAssignmentScheduler {
 
   hasLiveSession(assignmentId: string): boolean {
     return this.liveAssignments.has(assignmentId);
+  }
+
+  private async launch(
+    assignment: AssignmentRecord,
+    resumeSessionId?: string,
+  ): Promise<AssignmentRecord> {
+    let session: ApprovalSessionHandle;
+    try {
+      session = this.sessionFactory();
+    } catch (error) {
+      await this.recordSessionFailure(assignment, error);
+      throw sessionFailure("Unable to create a managed assignment session", error);
+    }
+    this.liveAssignments.set(assignment.assignment_id, {
+      run_id: assignment.run_id,
+      session,
+    });
+
+    try {
+      const update = await session.start({
+        role: assignment.role,
+        assignment: assignment.assignment,
+        working_directory: assignment.working_directory,
+        ...(resumeSessionId === undefined
+          ? {}
+          : { resume_session_id: resumeSessionId }),
+        ...(assignment.output_contract === null
+          ? {}
+          : { output_contract: assignment.output_contract }),
+      });
+      const persisted = await this.store.recordAssignmentUpdate(
+        assignment.run_id,
+        assignment.assignment_id,
+        update,
+      );
+      if (persisted.state !== "waiting_user") {
+        this.liveAssignments.delete(assignment.assignment_id);
+      }
+      return persisted;
+    } catch (error) {
+      this.liveAssignments.delete(assignment.assignment_id);
+      await this.recordSessionFailure(assignment, error);
+      throw normalizeSessionFailure(error);
+    }
   }
 
   private async recordSessionFailure(

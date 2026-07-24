@@ -177,6 +177,11 @@ the same turn only after the user selects one-time approval, session approval,
 decline, or cancel. Treat an expired, unknown, or already resolved approval ID
 as an error instead of replaying the decision.
 
+Treat retry exhaustion as a separate `waiting_user` decision, not a dangerous
+action approval. Show its counters and redacted failure reason, then accept
+only `retry_once` or `cancel_run` through the opaque retry request. Never route
+a retry request through the command/file approval channel.
+
 ## Failure, timeout, and cancellation policy
 
 - Permit two worker correction rounds.

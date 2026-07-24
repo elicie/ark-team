@@ -29,6 +29,8 @@ import {
   type RunLogsResult,
   type RunRecord,
   type RunState,
+  type RetryMode,
+  type RetryRequestKind,
   type TeamListResult,
   type TeamRecord,
   type TransitionResult,
@@ -86,6 +88,28 @@ export interface ResumeAssignmentInput {
   assignment_id: string;
   assignment: string;
   output_contract: "pl_report";
+}
+
+export interface CorrectAssignmentInput {
+  run_id: string;
+  assignment_id: string;
+  assignment: string;
+  retry_request_id?: string;
+}
+
+export interface RetryAssignmentInput {
+  run_id: string;
+  assignment_id: string;
+  retry_request_id?: string;
+}
+
+export interface RequestAssignmentRetryInput {
+  run_id: string;
+  assignment_id: string;
+  kind: RetryRequestKind;
+  mode: RetryMode;
+  reason: string;
+  assignment?: string;
 }
 
 export interface ListAssignmentsInput {
@@ -862,6 +886,7 @@ export class RunStore {
         session_id: null,
         turn_id: null,
         pending_approval: null,
+        pending_retry: null,
         final_report: null,
         structured_report: null,
         usage: null,
@@ -871,6 +896,8 @@ export class RunStore {
         updated_at: timestamp,
         revision: 1,
         turn_count: 1,
+        session_attempt_count: 1,
+        correction_count: 0,
       };
       const nextState =
         persisted.run.state === "waiting_user" ? "waiting_user" : "executing";
@@ -967,6 +994,7 @@ export class RunStore {
         state: "running",
         turn_id: null,
         pending_approval: null,
+        pending_retry: null,
         final_report: null,
         structured_report: null,
         usage: null,
@@ -975,6 +1003,7 @@ export class RunStore {
         updated_at: timestamp,
         revision: current.revision + 1,
         turn_count: current.turn_count + 1,
+        correction_count: 0,
       };
       const assignments = persisted.assignments.map((candidate) =>
         candidate.assignment_id === assignment.assignment_id
@@ -1005,6 +1034,300 @@ export class RunStore {
           nextState === "waiting_user"
             ? persisted.run.resume_state ?? "executing"
             : null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+      });
+      return assignment;
+    });
+  }
+
+  async correctAssignment(
+    input: CorrectAssignmentInput,
+  ): Promise<AssignmentRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(input.run_id);
+      assertRunAcceptsAssignments(persisted.run.state);
+      const current = findAssignment(persisted, input.assignment_id);
+      const retryRequest = current.pending_retry;
+      const explicitRetry = input.retry_request_id !== undefined;
+      if (
+        explicitRetry
+          ? current.state !== "waiting_user" ||
+            retryRequest?.retry_request_id !== input.retry_request_id ||
+            retryRequest?.mode !== "resume_session"
+          : current.state !== "completed"
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Correction requires a completed report or its current resume retry request",
+        );
+      }
+      if (
+        current.output_contract === null ||
+        current.structured_report === null ||
+        current.session_id === null
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Correction requires a structured report and resumable session",
+        );
+      }
+      const assignmentText = input.assignment.trim();
+      if (!assignmentText) {
+        throw new ArkTeamError("INVALID_INPUT", "assignment must not be empty");
+      }
+
+      const timestamp = this.now().toISOString();
+      const assignment: AssignmentRecord = {
+        ...current,
+        assignment: assignmentText,
+        state: "running",
+        turn_id: null,
+        pending_approval: null,
+        pending_retry: null,
+        final_report: null,
+        structured_report: null,
+        usage: null,
+        failure_message: null,
+        report_routed_at: null,
+        updated_at: timestamp,
+        revision: current.revision + 1,
+        turn_count: current.turn_count + 1,
+        correction_count: current.correction_count + 1,
+      };
+      const assignments = persisted.assignments.map((candidate) =>
+        candidate.assignment_id === assignment.assignment_id
+          ? assignment
+          : candidate,
+      );
+      const nextState = assignments.some(
+        (candidate) => candidate.state === "waiting_user",
+      )
+        ? "waiting_user"
+        : persisted.run.state === "waiting_user"
+          ? persisted.run.resume_state ?? "executing"
+          : "executing";
+      const events = retryAttemptEvents({
+        persisted,
+        assignment,
+        timestamp,
+        next_state: nextState,
+        event_type: "assignment.correction",
+        message: `${assignment.role} assignment resumed for correction`,
+        ...(explicitRetry
+          ? { retry_request_id: input.retry_request_id }
+          : {}),
+        ...(retryRequest === null ? {} : { retry_kind: retryRequest.kind }),
+      });
+      const run: RunRecord = {
+        ...persisted.run,
+        state: nextState,
+        resume_state:
+          nextState === "waiting_user"
+            ? persisted.run.resume_state ?? "executing"
+            : null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + events.length,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, ...events],
+        assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+      });
+      return assignment;
+    });
+  }
+
+  async retryAssignment(
+    input: RetryAssignmentInput,
+  ): Promise<AssignmentRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(input.run_id);
+      assertRunAcceptsAssignments(persisted.run.state);
+      const current = findAssignment(persisted, input.assignment_id);
+      const retryRequest = current.pending_retry;
+      const explicitRetry = input.retry_request_id !== undefined;
+      if (
+        explicitRetry
+          ? current.state !== "waiting_user" ||
+            retryRequest?.retry_request_id !== input.retry_request_id ||
+            retryRequest?.mode !== "fresh_session"
+          : current.state !== "failed"
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Fresh retry requires a failed assignment or its current retry request",
+        );
+      }
+
+      const timestamp = this.now().toISOString();
+      const assignment: AssignmentRecord = {
+        ...current,
+        state: "running",
+        session_id: null,
+        turn_id: null,
+        pending_approval: null,
+        pending_retry: null,
+        final_report: null,
+        structured_report: null,
+        usage: null,
+        failure_message: null,
+        report_routed_at: null,
+        updated_at: timestamp,
+        revision: current.revision + 1,
+        turn_count: current.turn_count + 1,
+        session_attempt_count: current.session_attempt_count + 1,
+      };
+      const assignments = persisted.assignments.map((candidate) =>
+        candidate.assignment_id === assignment.assignment_id
+          ? assignment
+          : candidate,
+      );
+      const nextState = assignments.some(
+        (candidate) => candidate.state === "waiting_user",
+      )
+        ? "waiting_user"
+        : persisted.run.state === "waiting_user"
+          ? persisted.run.resume_state ?? "executing"
+          : "executing";
+      const events = retryAttemptEvents({
+        persisted,
+        assignment,
+        timestamp,
+        next_state: nextState,
+        event_type: "assignment.retrying",
+        message: `${assignment.role} assignment started in a fresh retry session`,
+        ...(explicitRetry
+          ? { retry_request_id: input.retry_request_id }
+          : {}),
+        ...(retryRequest === null ? {} : { retry_kind: retryRequest.kind }),
+      });
+      const run: RunRecord = {
+        ...persisted.run,
+        state: nextState,
+        resume_state:
+          nextState === "waiting_user"
+            ? persisted.run.resume_state ?? "executing"
+            : null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + events.length,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, ...events],
+        assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+      });
+      return assignment;
+    });
+  }
+
+  async requestAssignmentRetry(
+    input: RequestAssignmentRetryInput,
+  ): Promise<AssignmentRecord> {
+    return this.withMutation(async () => {
+      if (
+        (input.kind === "internal_failure_exhausted" &&
+          input.mode !== "fresh_session") ||
+        (input.kind === "correction_exhausted" &&
+          input.mode !== "resume_session")
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "retry request kind and mode do not match",
+        );
+      }
+      const persisted = await this.readPersistedRun(input.run_id);
+      const current = findAssignment(persisted, input.assignment_id);
+      if (
+        current.state === "waiting_user" &&
+        current.pending_retry !== null
+      ) {
+        return current;
+      }
+      if (
+        (input.mode === "fresh_session" && current.state !== "failed") ||
+        (input.mode === "resume_session" &&
+          (current.state !== "completed" ||
+            current.session_id === null ||
+            current.structured_report === null))
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Retry exhaustion does not match the assignment state",
+        );
+      }
+      const reason = input.reason.trim().slice(0, 1000);
+      if (!reason) {
+        throw new ArkTeamError("INVALID_INPUT", "retry reason must not be empty");
+      }
+      const assignmentText = input.assignment?.trim();
+      if (input.assignment !== undefined && !assignmentText) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "retry assignment must not be empty",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const retryRequestId = randomUUID();
+      const assignment: AssignmentRecord = {
+        ...current,
+        ...(assignmentText ? { assignment: assignmentText } : {}),
+        state: "waiting_user",
+        pending_approval: null,
+        pending_retry: {
+          retry_request_id: retryRequestId,
+          kind: input.kind,
+          mode: input.mode,
+          reason,
+        },
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const assignments = persisted.assignments.map((candidate) =>
+        candidate.assignment_id === assignment.assignment_id
+          ? assignment
+          : candidate,
+      );
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "assignment.retry_exhausted",
+        timestamp,
+        state: "waiting_user",
+        assignment_id: assignment.assignment_id,
+        team_id: assignment.team_id,
+        agent_role: assignment.role,
+        retry_request_id: retryRequestId,
+        retry_kind: input.kind,
+        session_attempt_count: assignment.session_attempt_count,
+        correction_count: assignment.correction_count,
+        message: reason,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        state: "waiting_user",
+        resume_state:
+          persisted.run.state === "waiting_user"
+            ? persisted.run.resume_state ?? "executing"
+            : persisted.run.state,
         updated_at: timestamp,
         revision: persisted.run.revision + 1,
         event_count: persisted.run.event_count + 1,
@@ -1111,6 +1434,7 @@ export class RunStore {
               session_id: update.session_id,
               turn_id: update.turn_id,
               pending_approval: update.approval,
+              pending_retry: null,
               updated_at: timestamp,
               revision: current.revision + 1,
             }
@@ -1120,6 +1444,7 @@ export class RunStore {
               session_id: update.session_id,
               turn_id: update.turn_id,
               pending_approval: null,
+              pending_retry: null,
               final_report: update.final_report.trim(),
               structured_report: structuredReport,
               usage: update.usage,
@@ -1411,6 +1736,7 @@ export class RunStore {
         ...current,
         state,
         pending_approval: null,
+        pending_retry: null,
         failure_message: state === "failed" ? message : null,
         updated_at: timestamp,
         revision: current.revision + 1,
@@ -1423,9 +1749,27 @@ export class RunStore {
         !assignments.some((candidate) => candidate.state === "waiting_user")
           ? persisted.run.resume_state ?? "executing"
           : persisted.run.state;
-      const event: RunEvent = {
+      const events: RunEvent[] = [];
+      if (state === "cancelled" && current.pending_retry !== null) {
+        events.push({
+          schema_version: 1,
+          sequence: 0,
+          event_id: randomUUID(),
+          event_type: "assignment.retry_resolved",
+          timestamp,
+          state: nextState,
+          assignment_id: assignment.assignment_id,
+          team_id: assignment.team_id,
+          agent_role: assignment.role,
+          retry_request_id: current.pending_retry.retry_request_id,
+          retry_kind: current.pending_retry.kind,
+          retry_decision: "cancel_run",
+          message: "User cancelled the run after retry exhaustion",
+        });
+      }
+      events.push({
         schema_version: 1,
-        sequence: persisted.run.event_count + 1,
+        sequence: 0,
         event_id: randomUUID(),
         event_type: `assignment.${state}`,
         timestamp,
@@ -1434,18 +1778,22 @@ export class RunStore {
         team_id: assignment.team_id,
         agent_role: assignment.role,
         message,
-      };
+      });
+      const sequencedEvents = events.map((event, index) => ({
+        ...event,
+        sequence: persisted.run.event_count + index + 1,
+      }));
       const updatedRun: RunRecord = {
         ...persisted.run,
         state: nextState,
         resume_state: nextState === "waiting_user" ? persisted.run.resume_state : null,
         updated_at: timestamp,
         revision: persisted.run.revision + 1,
-        event_count: persisted.run.event_count + 1,
+        event_count: persisted.run.event_count + sequencedEvents.length,
       };
       await this.writePersistedRun({
         run: updatedRun,
-        events: [...persisted.events, event],
+        events: [...persisted.events, ...sequencedEvents],
         assignments,
         teams: persisted.teams,
         plan: persisted.plan,
@@ -1571,6 +1919,56 @@ export class RunStore {
     );
     return result;
   }
+}
+
+function retryAttemptEvents(input: {
+  persisted: PersistedRun;
+  assignment: AssignmentRecord;
+  timestamp: string;
+  next_state: RunState;
+  event_type: "assignment.retrying" | "assignment.correction";
+  message: string;
+  retry_request_id?: string;
+  retry_kind?: RetryRequestKind;
+}): RunEvent[] {
+  const events: RunEvent[] = [];
+  if (input.retry_request_id !== undefined) {
+    events.push({
+      schema_version: 1,
+      sequence: 0,
+      event_id: randomUUID(),
+      event_type: "assignment.retry_resolved",
+      timestamp: input.timestamp,
+      state: input.next_state,
+      assignment_id: input.assignment.assignment_id,
+      team_id: input.assignment.team_id,
+      agent_role: input.assignment.role,
+      retry_request_id: input.retry_request_id,
+      ...(input.retry_kind === undefined
+        ? {}
+        : { retry_kind: input.retry_kind }),
+      retry_decision: "retry_once",
+      message: "User authorized one additional assignment retry",
+    });
+  }
+  events.push({
+    schema_version: 1,
+    sequence: 0,
+    event_id: randomUUID(),
+    event_type: input.event_type,
+    timestamp: input.timestamp,
+    state: input.next_state,
+    assignment_id: input.assignment.assignment_id,
+    team_id: input.assignment.team_id,
+    agent_role: input.assignment.role,
+    session_attempt_count: input.assignment.session_attempt_count,
+    correction_count: input.assignment.correction_count,
+    message: input.message,
+  });
+  return events.map((event, index) => ({
+    ...event,
+    sequence: input.persisted.run.event_count + index + 1,
+  }));
 }
 
 function invalidTransition(operation: string, state: RunState): ArkTeamError {

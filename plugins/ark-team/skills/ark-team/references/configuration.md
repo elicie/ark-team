@@ -135,6 +135,7 @@ The current bundled control-plane slice exposes these MCP tools:
 - `ark_team_assignment_list`
 - `ark_team_assignment_status`
 - `ark_team_assignment_decide`
+- `ark_team_assignment_retry_decide`
 - `ark_team_assignment_cancel`
 
 `ark_team_execute` is the managed one-call entry point: it creates the run,
@@ -175,9 +176,12 @@ team branches.
 
 Retain every assignment ID. Read `ark_team_assignment_status` or
 `ark_team_assignment_list` for stored reports and usage. When the state is
-`waiting_user`, show the pending request and call
+`waiting_user`, distinguish its request type. For `pending_approval`, call
 `ark_team_assignment_decide` only with the exact opaque approval ID and the
-user's explicit decision. Then call `ark_team_advance` to continue
+user's explicit decision. For `pending_retry`, report the reason,
+`session_attempt_count`, and `correction_count`, then call
+`ark_team_assignment_retry_decide` with its opaque ID and explicit
+`retry_once` or `cancel_run` choice. Then call `ark_team_advance` to continue
 dependency-ready work and same-thread PL reporting.
 
 The scheduler records interim PL worker plans for the controller, worker
@@ -187,6 +191,15 @@ verification. Once all teams complete, the run enters `integrating`; merge,
 cross-team verification, and cleanup are handled by a later integration stage.
 Pending approvals remain persisted but cannot yet be reattached after an MCP
 process restart.
+
+An abnormally failed internal assignment receives at most two automatic fresh
+sessions. A structurally valid but blocked, mismatched, uncommitted when
+required, or insufficiently verified report receives at most two corrective
+turns on the same session. PL plan corrections and final-report corrections
+have separate two-turn budgets. Exhaustion creates one durable
+`pending_retry`; it never silently resets a counter or continues without the
+opaque user decision. Observable retry/correction events include counters and
+usage, never raw reasoning.
 
 The bundled managed-session CLI is:
 

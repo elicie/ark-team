@@ -80,6 +80,7 @@ It currently exposes:
 - `ark_team_assignment_list`
 - `ark_team_assignment_status`
 - `ark_team_assignment_decide`
+- `ark_team_assignment_retry_decide`
 - `ark_team_assignment_cancel`
 
 Runs are stored as atomic JSON records under
@@ -109,11 +110,18 @@ worker reports. `ark_team_advance` continues that process after an approval
 decision. When all PL reports cover their workers with passing verification,
 the run enters `integrating`.
 
+Internal PL/worker session failures receive at most two automatic fresh-session
+retries. Valid but deficient plans and reports receive at most two
+same-session correction turns. Assignment records retain attempt and
+correction counters. Exhaustion creates a distinct opaque `pending_retry`;
+`ark_team_assignment_retry_decide` accepts only an explicit `retry_once` or
+`cancel_run` choice, and stale or replayed request IDs fail closed.
+
 Managed assignment records live in the same atomic run record. Each record
 retains its team and parent PL, linked worktree, state, session and turn IDs,
-task key and output contract, one pending approval, routed structured report,
-turn count, and token usage. Logs record observable state changes and usage,
-not raw model reasoning or event history.
+task key and output contract, one pending approval or retry request, routed
+structured report, attempt/correction/turn counts, and token usage. Logs record
+observable state changes and usage, not raw model reasoning or event history.
 
 The scheduler enforces one PL per team, at most four teams per run, and at most
 five workers per PL. Workers use the same team worktree and identify their
@@ -312,8 +320,9 @@ that PM-planning path from one MCP call.
 
 The runtime now dispatches independent teams and workers concurrently, gates
 dependencies, routes stored worker reports into same-session PL continuations,
-and stops with durable approval state. The next runtime slices are still
-required to apply correction and abnormal retries, integrate and verify
-commits, select local merge versus guarded remote work, clean worktrees, and
+applies bounded internal failure retries and report corrections, and stops with
+durable approval or retry-choice state. The next runtime slices are still
+required to integrate and verify commits, select local merge versus guarded
+remote work, clean worktrees, add explicit external-provider adapters, and
 reattach interrupted live sessions. The current control plane does not claim
 those remaining guarantees.

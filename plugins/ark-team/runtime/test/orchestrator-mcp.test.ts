@@ -93,11 +93,17 @@ test("TEST-805 exposes automatic PM planning and materialization through MCP", a
       },
     });
     const advancedPayload = advanced.structuredContent as
-      | { ok?: boolean; progressed?: boolean; waiting_approvals?: number }
+      | {
+          ok?: boolean;
+          progressed?: boolean;
+          waiting_approvals?: number;
+          waiting_retries?: number;
+        }
       | undefined;
     assert.equal(advancedPayload?.ok, true);
     assert.equal(advancedPayload?.progressed, false);
     assert.equal(advancedPayload?.waiting_approvals, 0);
+    assert.equal(advancedPayload?.waiting_retries, 0);
   } finally {
     await client.close();
     await server.close();
@@ -143,6 +149,7 @@ class SnapshotCoordinator implements TeamExecutionCoordinator {
       assignments: (await this.store.listAssignments(runId)).assignments,
       progressed: false,
       waiting_approvals: 0,
+      waiting_retries: 0,
     };
   }
 }

@@ -256,6 +256,7 @@ class SnapshotCoordinator implements TeamExecutionCoordinator {
       assignments: (await this.store.listAssignments(runId)).assignments,
       progressed: false,
       waiting_approvals: 0,
+      waiting_retries: 0,
     };
   }
 }

@@ -12,26 +12,55 @@ import type {
 } from "./role-contracts.js";
 import { RunStore } from "./state-store.js";
 
+const MAX_COORDINATOR_PASSES = 500;
+
 export interface TeamCoordinatorResult {
   run: RunRecord;
   teams: TeamRecord[];
   assignments: AssignmentRecord[];
   progressed: boolean;
   waiting_approvals: number;
+  waiting_retries: number;
+}
+
+export interface TeamCoordinatorOptions {
+  internal_agent_retries?: number;
+  worker_correction_rounds?: number;
+  pl_correction_rounds?: number;
 }
 
 export class TeamCoordinator {
   private operationQueue: Promise<void> = Promise.resolve();
+  private readonly internalAgentRetries: number;
+  private readonly workerCorrectionRounds: number;
+  private readonly plCorrectionRounds: number;
 
   constructor(
     private readonly store: RunStore,
     private readonly scheduler: ManagedAssignmentScheduler,
-  ) {}
+    options: TeamCoordinatorOptions = {},
+  ) {
+    this.internalAgentRetries = boundedPolicyValue(
+      options.internal_agent_retries,
+      2,
+      "internal_agent_retries",
+    );
+    this.workerCorrectionRounds = boundedPolicyValue(
+      options.worker_correction_rounds,
+      2,
+      "worker_correction_rounds",
+    );
+    this.plCorrectionRounds = boundedPolicyValue(
+      options.pl_correction_rounds,
+      2,
+      "pl_correction_rounds",
+    );
+  }
 
   async advance(runId: string): Promise<TeamCoordinatorResult> {
     return this.withOperation(async () => {
       let anyProgress = false;
-      for (let pass = 0; pass < 50; pass += 1) {
+      for (let pass = 0; pass < MAX_COORDINATOR_PASSES; pass += 1) {
         const run = await this.store.getRun(runId);
         if (run.state === "integrating") {
           break;
@@ -49,8 +78,46 @@ export class TeamCoordinator {
 
         const teams = (await this.store.listTeams(runId)).teams;
         const assignments = (await this.store.listAssignments(runId)).assignments;
-        let passProgress = false;
 
+        const failedAssignments = assignments.filter(
+          (assignment) => assignment.state === "failed",
+        );
+        if (failedAssignments.length > 0) {
+          const retryOperations: Array<() => Promise<AssignmentRecord>> = [];
+          const exhaustedOperations: Array<() => Promise<AssignmentRecord>> = [];
+          for (const assignment of failedAssignments) {
+            if (
+              assignment.session_attempt_count <= this.internalAgentRetries
+            ) {
+              retryOperations.push(
+                async () =>
+                  this.scheduler.retry({
+                    run_id: runId,
+                    assignment_id: assignment.assignment_id,
+                  }),
+              );
+            } else {
+              exhaustedOperations.push(
+                async () =>
+                  this.scheduler.requestRetry({
+                    run_id: runId,
+                    assignment_id: assignment.assignment_id,
+                    kind: "internal_failure_exhausted",
+                    mode: "fresh_session",
+                    reason: `${assignment.role} assignment exhausted ${this.internalAgentRetries} automatic internal retries: ${assignment.failure_message ?? "managed session failed"}`,
+                  }),
+              );
+            }
+          }
+          await runRetryableParallel(retryOperations);
+          await runParallel(exhaustedOperations);
+          anyProgress = true;
+          continue;
+        }
+
+        let passProgress = false;
+        const finalCorrections: Array<() => Promise<AssignmentRecord>> = [];
+        const finalExhaustions: Array<() => Promise<AssignmentRecord>> = [];
         for (const team of teams) {
           if (team.state !== "active") {
             continue;
@@ -60,28 +127,66 @@ export class TeamCoordinator {
               assignment.role === "pl" && assignment.team_id === team.team_id,
           );
           if (
-            pl?.state === "completed" &&
-            pl.output_contract === "pl_report" &&
-            pl.structured_report?.kind === "pl_report"
+            pl?.state !== "completed" ||
+            pl.output_contract !== "pl_report" ||
+            pl.structured_report?.kind !== "pl_report"
           ) {
-            assertFinalPlReport(
-              team,
-              pl.structured_report,
-              assignments.filter(
-                (assignment) =>
-                  assignment.role === "worker" &&
-                  assignment.parent_assignment_id === pl.assignment_id,
-              ),
-            );
+            continue;
+          }
+          const workers = assignments.filter(
+            (assignment) =>
+              assignment.role === "worker" &&
+              assignment.parent_assignment_id === pl.assignment_id,
+          );
+          const problem = finalPlReportProblem(
+            team,
+            pl.structured_report,
+            workers,
+          );
+          if (problem === null) {
             await this.store.completeTeam(
               runId,
               team.team_id,
               pl.assignment_id,
             );
             passProgress = true;
+            continue;
+          }
+          const correctionAssignment = buildCorrectionAssignment(
+            team,
+            pl,
+            problem,
+          );
+          if (pl.correction_count < this.plCorrectionRounds) {
+            finalCorrections.push(
+              async () =>
+                this.scheduler.correct({
+                  run_id: runId,
+                  assignment_id: pl.assignment_id,
+                  assignment: correctionAssignment,
+                }),
+            );
+          } else {
+            finalExhaustions.push(
+              async () =>
+                this.scheduler.requestRetry({
+                  run_id: runId,
+                  assignment_id: pl.assignment_id,
+                  kind: "correction_exhausted",
+                  mode: "resume_session",
+                  reason: `PL report correction budget exhausted: ${problem}`,
+                  assignment: correctionAssignment,
+                }),
+            );
           }
         }
-        if (passProgress) {
+        if (
+          passProgress ||
+          finalCorrections.length > 0 ||
+          finalExhaustions.length > 0
+        ) {
+          await runRetryableParallel(finalCorrections);
+          await runParallel(finalExhaustions);
           anyProgress = true;
           continue;
         }
@@ -100,7 +205,7 @@ export class TeamCoordinator {
             ),
         );
         if (readyTeams.length > 0) {
-          await runParallel(
+          await runRetryableParallel(
             readyTeams.map(
               (team) => async () =>
                 this.scheduler.start({
@@ -120,6 +225,135 @@ export class TeamCoordinator {
         const currentAssignments = (
           await this.store.listAssignments(runId)
         ).assignments;
+        const planCorrections: Array<() => Promise<AssignmentRecord>> = [];
+        const planExhaustions: Array<() => Promise<AssignmentRecord>> = [];
+        for (const team of refreshedTeams) {
+          if (team.state !== "active") {
+            continue;
+          }
+          const pl = currentAssignments.find(
+            (assignment) =>
+              assignment.role === "pl" && assignment.team_id === team.team_id,
+          );
+          if (
+            pl?.state !== "completed" ||
+            pl.output_contract !== "pl_worker_plan" ||
+            pl.structured_report?.kind !== "pl_worker_plan"
+          ) {
+            continue;
+          }
+          const problem = plWorkerPlanProblem(team, pl.structured_report);
+          if (problem === null) {
+            continue;
+          }
+          const correctionAssignment = buildCorrectionAssignment(
+            team,
+            pl,
+            problem,
+          );
+          if (pl.correction_count < this.plCorrectionRounds) {
+            planCorrections.push(
+              async () =>
+                this.scheduler.correct({
+                  run_id: runId,
+                  assignment_id: pl.assignment_id,
+                  assignment: correctionAssignment,
+                }),
+            );
+          } else {
+            planExhaustions.push(
+              async () =>
+                this.scheduler.requestRetry({
+                  run_id: runId,
+                  assignment_id: pl.assignment_id,
+                  kind: "correction_exhausted",
+                  mode: "resume_session",
+                  reason: `PL worker-plan correction budget exhausted: ${problem}`,
+                  assignment: correctionAssignment,
+                }),
+            );
+          }
+        }
+        if (planCorrections.length > 0 || planExhaustions.length > 0) {
+          await runRetryableParallel(planCorrections);
+          await runParallel(planExhaustions);
+          anyProgress = true;
+          continue;
+        }
+
+        const workerCorrections: Array<() => Promise<AssignmentRecord>> = [];
+        const workerExhaustions: Array<() => Promise<AssignmentRecord>> = [];
+        for (const team of refreshedTeams) {
+          const pl = currentAssignments.find(
+            (assignment) =>
+              assignment.role === "pl" &&
+              assignment.team_id === team.team_id &&
+              assignment.output_contract === "pl_worker_plan" &&
+              assignment.structured_report?.kind === "pl_worker_plan",
+          );
+          if (!pl) {
+            continue;
+          }
+          const workerPlan =
+            pl.structured_report?.kind === "pl_worker_plan"
+              ? pl.structured_report
+              : null;
+          if (workerPlan === null) {
+            continue;
+          }
+          const existingWorkers = currentAssignments.filter(
+            (assignment) =>
+              assignment.role === "worker" &&
+              assignment.parent_assignment_id === pl.assignment_id &&
+              assignment.state === "completed",
+          );
+          for (const worker of existingWorkers) {
+            const plannedWorker = workerPlan.workers.find(
+              (candidate) => candidate.worker_key === worker.task_key,
+            );
+            const problem =
+              plannedWorker === undefined
+                ? `Worker task ${worker.task_key ?? "(missing)"} is not in the PL plan`
+                : workerReportProblem(team, plannedWorker, worker);
+            if (problem === null) {
+              continue;
+            }
+            const correctionAssignment = buildCorrectionAssignment(
+              team,
+              worker,
+              problem,
+            );
+            if (worker.correction_count < this.workerCorrectionRounds) {
+              workerCorrections.push(
+                async () =>
+                  this.scheduler.correct({
+                    run_id: runId,
+                    assignment_id: worker.assignment_id,
+                    assignment: correctionAssignment,
+                  }),
+              );
+            } else {
+              workerExhaustions.push(
+                async () =>
+                  this.scheduler.requestRetry({
+                    run_id: runId,
+                    assignment_id: worker.assignment_id,
+                    kind: "correction_exhausted",
+                    mode: "resume_session",
+                    reason: `Worker report correction budget exhausted: ${problem}`,
+                    assignment: correctionAssignment,
+                  }),
+              );
+            }
+          }
+        }
+        if (workerCorrections.length > 0 || workerExhaustions.length > 0) {
+          await runRetryableParallel(workerCorrections);
+          await runParallel(workerExhaustions);
+          anyProgress = true;
+          continue;
+        }
+
         const workerStarts: Array<() => Promise<AssignmentRecord>> = [];
         for (const team of refreshedTeams) {
           if (team.state !== "active") {
@@ -138,7 +372,6 @@ export class TeamCoordinator {
             continue;
           }
           const workerPlan = pl.structured_report;
-          assertPlWorkerPlan(team, workerPlan);
           const existingWorkers = currentAssignments.filter(
             (assignment) =>
               assignment.role === "worker" &&
@@ -153,7 +386,15 @@ export class TeamCoordinator {
                 (worker) =>
                   worker.state === "completed" &&
                   worker.output_contract === "worker_report" &&
-                  worker.structured_report?.kind === "worker_report",
+                  worker.structured_report?.kind === "worker_report" &&
+                  workerReportProblem(
+                    team,
+                    workerPlan.workers.find(
+                      (candidate) =>
+                        candidate.worker_key === worker.task_key,
+                    ),
+                    worker,
+                  ) === null,
               )
               .map((worker) => worker.task_key)
               .filter((key): key is string => key !== null),
@@ -183,7 +424,7 @@ export class TeamCoordinator {
           }
         }
         if (workerStarts.length > 0) {
-          await runParallel(workerStarts);
+          await runRetryableParallel(workerStarts);
           anyProgress = true;
           continue;
         }
@@ -229,7 +470,7 @@ export class TeamCoordinator {
           );
         }
         if (plResumes.length > 0) {
-          await runParallel(plResumes);
+          await runRetryableParallel(plResumes);
           anyProgress = true;
           continue;
         }
@@ -246,7 +487,10 @@ export class TeamCoordinator {
         assignments,
         progressed: anyProgress,
         waiting_approvals: assignments.filter(
-          (assignment) => assignment.state === "waiting_user",
+          (assignment) => assignment.pending_approval !== null,
+        ).length,
+        waiting_retries: assignments.filter(
+          (assignment) => assignment.pending_retry !== null,
         ).length,
       };
     });
@@ -315,17 +559,72 @@ function buildPlFinalAssignment(
   ].join("\n");
 }
 
-function assertPlWorkerPlan(team: TeamRecord, plan: PlWorkerPlan): void {
+function buildCorrectionAssignment(
+  team: TeamRecord,
+  assignment: AssignmentRecord,
+  problem: string,
+): string {
+  return [
+    `Team: ${team.team_id}`,
+    `Role: ${assignment.role}`,
+    ...(assignment.task_key === null
+      ? []
+      : [`Worker key: ${assignment.task_key}`]),
+    `Correction required: ${problem}`,
+    "Previous structured report:",
+    JSON.stringify(assignment.structured_report),
+    `Return a corrected strict ${assignment.output_contract} for the same bounded assignment.`,
+    "Inspect the existing worktree evidence. Do not claim completion until every stated deficiency is resolved.",
+  ].join("\n");
+}
+
+function plWorkerPlanProblem(
+  team: TeamRecord,
+  plan: PlWorkerPlan,
+): string | null {
   if (plan.team_id !== team.team_id) {
-    throw protocolError(
-      `PL worker plan belongs to ${plan.team_id}, expected ${team.team_id}`,
-    );
+    return `PL worker plan belongs to ${plan.team_id}, expected ${team.team_id}`;
   }
   if (plan.workers.length !== team.worker_count) {
-    throw protocolError(
-      `PL planned ${plan.workers.length} workers, expected ${team.worker_count}`,
-    );
+    return `PL planned ${plan.workers.length} workers, expected ${team.worker_count}`;
   }
+  return null;
+}
+
+function workerReportProblem(
+  team: TeamRecord,
+  plannedWorker: PlWorkerPlan["workers"][number] | undefined,
+  assignment: AssignmentRecord,
+): string | null {
+  if (plannedWorker === undefined) {
+    return `Worker task ${assignment.task_key ?? "(missing)"} is not in the PL plan`;
+  }
+  if (
+    assignment.output_contract !== "worker_report" ||
+    assignment.structured_report?.kind !== "worker_report"
+  ) {
+    return `Worker ${plannedWorker.worker_key} did not return worker_report`;
+  }
+  const report = assignment.structured_report;
+  if (
+    report.team_id !== team.team_id ||
+    report.worker_key !== plannedWorker.worker_key
+  ) {
+    return `Worker report identity is ${report.team_id}/${report.worker_key}, expected ${team.team_id}/${plannedWorker.worker_key}`;
+  }
+  if (report.status !== "completed") {
+    return `Worker ${plannedWorker.worker_key} reported ${report.status}`;
+  }
+  if (report.blockers.length > 0) {
+    return `Worker ${plannedWorker.worker_key} reported unresolved blockers`;
+  }
+  if (report.verification.some((verification) => verification.status !== "passed")) {
+    return `Worker ${plannedWorker.worker_key} lacks passing verification`;
+  }
+  if (plannedWorker.commit_required && report.commit_sha === null) {
+    return `Worker ${plannedWorker.worker_key} omitted its required local commit`;
+  }
+  return null;
 }
 
 function collectWorkerReports(
@@ -356,24 +655,21 @@ function collectWorkerReports(
   return reports;
 }
 
-function assertFinalPlReport(
+function finalPlReportProblem(
   team: TeamRecord,
   report: PlReport,
   workers: AssignmentRecord[],
-): void {
+): string | null {
   if (report.team_id !== team.team_id) {
-    throw protocolError(
-      `Final PL report belongs to ${report.team_id}, expected ${team.team_id}`,
-    );
+    return `Final PL report belongs to ${report.team_id}, expected ${team.team_id}`;
   }
   if (
     report.status !== "completed" ||
     report.worker_reports.some((worker) => worker.status !== "completed") ||
-    report.verification.some((verification) => verification.status !== "passed")
+    report.verification.some((verification) => verification.status !== "passed") ||
+    report.blockers.length > 0
   ) {
-    throw protocolError(
-      `Final PL report for ${team.team_id} lacks passing completion evidence`,
-    );
+    return `Final PL report for ${team.team_id} lacks passing completion evidence`;
   }
   const expectedWorkerKeys = workers
     .map((worker) => worker.task_key)
@@ -383,10 +679,23 @@ function assertFinalPlReport(
     .map((worker) => worker.worker_key)
     .sort();
   if (JSON.stringify(expectedWorkerKeys) !== JSON.stringify(reportedWorkerKeys)) {
-    throw protocolError(
-      `Final PL report for ${team.team_id} does not cover the assigned workers`,
-    );
+    return `Final PL report for ${team.team_id} does not cover the assigned workers`;
   }
+  const actualReports = workers
+    .map((worker) =>
+      worker.structured_report?.kind === "worker_report"
+        ? worker.structured_report
+        : null,
+    )
+    .filter((worker): worker is WorkerReport => worker !== null)
+    .sort((left, right) => left.worker_key.localeCompare(right.worker_key));
+  const reported = [...report.worker_reports].sort((left, right) =>
+    left.worker_key.localeCompare(right.worker_key),
+  );
+  if (JSON.stringify(actualReports) !== JSON.stringify(reported)) {
+    return `Final PL report for ${team.team_id} changed or omitted worker evidence`;
+  }
+  return null;
 }
 
 async function runParallel<T>(
@@ -402,6 +711,45 @@ async function runParallel<T>(
     throw rejected.reason;
   }
   return settled.map((result) => (result as PromiseFulfilledResult<T>).value);
+}
+
+async function runRetryableParallel<T>(
+  operations: Array<() => Promise<T>>,
+): Promise<void> {
+  const settled = await Promise.allSettled(
+    operations.map(async (operation) => operation()),
+  );
+  const fatal = settled.find(
+    (result): result is PromiseRejectedResult =>
+      result.status === "rejected" && !isRetryableSessionFailure(result.reason),
+  );
+  if (fatal) {
+    throw fatal.reason;
+  }
+}
+
+function isRetryableSessionFailure(error: unknown): boolean {
+  return (
+    error instanceof ArkTeamError &&
+    (error.code === "AGENT_SESSION_FAILED" ||
+      error.code === "AGENT_SESSION_PROTOCOL_ERROR" ||
+      error.code === "AGENT_SESSION_UNAVAILABLE")
+  );
+}
+
+function boundedPolicyValue(
+  value: number | undefined,
+  fallback: number,
+  field: string,
+): number {
+  const selected = value ?? fallback;
+  if (!Number.isSafeInteger(selected) || selected < 0 || selected > 10) {
+    throw new ArkTeamError(
+      "INVALID_INPUT",
+      `${field} must be an integer from 0 to 10`,
+    );
+  }
+  return selected;
 }
 
 function protocolError(message: string): ArkTeamError {

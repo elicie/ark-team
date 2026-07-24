@@ -22,7 +22,7 @@ import { RunStore } from "./state-store.js";
 import { TeamCoordinator } from "./team-coordinator.js";
 
 const SERVER_INSTRUCTIONS =
-  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, materialize its strict plan, and advance dependency-ready PL/worker work in one call. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list. Keep every returned assignment_id. When an assignment returns waiting_user, present its pending approval and call ark_team_assignment_decide only after the user's decision, then call ark_team_advance to continue the same hierarchy. Use assignment status/list for stored reports and usage. Run pause/cancel stops active managed assignments.";
+  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, materialize its strict plan, and advance dependency-ready PL/worker work in one call. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list. Keep every returned assignment_id. For waiting_user, distinguish pending_approval from pending_retry. Deliver approvals only through ark_team_assignment_decide. Deliver exhausted-retry choices only through ark_team_assignment_retry_decide. Then call ark_team_advance to continue the hierarchy. Use assignment status/list for stored reports, counters, and usage. Run pause/cancel stops active managed assignments.";
 
 export interface ArkTeamExecutionController {
   execute(input: ExecuteArkTeamInput): Promise<ExecuteArkTeamResult>;
@@ -75,7 +75,7 @@ export function createArkTeamMcpServer(
     {
       title: "Execute Ark Team PM planning",
       description:
-        "Create a run, invoke the Sol/xhigh read-only PM for a strict plan, and materialize its linked team worktrees.",
+        "Create a run, invoke the Sol/xhigh read-only PM, materialize linked team worktrees, and advance bounded PL/worker execution.",
       inputSchema: {
         objective: z.string().min(1).max(20_000),
         project_path: z.string().min(1),
@@ -391,6 +391,41 @@ export function createArkTeamMcpServer(
     async ({ run_id, assignment_id, reason }) =>
       handleTool(async () => ({
         assignment: await scheduler.cancel(run_id, assignment_id, reason),
+      })),
+  );
+
+  server.registerTool(
+    "ark_team_assignment_retry_decide",
+    {
+      title: "Resolve exhausted assignment retry",
+      description:
+        "Apply an explicit user choice to one opaque exhausted-retry request: run one additional bounded attempt or cancel the run.",
+      inputSchema: {
+        run_id: z.string().min(1),
+        assignment_id: z.string().regex(ASSIGNMENT_ID_PATTERN),
+        retry_request_id: z.string().uuid(),
+        decision: z.enum(["retry_once", "cancel_run"]),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({
+      run_id,
+      assignment_id,
+      retry_request_id,
+      decision,
+    }) =>
+      handleTool(async () => ({
+        assignment: await scheduler.decideRetry(
+          run_id,
+          assignment_id,
+          retry_request_id,
+          decision,
+        ),
       })),
   );
 

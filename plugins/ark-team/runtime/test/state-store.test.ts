@@ -304,7 +304,7 @@ test("TEST-704 persists one PM plan and its prepared teams atomically", async ()
   assert.equal((await store.listTeams(run.run_id)).teams[0]?.state, "active");
 });
 
-test("TEST-901 reopens legacy assignments with new hierarchy defaults", async () => {
+test("TEST-901 and TEST-1001 reopen legacy assignments with hierarchy and retry defaults", async () => {
   const runId = "ark-20260724t010000z-abc124";
   const assignmentId = "asg-000000000001";
   const runDirectory = path.join(stateRoot, runId);
@@ -377,6 +377,9 @@ test("TEST-901 reopens legacy assignments with new hierarchy defaults", async ()
   assert.equal(assignment.output_contract, null);
   assert.equal(assignment.structured_report, null);
   assert.equal(assignment.turn_count, 1);
+  assert.equal(assignment.pending_retry, null);
+  assert.equal(assignment.session_attempt_count, 1);
+  assert.equal(assignment.correction_count, 0);
 });
 
 test("TEST-502 enforces team, PL, worker ownership, and count bounds", async () => {

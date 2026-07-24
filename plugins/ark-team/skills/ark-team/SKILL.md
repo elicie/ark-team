@@ -105,15 +105,26 @@ Return deficient worker results to the worker at most twice. Return deficient te
 
 Use an external model only when the user explicitly requests it. Retry an external provider failure three times, then pause and ask the user; never silently fall back to Luna.
 
+The managed runtime enforces the internal budgets without PM intervention.
+Fresh-session failures increment `session_attempt_count`; semantic corrections
+resume the same session and increment `correction_count`. When either budget is
+exhausted, distinguish `pending_retry` from a tool approval, show its redacted
+reason and counters, and wait for the user to choose `retry_once` or
+`cancel_run`. Deliver that choice only through
+`ark_team_assignment_retry_decide` with the exact opaque retry request ID.
+
 ## Handle approvals and interruptions
 
 Continue ordinary in-scope work without approval. Pause for the dangerous actions listed in the operating contract.
 
-When a managed PL or worker returns `waiting_user`, present the redacted request
-to the user and leave it unanswered. Pass `approve_once`, `approve_session`,
-`decline`, or `cancel` through `ark_team_assignment_decide` only after the
-user's decision, then call `ark_team_advance` to continue scheduling from the
-persisted hierarchy. Never infer approval from the original task or silently
+When a managed PL or worker returns `waiting_user`, inspect whether it carries
+`pending_approval` or `pending_retry` and present the corresponding redacted
+request to the user. Pass `approve_once`, `approve_session`, `decline`, or
+`cancel` through `ark_team_assignment_decide` only for `pending_approval`.
+Pass `retry_once` or `cancel_run` through
+`ark_team_assignment_retry_decide` only for `pending_retry`. Then call
+`ark_team_advance` to continue scheduling from the persisted hierarchy. Never
+infer approval from the original task, reset a retry counter, or silently
 substitute a new session.
 
 When the user changes requirements, pause only affected teams, update their contracts, and allow unaffected work to continue.

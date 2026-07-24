@@ -69,6 +69,39 @@ export const pendingApprovalSchema = z.object({
   requested_permissions: z.unknown().optional(),
 });
 
+export const retryRequestKindSchema = z.enum([
+  "internal_failure_exhausted",
+  "correction_exhausted",
+]);
+
+export type RetryRequestKind = z.infer<typeof retryRequestKindSchema>;
+
+export const retryModeSchema = z.enum(["fresh_session", "resume_session"]);
+export type RetryMode = z.infer<typeof retryModeSchema>;
+
+export const pendingRetryRequestSchema = z
+  .object({
+    retry_request_id: z.string().uuid(),
+    kind: retryRequestKindSchema,
+    mode: retryModeSchema,
+    reason: z.string().min(1).max(1000),
+  })
+  .superRefine((request, context) => {
+    if (
+      (request.kind === "internal_failure_exhausted" &&
+        request.mode !== "fresh_session") ||
+      (request.kind === "correction_exhausted" &&
+        request.mode !== "resume_session")
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "retry request kind and mode do not match",
+      });
+    }
+  });
+
+export type PendingRetryRequest = z.infer<typeof pendingRetryRequestSchema>;
+
 export const reportTargetSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("controller"),
@@ -101,6 +134,7 @@ export const assignmentRecordSchema = z
     session_id: z.string().min(1).nullable(),
     turn_id: z.string().min(1).nullable(),
     pending_approval: pendingApprovalSchema.nullable(),
+    pending_retry: pendingRetryRequestSchema.nullable().default(null),
     final_report: z.string().min(1).nullable(),
     structured_report: managedOutputSchema.nullable().default(null),
     usage: usageSchema.nullable(),
@@ -110,6 +144,8 @@ export const assignmentRecordSchema = z
     updated_at: z.string().min(1),
     revision: z.number().int().positive(),
     turn_count: z.number().int().positive().default(1),
+    session_attempt_count: z.number().int().positive().default(1),
+    correction_count: z.number().int().nonnegative().default(0),
   })
   .superRefine((assignment, context) => {
     if (
@@ -120,7 +156,7 @@ export const assignmentRecordSchema = z
     ) {
       context.addIssue({
         code: "custom",
-        message: "PL assignments must report directly to PM",
+        message: "PL assignments must report to PM or the controller",
       });
     }
     if (
@@ -187,13 +223,23 @@ export const assignmentRecordSchema = z
     }
     if (
       assignment.state === "waiting_user" &&
-      (!assignment.session_id ||
-        !assignment.turn_id ||
-        assignment.pending_approval === null)
+      ((assignment.pending_approval === null) ===
+        (assignment.pending_retry === null))
     ) {
       context.addIssue({
         code: "custom",
-        message: "waiting assignments require session, turn, and approval data",
+        message:
+          "waiting assignments require exactly one approval or retry request",
+      });
+    }
+    if (
+      assignment.state === "waiting_user" &&
+      assignment.pending_approval !== null &&
+      (!assignment.session_id || !assignment.turn_id)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "approval waiting requires session and turn data",
       });
     }
     if (
@@ -222,11 +268,13 @@ export const assignmentRecordSchema = z
     }
     if (
       assignment.state !== "waiting_user" &&
-      assignment.pending_approval !== null
+      (assignment.pending_approval !== null ||
+        assignment.pending_retry !== null)
     ) {
       context.addIssue({
         code: "custom",
-        message: "only waiting assignments may retain a pending approval",
+        message:
+          "only waiting assignments may retain a pending approval or retry request",
       });
     }
   });
@@ -304,6 +352,10 @@ export const runEventSchema = z.object({
     "assignment.resumed",
     "assignment.waiting_user",
     "assignment.approval_resolved",
+    "assignment.retrying",
+    "assignment.correction",
+    "assignment.retry_exhausted",
+    "assignment.retry_resolved",
     "assignment.completed",
     "assignment.report_routed",
     "assignment.failed",
@@ -317,6 +369,11 @@ export const runEventSchema = z.object({
   team_id: z.string().regex(TEAM_ID_PATTERN).optional(),
   agent_role: eventAgentRoleSchema.optional(),
   approval_id: z.string().uuid().optional(),
+  retry_request_id: z.string().uuid().optional(),
+  retry_kind: retryRequestKindSchema.optional(),
+  retry_decision: z.enum(["retry_once", "cancel_run"]).optional(),
+  session_attempt_count: z.number().int().positive().optional(),
+  correction_count: z.number().int().nonnegative().optional(),
   report_target: reportTargetSchema.optional(),
   approval_decision: z
     .enum(["approve_once", "approve_session", "decline", "cancel"])

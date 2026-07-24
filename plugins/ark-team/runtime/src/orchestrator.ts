@@ -40,6 +40,7 @@ export interface ExecuteArkTeamResult {
   assignments: TeamCoordinatorResult["assignments"];
   progressed: boolean;
   waiting_approvals: number;
+  waiting_retries: number;
 }
 
 export interface TeamExecutionCoordinator {
@@ -109,6 +110,7 @@ export class ArkTeamOrchestrator {
       assignments: advanced.assignments,
       progressed: advanced.progressed,
       waiting_approvals: advanced.waiting_approvals,
+      waiting_retries: advanced.waiting_retries,
     };
   }
 
