@@ -8,14 +8,18 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "npm run typecheck && esbuild plugins/ark-team/runtime/src/server.ts --bundle --minify-whitespace --platform=node --format=esm --target=node18 --outfile=plugins/ark-team/runtime/dist/server.js && node plugins/ark-team/runtime/scripts/normalize-bundle.mjs",
-    "test:unit": "tsx --test plugins/ark-team/runtime/test/state-store.test.ts",
+    "build": "npm run typecheck && esbuild plugins/ark-team/runtime/src/server.ts --bundle --minify-whitespace --platform=node --format=esm --target=node18 --outfile=plugins/ark-team/runtime/dist/server.js && esbuild plugins/ark-team/runtime/src/session-cli.ts --bundle --minify-whitespace --platform=node --format=esm --target=node18 --outfile=plugins/ark-team/runtime/dist/session-cli.js && node plugins/ark-team/runtime/scripts/normalize-bundle.mjs",
+    "test:unit": "tsx --test plugins/ark-team/runtime/test/state-store.test.ts plugins/ark-team/runtime/test/agent-contract.test.ts plugins/ark-team/runtime/test/managed-session.test.ts",
     "test:mcp": "tsx --test plugins/ark-team/runtime/test/mcp-smoke.test.ts",
-    "test": "npm run test:unit && npm run build && npm run test:mcp",
+    "test:cli": "tsx --test plugins/ark-team/runtime/test/session-cli.test.ts",
+    "test": "npm run test:unit && npm run build && npm run test:cli && npm run test:mcp",
+    "verify:codex-models": "node plugins/ark-team/runtime/scripts/verify-codex-models.mjs",
+    "verify:managed-sessions": "tsx plugins/ark-team/runtime/scripts/probe-managed-sessions.ts",
     "validate": "npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
+    "@openai/codex-sdk": "0.145.0",
     "zod": "4.4.3"
   },
   "overrides": {

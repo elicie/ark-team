@@ -3,7 +3,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
-const bundlePath = path.resolve(scriptDirectory, "../dist/server.js");
-const bundle = await readFile(bundlePath, "utf8");
 
-await writeFile(bundlePath, bundle.replace(/[ \t]+$/gm, ""), "utf8");
+for (const bundleName of ["server.js", "session-cli.js"]) {
+  const bundlePath = path.resolve(scriptDirectory, "../dist", bundleName);
+  const bundle = await readFile(bundlePath, "utf8");
+  await writeFile(bundlePath, bundle.replace(/[ \t]+$/gm, ""), "utf8");
+}

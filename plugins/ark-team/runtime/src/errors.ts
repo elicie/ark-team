@@ -1,9 +1,12 @@
 export type ArkTeamErrorCode =
+  | "AGENT_SESSION_FAILED"
+  | "AGENT_SESSION_PROTOCOL_ERROR"
   | "CORRUPT_STATE"
   | "INVALID_INPUT"
   | "INVALID_TRANSITION"
   | "RUN_NOT_FOUND"
-  | "STATE_ROOT_UNAVAILABLE";
+  | "STATE_ROOT_UNAVAILABLE"
+  | "UNSAFE_AGENT_WORKSPACE";
 
 export class ArkTeamError extends Error {
   readonly code: ArkTeamErrorCode;

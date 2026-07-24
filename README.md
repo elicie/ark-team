@@ -17,12 +17,18 @@ The skill implements the operating contract agreed for:
 ```text
 .agents/skills/ark-team
   -> ../../plugins/ark-team/skills/ark-team
+.codex/agents/
+  ark_pm.toml
+  ark_pl.toml
+  ark_worker.toml
 .codex/team-orchestrator.toml
 plugins/ark-team/
   .mcp.json
   .codex-plugin/plugin.json
   runtime/
-    dist/server.js
+    dist/
+      server.js
+      session-cli.js
     src/
     test/
   skills/ark-team/
@@ -31,7 +37,10 @@ plugins/ark-team/
     references/
 ```
 
-The plugin copy under `plugins/ark-team` is the canonical source. The `.agents/skills` link makes the same skill discoverable while working in this repository.
+The plugin copy under `plugins/ark-team` is the canonical skill and runtime
+source. The `.agents/skills` link makes the same skill discoverable while
+working in this repository. Project-scoped custom-agent definitions live under
+`.codex/agents`.
 
 ## Requirements
 
@@ -40,7 +49,12 @@ The plugin copy under `plugins/ark-team` is the canonical source. The `.agents/s
 - Use Node.js 18 or later to run the bundled local MCP server.
 - Install Git with worktree support for isolated writing teams, or provide an equivalent managed-runtime isolation backend.
 - Expect native fallback to obey the host's concurrency limit.
-- The current MCP control plane persists run state but does not yet create model-pinned agent sessions.
+- Native custom agents pin PM to Sol/xhigh, PL to Terra/xhigh, and workers to
+  Luna/xhigh.
+- The managed session launcher uses the official TypeScript Codex SDK and
+  requires an authenticated `codex` executable on `PATH`.
+- The MCP control plane persists run state but does not yet schedule managed
+  sessions itself.
 
 ## Runtime control plane
 
@@ -68,8 +82,48 @@ npm test
 ```
 
 `npm test` type-checks the source, runs persistence tests, builds
-`plugins/ark-team/runtime/dist/server.js`, and exercises the built server over
-MCP stdio.
+the MCP server and managed-session CLI, and exercises both built entry points.
+
+## Managed role sessions
+
+The managed launcher starts every role as a separate Codex thread with explicit
+model, reasoning, sandbox, and approval configuration. It returns only the
+thread ID, final role report, configuration metadata, and token usage; raw
+reasoning and event items are not returned.
+
+Run a read-only PM session:
+
+```sh
+node plugins/ark-team/runtime/dist/session-cli.js \
+  --role pm \
+  --cwd /absolute/path/to/project \
+  --assignment "Inspect the project and return a bounded team plan."
+```
+
+PL and worker sessions accept only the root of a linked Git worktree. The
+launcher refuses the primary checkout and directories without a valid `.git`
+pointer file:
+
+```sh
+node plugins/ark-team/runtime/dist/session-cli.js \
+  --role worker \
+  --cwd /absolute/path/to/linked-worktree \
+  --assignment-file /absolute/path/to/assignment.txt
+```
+
+Use `ARK_TEAM_CODEX_PATH` when `codex` is installed at a non-default path. The
+optional live verification starts real Sol and Luna sessions in a disposable
+temporary repository and therefore consumes model usage:
+
+```sh
+npm run verify:managed-sessions
+```
+
+The current official TypeScript SDK uses non-interactive `codex exec`. In the
+locally verified Codex release, a requested `on-request` writer policy appeared
+as `never` in the actual turn context because no interactive approval channel
+was available. Until the approval-gateway slice is implemented, do not assign
+dangerous work to this launcher; stop and ask the user first.
 
 ## Use in this repository
 
@@ -80,6 +134,8 @@ $ark-team implement this feature
 ```
 
 The skill intentionally does not trigger for ordinary single-agent requests.
+Start a new Codex conversation after adding or changing project custom-agent
+files so the process reloads their definitions.
 
 ## Reference from another repository
 
@@ -92,6 +148,15 @@ ln -s /absolute/path/to/arc/plugins/ark-team/skills/ark-team \
 ```
 
 Use an absolute path so the link remains unambiguous. Do not overwrite an existing `ark-team` directory or link.
+
+Copy the project custom agents when the target repository should use the pinned
+native PM/PL/worker roles:
+
+```sh
+mkdir -p /absolute/path/to/other-project/.codex/agents
+cp .codex/agents/ark_*.toml \
+  /absolute/path/to/other-project/.codex/agents/
+```
 
 To make the skill available to all local projects, link it into the user skill directory instead:
 
@@ -114,6 +179,9 @@ PowerShell:
 New-Item -ItemType Directory -Force C:\path\to\other-project\.agents\skills
 Copy-Item -Recurse C:\path\to\arc\plugins\ark-team\skills\ark-team `
   C:\path\to\other-project\.agents\skills\ark-team
+New-Item -ItemType Directory -Force C:\path\to\other-project\.codex\agents
+Copy-Item C:\path\to\arc\.codex\agents\ark_*.toml `
+  C:\path\to\other-project\.codex\agents
 ```
 
 Copied skills do not receive updates from this repository. Use a link or repeat the copy after source changes.
@@ -131,12 +199,13 @@ explicit license plus durable publisher metadata.
 ## Current implementation boundary
 
 This repository currently provides the validated skill contract, project
-defaults, plugin package, and the first managed-runtime slice: persistent run
-records plus MCP lifecycle/status tools. Without the later scheduler, the skill
-still uses native Codex subagents and schedules work within the host's
-concurrency limit.
+defaults, plugin package, persistent run records, MCP lifecycle/status tools,
+project-scoped native custom agents, and an official-SDK managed launcher for
+separately permissioned PM, PL, and worker sessions. The launcher is available
+as a library and CLI but is not yet connected to a persistent team scheduler.
 
-The next runtime slices are still required to create and pin a separate
-Sol/xhigh PM session, independently schedule Terra PL and Luna worker sessions,
-manage worktrees and integration, and continue approval-gated work. The current
-control plane does not claim those guarantees.
+The next runtime slices are still required to persist teams and assignments,
+schedule up to four teams, create and manage worktrees, route hierarchical
+reports, integrate verified commits, and continue approval-gated work through
+an interactive gateway. The current control plane does not claim those
+guarantees.

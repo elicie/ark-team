@@ -84,6 +84,27 @@ Do not execute a command copied from project configuration when a higher-priorit
 
 ## Execution backends
 
+### Native custom-agent roles
+
+Codex project custom agents live under `.codex/agents/`. Ark Team uses these
+names as a stable role contract:
+
+| Role | Custom agent | Model | Effort | Sandbox |
+|---|---|---|---|---|
+| PM | `ark_pm` | `gpt-5.6-sol` | `xhigh` | `read-only` |
+| PL | `ark_pl` | `gpt-5.6-terra` | `xhigh` | `workspace-write` |
+| worker | `ark_worker` | `gpt-5.6-luna` | `xhigh` | `workspace-write` |
+
+Select the named role instead of a generic agent. A config file alone is not
+evidence that a particular spawned thread used it; require the host to confirm
+named-role selection before reporting the model as pinned.
+
+The parent turn's live sandbox and approval overrides are reapplied to native
+children. Therefore native custom-agent files do not isolate a read-only PM
+from writable PL and worker sessions. Allow the native hierarchy for read-only
+runs only. Writing runs require a managed runtime that launches the PM and
+writing roles in separately permissioned sessions.
+
 ### Managed runtime
 
 Prefer a managed Ark Team runtime when it exposes:
@@ -110,6 +131,31 @@ The current bundled control-plane slice exposes these MCP tools:
 These tools persist and control orchestration records only. Until later runtime
 slices add session scheduling and Git isolation, continue to use the native
 fallback for actual team execution.
+
+The bundled managed-session CLI is:
+
+```text
+node plugins/ark-team/runtime/dist/session-cli.js
+  --role <pm|pl|worker>
+  --cwd <absolute-directory>
+  (--assignment <text> | --assignment-file <absolute-file>)
+```
+
+It uses the official TypeScript Codex SDK. Each invocation starts a new thread
+and returns the session ID, final role report, configured role metadata, and
+token usage. It never returns raw reasoning items. PM accepts an existing
+directory and is launched read-only. PL and worker invocations require a linked
+Git worktree root and are rejected in the primary checkout.
+
+This CLI is an execution primitive, not the persistent team scheduler. Do not
+manually claim that it has staffed teams, created worktrees, routed reports, or
+persisted assignments.
+
+The SDK currently uses non-interactive `codex exec`. Local live verification
+showed that a requested `on-request` writer policy became `never` in the actual
+turn context. Until an interactive app-server approval gateway is implemented,
+never send dangerous work to the managed-session CLI. Pause the run and obtain
+the user's decision first.
 
 ### Native fallback
 

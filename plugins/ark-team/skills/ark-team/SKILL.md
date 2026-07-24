@@ -24,12 +24,19 @@ Do not activate Ark Team for a normal coding request merely because subagents co
 ## Establish the run
 
 1. Resolve `.codex/team-orchestrator.toml` from the active project. Use the defaults in the configuration reference when it is absent.
-2. Inspect the repository or workspace without changing it. Verify that Git and worktree support are available before scheduling isolated writing teams. Permit a read-only run without Git; stop a writing run with an unsupported-environment report when neither Git worktrees nor the managed runtime's equivalent isolation is available.
-3. Detect whether the managed Ark Team runtime is available.
+2. Resolve the project custom agents `ark_pm`, `ark_pl`, and `ark_worker`.
+   - Codex reapplies the parent turn's live sandbox and approval overrides to spawned agents. Do not treat custom-agent TOML permissions as an isolation boundary.
+   - For a read-only run, use the native hierarchy only when the parent turn is also read-only.
+   - For a writing run, require a managed runtime that launches PM in an independent read-only session and PL/worker sessions with guarded write access. If it is unavailable, stop with an unsupported-environment report.
+   - When the permission gate passes, `ark_pm` is available, and the current session is not already that role, spawn `ark_pm`, give it the objective and applicable configuration, wait for its final report, and relay that report to the user.
+   - Require `ark_pm` to select `ark_pl` for PL assignments and `ark_pl` to select `ark_worker` for worker assignments.
+   - Treat a selected named custom agent plus its loaded configuration as the minimum evidence of model pinning. If the runtime does not confirm named-role selection, report the degraded guarantee instead of claiming the configured model was used.
+3. Inspect the repository or workspace without changing it. Verify that Git and worktree support are available before scheduling isolated writing teams. Permit a read-only run without Git; stop a writing run with an unsupported-environment report when neither Git worktrees nor the managed runtime's equivalent isolation is available.
+4. Detect whether the managed Ark Team runtime is available.
    - Prefer the managed runtime when it can create a dedicated `gpt-5.6-sol`/`xhigh`/read-only PM session, persistent run state, and isolated team sessions.
-   - Otherwise use native Codex subagents, respect the surfaced concurrency limit, and schedule work in waves.
-4. State any degraded guarantees before execution. Never claim that native fallback pinned a model, created an independent session, or exceeded a host concurrency limit unless the runtime confirms it.
-5. Create a portable run identifier matching `[a-z0-9-]+`, such as `ark-20260724t201141z-a1b2c3`, and record the starting branch, workspace state, acceptance criteria, and requested deliverables.
+   - Otherwise use the named native Codex custom agents only for read-only work, respect the surfaced concurrency limit, and schedule work in waves.
+5. State any degraded guarantees before execution. Never claim that native fallback pinned a model, created an independent session, or exceeded a host concurrency limit unless the runtime confirms it.
+6. Create a portable run identifier matching `[a-z0-9-]+`, such as `ark-20260724t201141z-a1b2c3`, and record the starting branch, workspace state, acceptance criteria, and requested deliverables.
 
 ## Act only as PM
 
@@ -51,6 +58,18 @@ Do the following as PM:
 Give every PL a bounded mission, owned paths or artifacts, dependencies, and a definition of done.
 
 Require workers to report to their PL. Require PLs to validate and consolidate worker results before reporting to PM.
+
+Select the named custom agents for every role:
+
+- PM: `ark_pm`
+- PL and integration PL: `ark_pl`
+- worker: `ark_worker`
+
+When a PL cannot select a nested `ark_worker`, require it to return a
+`WORKER_SPAWN_REQUEST` to PM. PM then spawns `ark_worker` with the PL's bounded
+assignment, forwards the worker report to the owning PL, and waits for the PL's
+validated team report. Preserve the logical reporting hierarchy and explicitly
+record this fallback.
 
 Allow PL-to-PL communication only for dependency coordination. Mirror the decision to PM and the run log. Do not allow one PL to change another team's scope, priority, or acceptance criteria.
 
