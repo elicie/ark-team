@@ -34,7 +34,8 @@ Do not activate Ark Team for a normal coding request merely because subagents co
 3. Inspect the repository or workspace without changing it. Verify that Git and worktree support are available before scheduling isolated writing teams. Permit a read-only run without Git; stop a writing run with an unsupported-environment report when neither Git worktrees nor the managed runtime's equivalent isolation is available.
 4. Detect whether the managed Ark Team runtime is available.
    - Prefer the managed runtime when it can create a dedicated `gpt-5.6-sol`/`xhigh`/read-only PM session, persistent run state, and isolated team sessions.
-   - Prefer `ark_team_execute` for a writing run so the runtime creates the run, invokes the managed PM for a strict `pm_plan`, records usage, and materializes team worktrees in one call.
+   - Prefer `ark_team_execute` for a writing run so the runtime creates the run, invokes the managed PM for a strict `pm_plan`, records usage, materializes team worktrees, and advances all dependency-ready PL and worker turns in one call.
+   - The managed coordinator asks each Terra PL for one strict worker plan, dispatches its Luna workers in dependency waves, routes their strict reports to that PL, and resumes the same PL session for the final team report. It repeats this across ready teams until every team is complete, an approval is waiting, or the run reaches integration.
    - Use `ark_team_start` plus `ark_team_plan_apply` only for a manual plan or to retry a stored PM plan after worktree preparation failed. Retain the returned run, PM session, team worktree, and branch records.
    - When managed assignment tools are available, retain every returned assignment ID and use them for explicit PL/worker start, status, approval, and cancellation operations.
    - Otherwise use the named native Codex custom agents only for read-only work, respect the surfaced concurrency limit, and schedule work in waves.
@@ -111,8 +112,9 @@ Continue ordinary in-scope work without approval. Pause for the dangerous action
 When a managed PL or worker returns `waiting_user`, present the redacted request
 to the user and leave it unanswered. Pass `approve_once`, `approve_session`,
 `decline`, or `cancel` through `ark_team_assignment_decide` only after the
-user's decision, then continue the same managed turn. Never infer approval from
-the original task or silently substitute a new session.
+user's decision, then call `ark_team_advance` to continue scheduling from the
+persisted hierarchy. Never infer approval from the original task or silently
+substitute a new session.
 
 When the user changes requirements, pause only affected teams, update their contracts, and allow unaffected work to continue.
 

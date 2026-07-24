@@ -122,6 +122,7 @@ The current bundled control-plane slice exposes these MCP tools:
 
 - `ark_team_start`
 - `ark_team_execute`
+- `ark_team_advance`
 - `ark_team_list`
 - `ark_team_status`
 - `ark_team_logs`
@@ -138,8 +139,14 @@ The current bundled control-plane slice exposes these MCP tools:
 
 `ark_team_execute` is the managed one-call entry point: it creates the run,
 launches the Sol/xhigh read-only PM for a strict `pm_plan`, records the PM
-thread metadata and usage, and materializes the plan. The run lifecycle tools
-persist and control orchestration records.
+thread metadata and usage, materializes the plan, and advances every
+dependency-ready team. The coordinator asks each Terra PL for a strict
+`pl_worker_plan`, dispatches the selected Luna workers in dependency waves,
+routes strict `worker_report` records to their owning PL, and resumes that same
+PL session for its strict `pl_report`. Independent teams and workers are
+started concurrently. The run stops advancing when it is waiting for a user
+approval, cannot make dependency progress, or all teams are ready to integrate.
+The run lifecycle tools persist and control orchestration records.
 `ark_team_plan_apply` accepts one strict `pm_plan`, requires a clean Git
 repository root, creates up to four linked team worktrees and preserved local
 branches, and atomically records their base commit and contracts.
@@ -170,12 +177,16 @@ Retain every assignment ID. Read `ark_team_assignment_status` or
 `ark_team_assignment_list` for stored reports and usage. When the state is
 `waiting_user`, show the pending request and call
 `ark_team_assignment_decide` only with the exact opaque approval ID and the
-user's explicit decision.
+user's explicit decision. Then call `ark_team_advance` to continue
+dependency-ready work and same-thread PL reporting.
 
-The scheduler records PL reports for PM and worker reports for the owning PL.
-This is durable routing evidence, not yet an automatic follow-up turn: a later
-slice must resume the PL with accumulated worker reports. Pending approvals
-remain persisted but cannot be reattached after MCP process restart.
+The scheduler records interim PL worker plans for the controller, worker
+reports for the owning PL, and final PL reports for PM. A team is completed
+only after the final report covers every assigned worker and reports passing
+verification. Once all teams complete, the run enters `integrating`; merge,
+cross-team verification, and cleanup are handled by a later integration stage.
+Pending approvals remain persisted but cannot yet be reattached after an MCP
+process restart.
 
 The bundled managed-session CLI is:
 
@@ -218,9 +229,9 @@ pending request.
 On completion the gateway returns only role metadata, session and turn IDs,
 the final report, and usage. Pending approvals are process-local and are not
 recoverable after controller restart. The gateway remains the session
-primitive. The MCP control plane persists and routes its updates and can
-materialize an already validated PM plan, but it does not yet invoke the PM or
-route child reports into resumed parent turns.
+primitive. The MCP control plane invokes the PM, materializes its validated
+plan, persists and routes child updates, and resumes each PL with its validated
+worker reports.
 
 ### Native fallback
 

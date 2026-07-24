@@ -13,6 +13,7 @@ import { assertManagedWorkspace } from "./managed-session.js";
 import {
   type CreateAssignmentInput,
   type ListAssignmentsInput,
+  type ResumeAssignmentInput,
   RunStore,
 } from "./state-store.js";
 
@@ -81,6 +82,57 @@ export class ManagedAssignmentScheduler {
         role: assignment.role,
         assignment: assignment.assignment,
         working_directory: assignment.working_directory,
+        ...(assignment.output_contract === null
+          ? {}
+          : { output_contract: assignment.output_contract }),
+      });
+      const persisted = await this.store.recordAssignmentUpdate(
+        assignment.run_id,
+        assignment.assignment_id,
+        update,
+      );
+      if (persisted.state !== "waiting_user") {
+        this.liveAssignments.delete(assignment.assignment_id);
+      }
+      return persisted;
+    } catch (error) {
+      this.liveAssignments.delete(assignment.assignment_id);
+      await this.recordSessionFailure(assignment, error);
+      throw normalizeSessionFailure(error);
+    }
+  }
+
+  async resume(input: ResumeAssignmentInput): Promise<AssignmentRecord> {
+    const current = await this.store.getAssignment(
+      input.run_id,
+      input.assignment_id,
+    );
+    const workingDirectory = await assertManagedWorkspace(
+      current.role,
+      current.working_directory,
+    );
+    const assignment = await this.store.resumeAssignment(input);
+    let session: ApprovalSessionHandle;
+    try {
+      session = this.sessionFactory();
+    } catch (error) {
+      await this.recordSessionFailure(assignment, error);
+      throw sessionFailure("Unable to create a resumed managed session", error);
+    }
+    this.liveAssignments.set(assignment.assignment_id, {
+      run_id: assignment.run_id,
+      session,
+    });
+
+    try {
+      const update = await session.start({
+        role: assignment.role,
+        assignment: assignment.assignment,
+        working_directory: workingDirectory,
+        ...(current.session_id === null
+          ? {}
+          : { resume_session_id: current.session_id }),
+        output_contract: input.output_contract,
       });
       const persisted = await this.store.recordAssignmentUpdate(
         assignment.run_id,

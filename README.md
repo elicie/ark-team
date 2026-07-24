@@ -57,8 +57,8 @@ working in this repository. Project-scoped custom-agent definitions live under
 - The approval-gated writer backend uses `codex app-server` over local stdio
   and requires a compatible generated stable protocol schema.
 - The MCP control plane persists run and assignment state and can schedule
-  explicitly defined PL/worker sessions and materialize a validated PM plan
-  into linked team worktrees. It does not yet invoke the PM planner.
+  a managed PM → PL → worker hierarchy, materialize the PM plan into linked
+  team worktrees, and resume each PL with its workers' validated reports.
 
 ## Runtime control plane
 
@@ -67,6 +67,7 @@ It currently exposes:
 
 - `ark_team_start`
 - `ark_team_execute`
+- `ark_team_advance`
 - `ark_team_list`
 - `ark_team_status`
 - `ark_team_logs`
@@ -101,15 +102,24 @@ failure leaves a durable failed run. A later worktree failure leaves the
 validated PM plan in a planning run so `ark_team_plan_apply` can retry it
 without consuming another PM turn.
 
+After plan materialization, the coordinator starts independent Terra PLs in
+parallel, validates their exact worker counts, runs dependency-ready Luna
+workers in waves, and resumes each original PL session with the consolidated
+worker reports. `ark_team_advance` continues that process after an approval
+decision. When all PL reports cover their workers with passing verification,
+the run enters `integrating`.
+
 Managed assignment records live in the same atomic run record. Each record
 retains its team and parent PL, linked worktree, state, session and turn IDs,
-one pending approval, routed final report, and token usage. Logs record
-observable state changes and usage, not raw model reasoning or event history.
+task key and output contract, one pending approval, routed structured report,
+turn count, and token usage. Logs record observable state changes and usage,
+not raw model reasoning or event history.
 
 The scheduler enforces one PL per team, at most four teams per run, and at most
-five workers per PL. Workers must use the same team worktree and identify their
-owning PL assignment. A completed worker report is routed to that PL record; a
-completed PL report is routed to PM.
+five workers per PL. Workers use the same team worktree and identify their
+owning PL assignment. Interim PL plans route to the controller, completed
+worker reports route to the owning PL, and the PL's same-session final report
+routes to PM.
 
 If the MCP process restarts while approval is pending, the record remains
 visible but its live app-server session is intentionally unavailable. Cancel
@@ -300,7 +310,10 @@ The control plane can also materialize a validated PM plan into durable linked
 team worktrees and preserved local branches, and `ark_team_execute` now drives
 that PM-planning path from one MCP call.
 
-The next runtime slices are still required to dispatch independent teams in
-parallel, route stored worker reports into PL
-continuations, apply retries, and integrate verified commits. The current
-control plane does not claim those guarantees.
+The runtime now dispatches independent teams and workers concurrently, gates
+dependencies, routes stored worker reports into same-session PL continuations,
+and stops with durable approval state. The next runtime slices are still
+required to apply correction and abnormal retries, integrate and verify
+commits, select local merge versus guarded remote work, clean worktrees, and
+reattach interrupted live sessions. The current control plane does not claim
+those remaining guarantees.

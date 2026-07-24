@@ -96,6 +96,7 @@ test("TEST-006 exposes lifecycle tools and persists a run through MCP", async ()
   assert.deepEqual(
     tools.tools.map((tool) => tool.name).sort(),
     [
+      "ark_team_advance",
       "ark_team_assignment_cancel",
       "ark_team_assignment_decide",
       "ark_team_assignment_list",

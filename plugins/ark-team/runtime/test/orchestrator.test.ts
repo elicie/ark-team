@@ -15,6 +15,7 @@ import {
   ArkTeamOrchestrator,
   buildPmPlanningAssignment,
   type ManagedPmLauncher,
+  type TeamExecutionCoordinator,
 } from "../src/orchestrator.js";
 import {
   PlanMaterializer,
@@ -43,6 +44,7 @@ test("TEST-801 and TEST-802 execute the exact PM plan and persist usage only", a
       materializer: new PlanMaterializer(fixture.store, {
         worktree_manager: manager,
       }),
+      coordinator: new SnapshotCoordinator(fixture.store),
     });
 
     const result = await orchestrator.execute({
@@ -241,6 +243,20 @@ class ScriptedPmLauncher implements ManagedPmLauncher {
       throw this.outcome;
     }
     return this.outcome;
+  }
+}
+
+class SnapshotCoordinator implements TeamExecutionCoordinator {
+  constructor(private readonly store: RunStore) {}
+
+  async advance(runId: string) {
+    return {
+      run: await this.store.getRun(runId),
+      teams: (await this.store.listTeams(runId)).teams,
+      assignments: (await this.store.listAssignments(runId)).assignments,
+      progressed: false,
+      waiting_approvals: 0,
+    };
   }
 }
 

@@ -16,6 +16,7 @@ import { createArkTeamMcpServer } from "../src/mcp-server.js";
 import {
   ArkTeamOrchestrator,
   type ManagedPmLauncher,
+  type TeamExecutionCoordinator,
 } from "../src/orchestrator.js";
 import {
   PlanMaterializer,
@@ -37,11 +38,14 @@ test("TEST-805 exposes automatic PM planning and materialization through MCP", a
   const orchestrator = new ArkTeamOrchestrator(store, {
     pm_launcher: launcher,
     materializer,
+    coordinator: new SnapshotCoordinator(store),
   });
+  const coordinator = new SnapshotCoordinator(store);
   const server = createArkTeamMcpServer(
     store,
     new ManagedAssignmentScheduler(store),
     materializer,
+    coordinator,
     orchestrator,
   );
   const client = new Client(
@@ -77,6 +81,23 @@ test("TEST-805 exposes automatic PM planning and materialization through MCP", a
     assert.equal(launcher.requests.length, 1);
     assert.equal(launcher.requests[0]?.role, "pm");
     assert.equal(launcher.requests[0]?.output_contract, "pm_plan");
+
+    const advanced = await client.callTool({
+      name: "ark_team_advance",
+      arguments: {
+        run_id: (
+          executed.structuredContent as
+            | { run?: { run_id?: string } }
+            | undefined
+        )?.run?.run_id,
+      },
+    });
+    const advancedPayload = advanced.structuredContent as
+      | { ok?: boolean; progressed?: boolean; waiting_approvals?: number }
+      | undefined;
+    assert.equal(advancedPayload?.ok, true);
+    assert.equal(advancedPayload?.progressed, false);
+    assert.equal(advancedPayload?.waiting_approvals, 0);
   } finally {
     await client.close();
     await server.close();
@@ -108,6 +129,20 @@ class FakePmLauncher implements ManagedPmLauncher {
         output_tokens: 30,
         reasoning_output_tokens: 20,
       },
+    };
+  }
+}
+
+class SnapshotCoordinator implements TeamExecutionCoordinator {
+  constructor(private readonly store: RunStore) {}
+
+  async advance(runId: string) {
+    return {
+      run: await this.store.getRun(runId),
+      teams: (await this.store.listTeams(runId)).teams,
+      assignments: (await this.store.listAssignments(runId)).assignments,
+      progressed: false,
+      waiting_approvals: 0,
     };
   }
 }

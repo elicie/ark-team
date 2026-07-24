@@ -39,7 +39,10 @@ import type {
 } from "./approval-session.js";
 import { ArkTeamError } from "./errors.js";
 import {
+  assertManagedOutputContractRole,
+  parseManagedOutput,
   pmPlanSchema,
+  type ManagedOutputContract,
   type PmPlan,
 } from "./role-contracts.js";
 import { assertRunId, createRunId } from "./run-id.js";
@@ -72,8 +75,17 @@ export interface CreateAssignmentInput {
   team_id: string;
   role: AssignmentRole;
   parent_assignment_id?: string;
+  task_key?: string;
+  output_contract?: ManagedOutputContract;
   assignment: string;
   working_directory: string;
+}
+
+export interface ResumeAssignmentInput {
+  run_id: string;
+  assignment_id: string;
+  assignment: string;
+  output_contract: "pl_report";
 }
 
 export interface ListAssignmentsInput {
@@ -96,6 +108,11 @@ export interface MaterializePlanInput {
 export interface MaterializePlanResult {
   run: RunRecord;
   teams: TeamRecord[];
+}
+
+export interface CompleteTeamResult {
+  run: RunRecord;
+  team: TeamRecord;
 }
 
 export interface PmPlanEvidence {
@@ -583,6 +600,91 @@ export class RunStore {
     };
   }
 
+  async completeTeam(
+    runId: string,
+    teamId: string,
+    plAssignmentId: string,
+  ): Promise<CompleteTeamResult> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = persisted.teams.find((team) => team.team_id === teamId);
+      if (!current) {
+        throw new ArkTeamError("TEAM_NOT_FOUND", `Team not found: ${teamId}`);
+      }
+      if (current.state === "completed") {
+        return { run: persisted.run, team: current };
+      }
+      const pl = findAssignment(persisted, plAssignmentId);
+      if (
+        current.state !== "active" ||
+        pl.role !== "pl" ||
+        pl.team_id !== teamId ||
+        pl.state !== "completed" ||
+        pl.output_contract !== "pl_report" ||
+        pl.structured_report?.kind !== "pl_report" ||
+        pl.structured_report.team_id !== teamId
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Team completion requires its valid completed PL report",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const team: TeamRecord = {
+        ...current,
+        state: "completed",
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const teams = persisted.teams.map((candidate) =>
+        candidate.team_id === teamId ? team : candidate,
+      );
+      const allCompleted = teams.every(
+        (candidate) => candidate.state === "completed",
+      );
+      const hasWaiting = persisted.assignments.some(
+        (assignment) => assignment.state === "waiting_user",
+      );
+      const nextState = allCompleted
+        ? "integrating"
+        : hasWaiting
+          ? "waiting_user"
+          : "executing";
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "team.completed",
+        timestamp,
+        state: nextState,
+        team_id: teamId,
+        agent_role: "pl",
+        assignment_id: plAssignmentId,
+        message: `Team ${teamId} completed with a validated PL report`,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        state: nextState,
+        resume_state:
+          nextState === "waiting_user"
+            ? persisted.run.resume_state ?? "executing"
+            : null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+      });
+      return { run, team };
+    });
+  }
+
   async createAssignment(input: CreateAssignmentInput): Promise<AssignmentRecord> {
     return this.withMutation(async () => {
       const persisted = await this.readPersistedRun(input.run_id);
@@ -595,6 +697,28 @@ export class RunStore {
       }
       if (input.role !== "pl" && input.role !== "worker") {
         throw new ArkTeamError("INVALID_INPUT", "assignment role must be pl or worker");
+      }
+      if (input.output_contract !== undefined) {
+        assertManagedOutputContractRole(input.role, input.output_contract);
+      }
+      const taskKey = input.task_key?.trim() ?? null;
+      if (
+        taskKey !== null &&
+        !TEAM_ID_PATTERN.test(taskKey)
+      ) {
+        throw new ArkTeamError("INVALID_INPUT", "task_key is invalid");
+      }
+      if (
+        input.role === "worker" &&
+        ((taskKey === null) !== (input.output_contract === undefined))
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "managed worker task_key and output_contract must be provided together",
+        );
+      }
+      if (input.role === "pl" && taskKey !== null) {
+        throw new ArkTeamError("INVALID_INPUT", "PL assignments cannot have task_key");
       }
       const assignmentText = input.assignment.trim();
       if (!assignmentText) {
@@ -699,6 +823,19 @@ export class RunStore {
             "a PL cannot own more than five worker assignments",
           );
         }
+        if (
+          taskKey !== null &&
+          persisted.assignments.some(
+            (assignment) =>
+              assignment.parent_assignment_id === parent.assignment_id &&
+              assignment.task_key === taskKey,
+          )
+        ) {
+          throw new ArkTeamError(
+            "INVALID_INPUT",
+            `worker task_key already exists: ${taskKey}`,
+          );
+        }
         parentAssignmentId = parent.assignment_id;
       }
 
@@ -713,21 +850,27 @@ export class RunStore {
         parent_assignment_id: parentAssignmentId,
         report_target:
           input.role === "pl"
-            ? { type: "pm" }
+            ? input.output_contract === "pl_worker_plan"
+              ? { type: "controller" }
+              : { type: "pm" }
             : { type: "assignment", assignment_id: parentAssignmentId ?? "" },
         assignment: assignmentText,
+        task_key: taskKey,
         working_directory: workingDirectory,
+        output_contract: input.output_contract ?? null,
         state: "running",
         session_id: null,
         turn_id: null,
         pending_approval: null,
         final_report: null,
+        structured_report: null,
         usage: null,
         failure_message: null,
         report_routed_at: null,
         created_at: timestamp,
         updated_at: timestamp,
         revision: 1,
+        turn_count: 1,
       };
       const nextState =
         persisted.run.state === "waiting_user" ? "waiting_user" : "executing";
@@ -785,6 +928,97 @@ export class RunStore {
   ): Promise<AssignmentRecord> {
     const persisted = await this.readPersistedRun(runId);
     return findAssignment(persisted, assignmentId);
+  }
+
+  async resumeAssignment(input: ResumeAssignmentInput): Promise<AssignmentRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(input.run_id);
+      assertRunAcceptsAssignments(persisted.run.state);
+      const current = findAssignment(persisted, input.assignment_id);
+      if (
+        current.role !== "pl" ||
+        current.state !== "completed" ||
+        current.output_contract !== "pl_worker_plan" ||
+        current.structured_report?.kind !== "pl_worker_plan" ||
+        current.session_id === null
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Only a completed PL worker-plan turn can resume for its final report",
+        );
+      }
+      const assignmentText = input.assignment.trim();
+      if (!assignmentText) {
+        throw new ArkTeamError("INVALID_INPUT", "assignment must not be empty");
+      }
+      if (input.output_contract !== "pl_report") {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "PL continuation requires pl_report",
+        );
+      }
+
+      const timestamp = this.now().toISOString();
+      const assignment: AssignmentRecord = {
+        ...current,
+        report_target: { type: "pm" },
+        assignment: assignmentText,
+        output_contract: "pl_report",
+        state: "running",
+        turn_id: null,
+        pending_approval: null,
+        final_report: null,
+        structured_report: null,
+        usage: null,
+        failure_message: null,
+        report_routed_at: null,
+        updated_at: timestamp,
+        revision: current.revision + 1,
+        turn_count: current.turn_count + 1,
+      };
+      const assignments = persisted.assignments.map((candidate) =>
+        candidate.assignment_id === assignment.assignment_id
+          ? assignment
+          : candidate,
+      );
+      const nextState = assignments.some(
+        (candidate) => candidate.state === "waiting_user",
+      )
+        ? "waiting_user"
+        : "executing";
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "assignment.resumed",
+        timestamp,
+        state: nextState,
+        assignment_id: assignment.assignment_id,
+        team_id: assignment.team_id,
+        agent_role: "pl",
+        message: "PL session resumed with consolidated worker reports",
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        state: nextState,
+        resume_state:
+          nextState === "waiting_user"
+            ? persisted.run.resume_state ?? "executing"
+            : null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+      });
+      return assignment;
+    });
   }
 
   async listAssignments(
@@ -865,6 +1099,10 @@ export class RunStore {
       }
 
       const timestamp = this.now().toISOString();
+      const structuredReport =
+        update.status === "completed" && current.output_contract !== null
+          ? parseManagedOutput(current.output_contract, update.final_report)
+          : null;
       const assignment: AssignmentRecord =
         update.status === "waiting_user"
           ? {
@@ -883,6 +1121,7 @@ export class RunStore {
               turn_id: update.turn_id,
               pending_approval: null,
               final_report: update.final_report.trim(),
+              structured_report: structuredReport,
               usage: update.usage,
               failure_message: null,
               report_routed_at: timestamp,
@@ -953,7 +1192,9 @@ export class RunStore {
             message:
               assignment.report_target.type === "pm"
                 ? "PL report routed to PM inbox"
-                : "Worker report routed to owning PL inbox",
+                : assignment.report_target.type === "controller"
+                  ? "PL worker plan routed to orchestration controller"
+                  : "Worker report routed to owning PL inbox",
           },
         );
       }

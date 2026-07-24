@@ -1,6 +1,10 @@
 import { z } from "zod/v4";
 
-import { pmPlanSchema } from "./role-contracts.js";
+import {
+  managedOutputContracts,
+  managedOutputSchema,
+  pmPlanSchema,
+} from "./role-contracts.js";
 
 export const RUN_ID_PATTERN = /^ark-\d{8}t\d{6}z-[a-z0-9]{6}$/;
 export const ASSIGNMENT_ID_PATTERN = /^asg-[a-f0-9]{12}$/;
@@ -35,6 +39,7 @@ export type AssignmentState = z.infer<typeof assignmentStateSchema>;
 export const teamStateSchema = z.enum([
   "ready",
   "active",
+  "completed",
   "integrated",
   "cleaned",
   "failed",
@@ -66,6 +71,9 @@ export const pendingApprovalSchema = z.object({
 
 export const reportTargetSchema = z.discriminatedUnion("type", [
   z.object({
+    type: z.literal("controller"),
+  }),
+  z.object({
     type: z.literal("pm"),
   }),
   z.object({
@@ -86,28 +94,84 @@ export const assignmentRecordSchema = z
     parent_assignment_id: z.string().regex(ASSIGNMENT_ID_PATTERN).nullable(),
     report_target: reportTargetSchema,
     assignment: z.string().min(1),
+    task_key: z.string().regex(TEAM_ID_PATTERN).nullable().default(null),
     working_directory: z.string().min(1),
+    output_contract: z.enum(managedOutputContracts).nullable().default(null),
     state: assignmentStateSchema,
     session_id: z.string().min(1).nullable(),
     turn_id: z.string().min(1).nullable(),
     pending_approval: pendingApprovalSchema.nullable(),
     final_report: z.string().min(1).nullable(),
+    structured_report: managedOutputSchema.nullable().default(null),
     usage: usageSchema.nullable(),
     failure_message: z.string().min(1).nullable(),
     report_routed_at: z.string().min(1).nullable(),
     created_at: z.string().min(1),
     updated_at: z.string().min(1),
     revision: z.number().int().positive(),
+    turn_count: z.number().int().positive().default(1),
   })
   .superRefine((assignment, context) => {
     if (
       assignment.role === "pl" &&
       (assignment.parent_assignment_id !== null ||
-        assignment.report_target.type !== "pm")
+        (assignment.report_target.type !== "pm" &&
+          assignment.report_target.type !== "controller"))
     ) {
       context.addIssue({
         code: "custom",
         message: "PL assignments must report directly to PM",
+      });
+    }
+    if (
+      assignment.role === "pl" &&
+      assignment.output_contract !== null &&
+      assignment.output_contract !== "pl_worker_plan" &&
+      assignment.output_contract !== "pl_report"
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "PL assignments require a PL output contract",
+      });
+    }
+    if (
+      assignment.role === "worker" &&
+      assignment.output_contract !== null &&
+      assignment.output_contract !== "worker_report"
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "worker assignments require worker_report",
+      });
+    }
+    if (
+      assignment.role === "pl" &&
+      assignment.output_contract === "pl_worker_plan" &&
+      assignment.report_target.type !== "controller"
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "PL worker plans must route to the controller",
+      });
+    }
+    if (
+      assignment.role === "pl" &&
+      assignment.output_contract === "pl_report" &&
+      assignment.report_target.type !== "pm"
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "final PL reports must route to PM",
+      });
+    }
+    if (
+      assignment.role === "worker" &&
+      (assignment.task_key !== null || assignment.output_contract !== null) &&
+      (assignment.task_key === null || assignment.output_contract === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "managed workers require task_key and output_contract",
       });
     }
     if (
@@ -138,11 +202,22 @@ export const assignmentRecordSchema = z
         !assignment.turn_id ||
         !assignment.final_report ||
         assignment.usage === null ||
-        !assignment.report_routed_at)
+        !assignment.report_routed_at ||
+        (assignment.output_contract !== null &&
+          assignment.structured_report === null))
     ) {
       context.addIssue({
         code: "custom",
         message: "completed assignments require report-routing evidence and usage",
+      });
+    }
+    if (
+      assignment.structured_report !== null &&
+      assignment.output_contract !== assignment.structured_report.kind
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "structured report kind must match output_contract",
       });
     }
     if (
@@ -223,8 +298,10 @@ export const runEventSchema = z.object({
     "pm.planned",
     "plan.materialized",
     "team.prepared",
+    "team.completed",
     "team.cleaned",
     "assignment.started",
+    "assignment.resumed",
     "assignment.waiting_user",
     "assignment.approval_resolved",
     "assignment.completed",

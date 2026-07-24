@@ -14,13 +14,15 @@ import {
   ArkTeamOrchestrator,
   type ExecuteArkTeamInput,
   type ExecuteArkTeamResult,
+  type TeamExecutionCoordinator,
 } from "./orchestrator.js";
 import { PlanMaterializer } from "./plan-materializer.js";
 import { pmPlanSchema } from "./role-contracts.js";
 import { RunStore } from "./state-store.js";
+import { TeamCoordinator } from "./team-coordinator.js";
 
 const SERVER_INSTRUCTIONS =
-  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, and materialize its strict plan in one call. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list. Managed PL/worker assignments require those linked Git worktrees. Keep every returned assignment_id. When an assignment returns waiting_user, present its pending approval and call ark_team_assignment_decide only after the user's decision. Use assignment status/list for stored reports and usage. Run pause/cancel stops active managed assignments.";
+  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, materialize its strict plan, and advance dependency-ready PL/worker work in one call. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list. Keep every returned assignment_id. When an assignment returns waiting_user, present its pending approval and call ark_team_assignment_decide only after the user's decision, then call ark_team_advance to continue the same hierarchy. Use assignment status/list for stored reports and usage. Run pause/cancel stops active managed assignments.";
 
 export interface ArkTeamExecutionController {
   execute(input: ExecuteArkTeamInput): Promise<ExecuteArkTeamResult>;
@@ -30,8 +32,10 @@ export function createArkTeamMcpServer(
   store: RunStore,
   scheduler = new ManagedAssignmentScheduler(store),
   materializer = new PlanMaterializer(store),
+  coordinator: TeamExecutionCoordinator = new TeamCoordinator(store, scheduler),
   orchestrator: ArkTeamExecutionController = new ArkTeamOrchestrator(store, {
     materializer,
+    coordinator,
   }),
 ): McpServer {
   const server = new McpServer(
@@ -86,6 +90,28 @@ export function createArkTeamMcpServer(
     async ({ objective, project_path }) =>
       handleTool(async () => ({
         ...(await orchestrator.execute({ objective, project_path })),
+      })),
+  );
+
+  server.registerTool(
+    "ark_team_advance",
+    {
+      title: "Advance Ark Team hierarchy",
+      description:
+        "Continue dependency-ready PL/worker scheduling and same-thread report delivery until blocked or waiting.",
+      inputSchema: {
+        run_id: z.string().min(1),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ run_id }) =>
+      handleTool(async () => ({
+        ...(await coordinator.advance(run_id)),
       })),
   );
 

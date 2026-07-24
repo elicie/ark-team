@@ -304,6 +304,81 @@ test("TEST-704 persists one PM plan and its prepared teams atomically", async ()
   assert.equal((await store.listTeams(run.run_id)).teams[0]?.state, "active");
 });
 
+test("TEST-901 reopens legacy assignments with new hierarchy defaults", async () => {
+  const runId = "ark-20260724t010000z-abc124";
+  const assignmentId = "asg-000000000001";
+  const runDirectory = path.join(stateRoot, runId);
+  await mkdir(runDirectory, { recursive: true });
+  await writeFile(
+    path.join(runDirectory, "run.json"),
+    `${JSON.stringify(
+      {
+        run: {
+          schema_version: 1,
+          run_id: runId,
+          objective: "Legacy assignment defaults",
+          project_path: projectRoot,
+          state: "executing",
+          resume_state: null,
+          created_at: "2026-07-24T01:00:00.000Z",
+          updated_at: "2026-07-24T01:00:00.000Z",
+          revision: 1,
+          event_count: 1,
+          assignment_count: 1,
+        },
+        events: [
+          {
+            schema_version: 1,
+            sequence: 1,
+            event_id: "legacy-assignment-event",
+            event_type: "assignment.started",
+            timestamp: "2026-07-24T01:00:00.000Z",
+            state: "executing",
+            assignment_id: assignmentId,
+            team_id: "team-a",
+            agent_role: "pl",
+          },
+        ],
+        assignments: [
+          {
+            schema_version: 1,
+            assignment_id: assignmentId,
+            run_id: runId,
+            team_id: "team-a",
+            role: "pl",
+            parent_assignment_id: null,
+            report_target: { type: "pm" },
+            assignment: "Legacy PL assignment",
+            working_directory: projectRoot,
+            state: "running",
+            session_id: null,
+            turn_id: null,
+            pending_approval: null,
+            final_report: null,
+            usage: null,
+            failure_message: null,
+            report_routed_at: null,
+            created_at: "2026-07-24T01:00:00.000Z",
+            updated_at: "2026-07-24T01:00:00.000Z",
+            revision: 1,
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+
+  const assignment = await new RunStore({
+    root_path: stateRoot,
+  }).getAssignment(runId, assignmentId);
+  assert.equal(assignment.task_key, null);
+  assert.equal(assignment.output_contract, null);
+  assert.equal(assignment.structured_report, null);
+  assert.equal(assignment.turn_count, 1);
+});
+
 test("TEST-502 enforces team, PL, worker ownership, and count bounds", async () => {
   let sequence = 0;
   const store = new RunStore({

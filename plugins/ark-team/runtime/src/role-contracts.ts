@@ -185,6 +185,14 @@ const contractSchemas = {
   pm_report: pmReportSchema,
 } as const;
 
+export const managedOutputSchema = z.union([
+  pmPlanSchema,
+  plWorkerPlanSchema,
+  workerReportSchema,
+  plReportSchema,
+  pmReportSchema,
+]);
+
 const allowedContractsByRole = {
   pm: new Set<ManagedOutputContract>(["pm_plan", "pm_report"]),
   pl: new Set<ManagedOutputContract>(["pl_worker_plan", "pl_report"]),

@@ -11,6 +11,11 @@ import {
   type RecordPmPlanResult,
   RunStore,
 } from "./state-store.js";
+import {
+  TeamCoordinator,
+  type TeamCoordinatorResult,
+} from "./team-coordinator.js";
+import { ManagedAssignmentScheduler } from "./assignment-scheduler.js";
 
 export interface ManagedPmLauncher {
   run(request: ManagedSessionRequest): Promise<ManagedSessionResult>;
@@ -19,6 +24,7 @@ export interface ManagedPmLauncher {
 export interface ArkTeamOrchestratorOptions {
   pm_launcher?: ManagedPmLauncher;
   materializer?: PlanMaterializer;
+  coordinator?: TeamExecutionCoordinator;
   codex_path?: string;
 }
 
@@ -31,11 +37,19 @@ export interface ExecuteArkTeamResult {
   run: RunRecord;
   pm_session: PmSessionRecord;
   teams: TeamRecord[];
+  assignments: TeamCoordinatorResult["assignments"];
+  progressed: boolean;
+  waiting_approvals: number;
+}
+
+export interface TeamExecutionCoordinator {
+  advance(runId: string): Promise<TeamCoordinatorResult>;
 }
 
 export class ArkTeamOrchestrator {
   private readonly pmLauncher: ManagedPmLauncher;
   private readonly materializer: PlanMaterializer;
+  private readonly coordinator: TeamExecutionCoordinator;
 
   constructor(
     private readonly store: RunStore,
@@ -50,6 +64,9 @@ export class ArkTeamOrchestrator {
           "codex",
       });
     this.materializer = options.materializer ?? new PlanMaterializer(store);
+    this.coordinator =
+      options.coordinator ??
+      new TeamCoordinator(store, new ManagedAssignmentScheduler(store));
   }
 
   async execute(input: ExecuteArkTeamInput): Promise<ExecuteArkTeamResult> {
@@ -83,11 +100,15 @@ export class ArkTeamOrchestrator {
     }
 
     const plan = pmResult.structured_report;
-    const materialized = await this.materializer.apply(run.run_id, plan);
+    await this.materializer.apply(run.run_id, plan);
+    const advanced = await this.coordinator.advance(run.run_id);
     return {
-      run: materialized.run,
+      run: advanced.run,
       pm_session: recorded.pm_session,
-      teams: materialized.teams,
+      teams: advanced.teams,
+      assignments: advanced.assignments,
+      progressed: advanced.progressed,
+      waiting_approvals: advanced.waiting_approvals,
     };
   }
 
