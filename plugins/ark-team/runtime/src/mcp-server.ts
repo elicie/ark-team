@@ -10,17 +10,29 @@ import {
 } from "./domain.js";
 import { ManagedAssignmentScheduler } from "./assignment-scheduler.js";
 import { normalizeError } from "./errors.js";
+import {
+  ArkTeamOrchestrator,
+  type ExecuteArkTeamInput,
+  type ExecuteArkTeamResult,
+} from "./orchestrator.js";
 import { PlanMaterializer } from "./plan-materializer.js";
 import { pmPlanSchema } from "./role-contracts.js";
 import { RunStore } from "./state-store.js";
 
 const SERVER_INSTRUCTIONS =
-  "Use Ark Team tools only after explicit user invocation. Start with ark_team_start and retain the run_id. Apply one validated pm_plan with ark_team_plan_apply to create durable linked team worktrees, then inspect them with ark_team_team_list. Managed PL/worker assignments require those linked Git worktrees. Keep every returned assignment_id. When an assignment returns waiting_user, present its pending approval and call ark_team_assignment_decide only after the user's decision. Use assignment status/list for stored reports and usage. Run pause/cancel stops active managed assignments.";
+  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, and materialize its strict plan in one call. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list. Managed PL/worker assignments require those linked Git worktrees. Keep every returned assignment_id. When an assignment returns waiting_user, present its pending approval and call ark_team_assignment_decide only after the user's decision. Use assignment status/list for stored reports and usage. Run pause/cancel stops active managed assignments.";
+
+export interface ArkTeamExecutionController {
+  execute(input: ExecuteArkTeamInput): Promise<ExecuteArkTeamResult>;
+}
 
 export function createArkTeamMcpServer(
   store: RunStore,
   scheduler = new ManagedAssignmentScheduler(store),
   materializer = new PlanMaterializer(store),
+  orchestrator: ArkTeamExecutionController = new ArkTeamOrchestrator(store, {
+    materializer,
+  }),
 ): McpServer {
   const server = new McpServer(
     {
@@ -51,6 +63,29 @@ export function createArkTeamMcpServer(
     async ({ objective, project_path }) =>
       handleTool(async () => ({
         run: await store.createRun({ objective, project_path }),
+      })),
+  );
+
+  server.registerTool(
+    "ark_team_execute",
+    {
+      title: "Execute Ark Team PM planning",
+      description:
+        "Create a run, invoke the Sol/xhigh read-only PM for a strict plan, and materialize its linked team worktrees.",
+      inputSchema: {
+        objective: z.string().min(1).max(20_000),
+        project_path: z.string().min(1),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ objective, project_path }) =>
+      handleTool(async () => ({
+        ...(await orchestrator.execute({ objective, project_path })),
       })),
   );
 
@@ -96,7 +131,7 @@ export function createArkTeamMcpServer(
     },
     async ({ run_id }) =>
       handleTool(async () => ({
-        run: await store.getRun(run_id),
+        ...(await store.getRunContext(run_id)),
       })),
   );
 

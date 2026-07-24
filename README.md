@@ -66,6 +66,7 @@ The plugin bundles a local stdio MCP server and registers it through `.mcp.json`
 It currently exposes:
 
 - `ark_team_start`
+- `ark_team_execute`
 - `ark_team_list`
 - `ark_team_status`
 - `ark_team_logs`
@@ -93,6 +94,12 @@ mission, dependencies, branch, worktree, base commit, worker count, and state.
 Set `ARK_TEAM_WORKTREE_ROOT` to an absolute path or `~/...` to override the
 default `<state-root>/.worktrees` location. The resolved location must be
 outside the project checkout.
+
+`ark_team_execute` combines run creation, a Sol/xhigh read-only PM turn, strict
+plan validation, PM session/usage persistence, and plan application. A PM
+failure leaves a durable failed run. A later worktree failure leaves the
+validated PM plan in a planning run so `ark_team_plan_apply` can retry it
+without consuming another PM turn.
 
 Managed assignment records live in the same atomic run record. Each record
 retains its team and parent PL, linked worktree, state, session and turn IDs,
@@ -290,9 +297,10 @@ app-server approval gateway, and a persistent MCP scheduler for explicitly
 defined PL and worker assignments. Role sessions now expose strict planning and
 report JSON contracts and can continue completed PM, PL, and worker threads.
 The control plane can also materialize a validated PM plan into durable linked
-team worktrees and preserved local branches.
+team worktrees and preserved local branches, and `ark_team_execute` now drives
+that PM-planning path from one MCP call.
 
-The next runtime slices are still required to invoke the PM planner, dispatch
-independent teams in parallel, route stored worker reports into PL
+The next runtime slices are still required to dispatch independent teams in
+parallel, route stored worker reports into PL
 continuations, apply retries, and integrate verified commits. The current
 control plane does not claim those guarantees.

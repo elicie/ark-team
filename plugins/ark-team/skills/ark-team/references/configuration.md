@@ -121,6 +121,7 @@ Use the runtime's actual tool schemas. Do not invent command names or fields.
 The current bundled control-plane slice exposes these MCP tools:
 
 - `ark_team_start`
+- `ark_team_execute`
 - `ark_team_list`
 - `ark_team_status`
 - `ark_team_logs`
@@ -135,7 +136,10 @@ The current bundled control-plane slice exposes these MCP tools:
 - `ark_team_assignment_decide`
 - `ark_team_assignment_cancel`
 
-The run lifecycle tools persist and control orchestration records.
+`ark_team_execute` is the managed one-call entry point: it creates the run,
+launches the Sol/xhigh read-only PM for a strict `pm_plan`, records the PM
+thread metadata and usage, and materializes the plan. The run lifecycle tools
+persist and control orchestration records.
 `ark_team_plan_apply` accepts one strict `pm_plan`, requires a clean Git
 repository root, creates up to four linked team worktrees and preserved local
 branches, and atomically records their base commit and contracts.
@@ -148,6 +152,12 @@ returned team worktree. Use one `team_id` per team, start its PL first, and pass
 `assignment_id` as each worker's `parent_assignment_id`. The scheduler enforces
 one PL per team, four teams per run, five workers per PL, and a shared team
 worktree.
+
+If PM execution or protocol validation fails, the runtime leaves a durable
+`failed` run. If PM succeeds but worktree materialization fails, it preserves
+the structured plan, PM session, and usage in a `planning` run. Correct the
+workspace condition and retry that exact plan through `ark_team_plan_apply`;
+do not spend another PM turn to regenerate it.
 
 The bundled runtime reads `ARK_TEAM_WORKTREE_ROOT` as an optional absolute
 managed-worktree root (a leading `~/` is expanded). Without it, worktrees live

@@ -23,6 +23,7 @@ import {
   type AssignmentState,
   persistedRunSchema,
   type PersistedRun,
+  type PmSessionRecord,
   type RunEvent,
   type RunListResult,
   type RunLogsResult,
@@ -95,6 +96,28 @@ export interface MaterializePlanInput {
 export interface MaterializePlanResult {
   run: RunRecord;
   teams: TeamRecord[];
+}
+
+export interface PmPlanEvidence {
+  session_id: string;
+  agent_name: "ark_pm";
+  model: "gpt-5.6-sol";
+  model_reasoning_effort: "xhigh";
+  sandbox_mode: "read-only";
+  approval_policy: "never";
+  usage: PmSessionRecord["usage"];
+}
+
+export interface RecordPmPlanResult {
+  run: RunRecord;
+  plan: PmPlan;
+  pm_session: PmSessionRecord;
+}
+
+export interface RunContextResult {
+  run: RunRecord;
+  plan: PmPlan | null;
+  pm_session: PmSessionRecord | null;
 }
 
 const ACTIVE_STATES = new Set<RunState>([
@@ -205,6 +228,7 @@ export class RunStore {
           assignments: [],
           teams: [],
           plan: null,
+          pm_session: null,
         });
       } catch (error) {
         await rm(this.runDirectory(runId), { recursive: true, force: true });
@@ -217,6 +241,15 @@ export class RunStore {
 
   async getRun(runId: string): Promise<RunRecord> {
     return (await this.readPersistedRun(runId)).run;
+  }
+
+  async getRunContext(runId: string): Promise<RunContextResult> {
+    const persisted = await this.readPersistedRun(runId);
+    return {
+      run: persisted.run,
+      plan: persisted.plan,
+      pm_session: persisted.pm_session,
+    };
   }
 
   async listRuns(input: ListRunsInput = {}): Promise<RunListResult> {
@@ -284,6 +317,138 @@ export class RunStore {
     };
   }
 
+  async recordPmPlan(
+    runId: string,
+    planInput: PmPlan,
+    evidence: PmPlanEvidence,
+  ): Promise<RecordPmPlanResult> {
+    return this.withMutation(async () => {
+      const parsedPlan = pmPlanSchema.safeParse(planInput);
+      if (!parsedPlan.success) {
+        throw new ArkTeamError("AGENT_SESSION_PROTOCOL_ERROR", "PM plan is invalid", {
+          cause: parsedPlan.error,
+        });
+      }
+      const persisted = await this.readPersistedRun(runId);
+      if (
+        persisted.run.state !== "planning" ||
+        persisted.plan !== null ||
+        persisted.pm_session !== null ||
+        persisted.teams.length > 0 ||
+        persisted.assignments.length > 0
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "PM planning evidence can only be recorded once before staffing",
+        );
+      }
+      if (
+        evidence.agent_name !== "ark_pm" ||
+        evidence.model !== "gpt-5.6-sol" ||
+        evidence.model_reasoning_effort !== "xhigh" ||
+        evidence.sandbox_mode !== "read-only" ||
+        evidence.approval_policy !== "never" ||
+        !evidence.session_id.trim()
+      ) {
+        throw new ArkTeamError(
+          "AGENT_SESSION_PROTOCOL_ERROR",
+          "PM session evidence does not match the managed role profile",
+        );
+      }
+
+      const timestamp = this.now().toISOString();
+      const pmSession: PmSessionRecord = {
+        session_id: evidence.session_id.trim(),
+        agent_name: evidence.agent_name,
+        model: evidence.model,
+        model_reasoning_effort: evidence.model_reasoning_effort,
+        sandbox_mode: evidence.sandbox_mode,
+        approval_policy: evidence.approval_policy,
+        usage: evidence.usage,
+        planned_at: timestamp,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "pm.planned",
+        timestamp,
+        state: "planning",
+        agent_role: "pm",
+        usage: evidence.usage,
+        message: `PM produced a validated ${parsedPlan.data.teams.length}-team plan`,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: parsedPlan.data,
+        pm_session: pmSession,
+      });
+      return {
+        run,
+        plan: parsedPlan.data,
+        pm_session: pmSession,
+      };
+    });
+  }
+
+  async failRun(runId: string, rawMessage: string): Promise<RunRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      if (persisted.run.state === "failed") {
+        return persisted.run;
+      }
+      if (
+        persisted.run.state === "completed" ||
+        persisted.run.state === "cancelled" ||
+        persisted.plan !== null ||
+        persisted.teams.length > 0 ||
+        persisted.assignments.length > 0
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          `Cannot fail run from ${persisted.run.state}`,
+        );
+      }
+      const message = rawMessage.trim().slice(0, 1000) || "PM planning failed";
+      const timestamp = this.now().toISOString();
+      const run: RunRecord = {
+        ...persisted.run,
+        state: "failed",
+        resume_state: null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: run.event_count,
+        event_id: randomUUID(),
+        event_type: "run.failed",
+        timestamp,
+        state: "failed",
+        message,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+      });
+      return run;
+    });
+  }
+
   async materializePlan(input: MaterializePlanInput): Promise<MaterializePlanResult> {
     return this.withMutation(async () => {
       const parsedPlan = pmPlanSchema.safeParse(input.plan);
@@ -293,10 +458,19 @@ export class RunStore {
         });
       }
       const persisted = await this.readPersistedRun(input.run_id);
-      if (persisted.run.state !== "planning" || persisted.plan !== null) {
+      if (persisted.run.state !== "planning") {
         throw new ArkTeamError(
           "INVALID_TRANSITION",
           `Cannot materialize a PM plan while the run is ${persisted.run.state}`,
+        );
+      }
+      if (
+        persisted.plan !== null &&
+        JSON.stringify(persisted.plan) !== JSON.stringify(parsedPlan.data)
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "materialized plan must match the stored PM plan",
         );
       }
       if (persisted.teams.length > 0 || persisted.assignments.length > 0) {
@@ -394,6 +568,7 @@ export class RunStore {
         assignments: persisted.assignments,
         teams,
         plan: parsedPlan.data,
+        pm_session: persisted.pm_session,
       });
       return { run, teams };
     });
@@ -598,6 +773,7 @@ export class RunStore {
         assignments: [...persisted.assignments, assignment],
         teams,
         plan: persisted.plan,
+        pm_session: persisted.pm_session,
       });
       return assignment;
     });
@@ -818,6 +994,7 @@ export class RunStore {
         assignments,
         teams: persisted.teams,
         plan: persisted.plan,
+        pm_session: persisted.pm_session,
       });
       return assignment;
     });
@@ -962,6 +1139,7 @@ export class RunStore {
         assignments: persisted.assignments,
         teams: persisted.teams,
         plan: persisted.plan,
+        pm_session: persisted.pm_session,
       });
       return { run: updatedRun, changed: true };
     });
@@ -1030,6 +1208,7 @@ export class RunStore {
         assignments,
         teams: persisted.teams,
         plan: persisted.plan,
+        pm_session: persisted.pm_session,
       });
       return assignment;
     });

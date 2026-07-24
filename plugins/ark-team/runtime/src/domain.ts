@@ -44,6 +44,7 @@ export type TeamState = z.infer<typeof teamStateSchema>;
 
 export const assignmentRoleSchema = z.enum(["pl", "worker"]);
 export type AssignmentRole = z.infer<typeof assignmentRoleSchema>;
+export const eventAgentRoleSchema = z.enum(["pm", "pl", "worker"]);
 
 export const usageSchema = z.object({
   input_tokens: z.number().int().nonnegative(),
@@ -179,6 +180,19 @@ export const teamRecordSchema = z.object({
 
 export type TeamRecord = z.infer<typeof teamRecordSchema>;
 
+export const pmSessionRecordSchema = z.object({
+  session_id: z.string().min(1),
+  agent_name: z.literal("ark_pm"),
+  model: z.literal("gpt-5.6-sol"),
+  model_reasoning_effort: z.literal("xhigh"),
+  sandbox_mode: z.literal("read-only"),
+  approval_policy: z.literal("never"),
+  usage: usageSchema,
+  planned_at: z.string().min(1),
+});
+
+export type PmSessionRecord = z.infer<typeof pmSessionRecordSchema>;
+
 export const runRecordSchema = z.object({
   schema_version: z.literal(1),
   run_id: z.string().regex(RUN_ID_PATTERN),
@@ -205,6 +219,8 @@ export const runEventSchema = z.object({
     "run.paused",
     "run.resumed",
     "run.cancelled",
+    "run.failed",
+    "pm.planned",
     "plan.materialized",
     "team.prepared",
     "team.cleaned",
@@ -222,7 +238,7 @@ export const runEventSchema = z.object({
   message: z.string().min(1).optional(),
   assignment_id: z.string().regex(ASSIGNMENT_ID_PATTERN).optional(),
   team_id: z.string().regex(TEAM_ID_PATTERN).optional(),
-  agent_role: assignmentRoleSchema.optional(),
+  agent_role: eventAgentRoleSchema.optional(),
   approval_id: z.string().uuid().optional(),
   report_target: reportTargetSchema.optional(),
   approval_decision: z
@@ -240,6 +256,7 @@ export const persistedRunSchema = z
     assignments: z.array(assignmentRecordSchema).default([]),
     teams: z.array(teamRecordSchema).default([]),
     plan: pmPlanSchema.nullable().default(null),
+    pm_session: pmSessionRecordSchema.nullable().default(null),
   })
   .superRefine((value, context) => {
     if (value.run.event_count !== value.events.length) {
@@ -310,7 +327,13 @@ export const persistedRunSchema = z
         message: "persisted teams require a PM plan",
       });
     }
-    if (value.plan !== null) {
+    if (value.pm_session !== null && value.plan === null) {
+      context.addIssue({
+        code: "custom",
+        message: "persisted PM session requires its structured plan",
+      });
+    }
+    if (value.plan !== null && value.teams.length > 0) {
       const plannedTeamIds = value.plan.teams.map((team) => team.team_id);
       if (
         plannedTeamIds.length !== value.teams.length ||
@@ -323,6 +346,16 @@ export const persistedRunSchema = z
           message: "persisted teams do not match the PM plan",
         });
       }
+    }
+    if (
+      value.plan !== null &&
+      value.teams.length === 0 &&
+      value.run.state !== "planning"
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "an unapplied PM plan requires a planning run",
+      });
     }
 
     value.events.forEach((event, index) => {
