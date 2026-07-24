@@ -167,6 +167,7 @@ class FakeWorkspaceManager implements TeamWorkspaceManager {
       isolation_mode: "git_worktree" as const,
       working_directory: path.join(this.root, run.run_id, team.team_id),
       branch: `ark-team/${run.run_id}/${team.team_id}`,
+      target_branch: "main",
       base_commit: "b".repeat(40),
     }));
   }

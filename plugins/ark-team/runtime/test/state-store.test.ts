@@ -230,6 +230,7 @@ test("TEST-704 persists one PM plan and its prepared teams atomically", async ()
     isolation_mode: "git_worktree" as const,
     working_directory: path.join(testRoot, "worktrees", team.team_id),
     branch: `ark-team/${run.run_id}/${team.team_id}`,
+    target_branch: "main",
     base_commit: baseCommit,
   }));
 

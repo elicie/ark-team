@@ -56,6 +56,9 @@ test("TEST-801 and TEST-802 execute the exact PM plan and persist usage only", a
     assert.equal(result.run.team_count, 1);
     assert.equal(result.pm_session.session_id, "pm-session-1");
     assert.deepEqual(result.pm_session.usage, usage);
+    assert.equal(result.integration, null);
+    assert.equal(result.pm_report, null);
+    assert.equal(result.remote_action_required, false);
     assert.equal(result.teams[0]?.team_id, "team-a");
     assert.equal(launcher.requests.length, 1);
     assert.deepEqual(
@@ -280,6 +283,7 @@ class FakeWorkspaceManager implements TeamWorkspaceManager {
       isolation_mode: "git_worktree",
       working_directory: path.join(this.root, run.run_id, team.team_id),
       branch: `ark-team/${run.run_id}/${team.team_id}`,
+      target_branch: "main",
       base_commit: "a".repeat(40),
     }));
   }

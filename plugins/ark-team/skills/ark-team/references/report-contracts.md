@@ -1,20 +1,21 @@
 # Ark Team Report Contracts
 
 The managed runtime uses strict JSON contracts named `pm_plan`,
-`pl_worker_plan`, `worker_report`, `pl_report`, and `pm_report`. Select only a
-contract permitted for the active role. Reject malformed JSON, unknown fields,
-wrong-role output, duplicate IDs, unknown or cyclic dependencies, more than
-four teams, or more than five workers. Keep the text shapes below for native
-fallback and user-facing reports.
+`pl_worker_plan`, `worker_report`, `pl_report`, `integration_report`, and
+`pm_report`. Select only a contract permitted for the active role. Reject
+malformed JSON, unknown fields, wrong-role output, duplicate IDs, unknown or
+cyclic dependencies, more than four teams, or more than five workers. Keep the
+text shapes below for native fallback and user-facing reports.
 
 ## Contents
 
 1. Worker report
 2. PL report
-3. PM start report
-4. PM status report
-5. PM final report
-6. Event-log fields
+3. Integration report
+4. PM start report
+5. PM status report
+6. PM final report
+7. Event-log fields
 
 ## Worker report
 
@@ -53,6 +54,23 @@ Decision needed from PM:
 ```
 
 Require the PL to distinguish observed evidence from inference.
+
+## Integration report
+
+Require the Terra integration PL to return `integration_report` with:
+
+```text
+Status: completed | blocked
+Summary:
+Team IDs:
+Full integration commit SHA:
+Cross-team verification:
+Blockers:
+```
+
+Reject completion when a team is omitted, any verification is not passing, the
+commit is not a full SHA, the worktree is dirty, the report disagrees with Git,
+or a recorded team tip is not an ancestor of the integration commit.
 
 ## PM start report
 

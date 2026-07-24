@@ -1,6 +1,7 @@
 import type {
   AssignmentListResult,
   AssignmentRecord,
+  AssignmentRole,
 } from "./domain.js";
 import {
   AppServerApprovalSession,
@@ -62,7 +63,7 @@ export class ManagedAssignmentScheduler {
 
   async start(input: CreateAssignmentInput): Promise<AssignmentRecord> {
     const workingDirectory = await assertManagedWorkspace(
-      input.role,
+      sessionRole(input.role),
       input.working_directory,
     );
     const assignment = await this.store.createAssignment({
@@ -79,7 +80,7 @@ export class ManagedAssignmentScheduler {
       input.assignment_id,
     );
     const workingDirectory = await assertManagedWorkspace(
-      current.role,
+      sessionRole(current.role),
       current.working_directory,
     );
     const assignment = await this.store.resumeAssignment(input);
@@ -98,7 +99,7 @@ export class ManagedAssignmentScheduler {
       input.assignment_id,
     );
     const workingDirectory = await assertManagedWorkspace(
-      current.role,
+      sessionRole(current.role),
       current.working_directory,
     );
     const assignment = await this.store.retryAssignment(input);
@@ -114,7 +115,7 @@ export class ManagedAssignmentScheduler {
       input.assignment_id,
     );
     const workingDirectory = await assertManagedWorkspace(
-      current.role,
+      sessionRole(current.role),
       current.working_directory,
     );
     const resumeSessionId = current.session_id;
@@ -318,7 +319,7 @@ export class ManagedAssignmentScheduler {
 
     try {
       const update = await session.start({
-        role: assignment.role,
+        role: sessionRole(assignment.role),
         assignment: assignment.assignment,
         working_directory: assignment.working_directory,
         ...(resumeSessionId === undefined
@@ -377,6 +378,10 @@ function isApprovalDecision(value: string): value is ApprovalDecision {
     value === "decline" ||
     value === "cancel"
   );
+}
+
+function sessionRole(role: AssignmentRole): "pl" | "worker" {
+  return role === "integration_pl" ? "pl" : role;
 }
 
 function normalizeSessionFailure(error: unknown): ArkTeamError {

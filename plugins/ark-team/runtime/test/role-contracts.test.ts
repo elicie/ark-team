@@ -17,6 +17,31 @@ test("TEST-601 parses strict role outputs and enforces role compatibility", () =
   assert.doesNotThrow(() =>
     assertManagedOutputContractRole("pl", "pl_worker_plan"),
   );
+  const integrationReport = {
+    kind: "integration_report" as const,
+    status: "completed" as const,
+    summary: "Integrated and verified.",
+    team_ids: ["team-a"],
+    integration_commit_sha: "a".repeat(40),
+    verification: [
+      {
+        name: "cross-team",
+        status: "passed" as const,
+        evidence: "checks passed",
+      },
+    ],
+    blockers: [],
+  };
+  assert.deepEqual(
+    parseManagedOutput(
+      "integration_report",
+      JSON.stringify(integrationReport),
+    ),
+    integrationReport,
+  );
+  assert.doesNotThrow(() =>
+    assertManagedOutputContractRole("pl", "integration_report"),
+  );
   assert.doesNotThrow(() =>
     assertManagedOutputContractRole("worker", "worker_report"),
   );

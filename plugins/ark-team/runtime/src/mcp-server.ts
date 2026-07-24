@@ -4,7 +4,6 @@ import { z } from "zod/v4";
 import {
   ASSIGNMENT_ID_PATTERN,
   TEAM_ID_PATTERN,
-  assignmentRoleSchema,
   assignmentStateSchema,
   runStateSchema,
 } from "./domain.js";
@@ -20,9 +19,13 @@ import { PlanMaterializer } from "./plan-materializer.js";
 import { pmPlanSchema } from "./role-contracts.js";
 import { RunStore } from "./state-store.js";
 import { TeamCoordinator } from "./team-coordinator.js";
+import {
+  ArkTeamRunCoordinator,
+  IntegrationCoordinator,
+} from "./integration-coordinator.js";
 
 const SERVER_INSTRUCTIONS =
-  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, materialize its strict plan, and advance dependency-ready PL/worker work in one call. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list. Keep every returned assignment_id. For waiting_user, distinguish pending_approval from pending_retry. Deliver approvals only through ark_team_assignment_decide. Deliver exhausted-retry choices only through ark_team_assignment_retry_decide. Then call ark_team_advance to continue the hierarchy. Use assignment status/list for stored reports, counters, and usage. Run pause/cancel stops active managed assignments.";
+  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, execute dependency-ready teams, and continue through guarded local integration and PM review in one call. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list and the integration record with ark_team_status. Keep every returned assignment_id. For waiting_user, distinguish pending_approval, pending_retry, and a verified pull-request handoff. Deliver approvals only through ark_team_assignment_decide. Deliver exhausted-retry choices only through ark_team_assignment_retry_decide. Never push or create a PR without the later remote-action approval flow. Then call ark_team_advance to continue the hierarchy. Use assignment status/list for stored reports, counters, and usage. Run pause/cancel stops active managed assignments.";
 
 export interface ArkTeamExecutionController {
   execute(input: ExecuteArkTeamInput): Promise<ExecuteArkTeamResult>;
@@ -32,7 +35,11 @@ export function createArkTeamMcpServer(
   store: RunStore,
   scheduler = new ManagedAssignmentScheduler(store),
   materializer = new PlanMaterializer(store),
-  coordinator: TeamExecutionCoordinator = new TeamCoordinator(store, scheduler),
+  coordinator: TeamExecutionCoordinator = new ArkTeamRunCoordinator(
+    store,
+    new TeamCoordinator(store, scheduler),
+    new IntegrationCoordinator(store, scheduler),
+  ),
   orchestrator: ArkTeamExecutionController = new ArkTeamOrchestrator(store, {
     materializer,
     coordinator,
@@ -98,7 +105,7 @@ export function createArkTeamMcpServer(
     {
       title: "Advance Ark Team hierarchy",
       description:
-        "Continue dependency-ready PL/worker scheduling and same-thread report delivery until blocked or waiting.",
+        "Continue dependency-ready teams, guarded integration, and PM review until completed, blocked, or waiting.",
       inputSchema: {
         run_id: z.string().min(1),
       },
@@ -241,7 +248,7 @@ export function createArkTeamMcpServer(
       inputSchema: {
         run_id: z.string().min(1),
         team_id: z.string().regex(TEAM_ID_PATTERN),
-        role: assignmentRoleSchema,
+        role: z.enum(["pl", "worker"]),
         parent_assignment_id: z
           .string()
           .regex(ASSIGNMENT_ID_PATTERN)

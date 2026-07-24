@@ -4,7 +4,11 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import type { RunRecord, TeamRecord } from "./domain.js";
+import type {
+  IntegrationRecord,
+  RunRecord,
+  TeamRecord,
+} from "./domain.js";
 import { ArkTeamError } from "./errors.js";
 import type { PmPlan } from "./role-contracts.js";
 
@@ -14,11 +18,22 @@ export interface PreparedTeamWorkspace {
   isolation_mode: TeamRecord["isolation_mode"];
   working_directory: string;
   branch: string;
+  target_branch: string;
   base_commit: string;
 }
 
 export interface WorktreeManagerOptions {
   root_path: string;
+}
+
+export interface PreparedIntegrationWorkspace {
+  run_id: string;
+  strategy: "local_merge" | "pull_request";
+  team_ids: string[];
+  working_directory: string;
+  branch: string;
+  target_branch: string;
+  base_commit: string;
 }
 
 const execFileAsync = promisify(execFile);
@@ -48,6 +63,7 @@ export class WorktreeManager {
     const baseCommit = (
       await git(projectPath, ["rev-parse", "HEAD"])
     ).stdout.trim();
+    const targetBranch = await currentBranch(projectPath);
     if (!/^[0-9a-f]{40,64}$/.test(baseCommit)) {
       throw new ArkTeamError(
         "WORKSPACE_PREPARATION_FAILED",
@@ -96,6 +112,7 @@ export class WorktreeManager {
           isolation_mode: "git_worktree",
           working_directory: workingDirectory,
           branch,
+          target_branch: targetBranch,
           base_commit: baseCommit,
         });
       }
@@ -144,6 +161,272 @@ export class WorktreeManager {
         `worktree branch was not preserved: ${workspace.branch}`,
       );
     }
+  }
+}
+
+export class IntegrationWorktreeManager {
+  readonly root_path: string;
+
+  constructor(options: WorktreeManagerOptions) {
+    if (!path.isAbsolute(options.root_path)) {
+      throw new ArkTeamError(
+        "INVALID_INPUT",
+        "managed worktree root must be absolute",
+      );
+    }
+    this.root_path = path.normalize(options.root_path);
+  }
+
+  async prepare(
+    run: RunRecord,
+    teams: TeamRecord[],
+    strategy: "local_merge" | "pull_request",
+  ): Promise<PreparedIntegrationWorkspace> {
+    const projectPath = await assertCleanRepositoryRoot(run.project_path);
+    assertOutsideProject(projectPath, this.root_path);
+    if (
+      teams.length === 0 ||
+      teams.some(
+        (team) =>
+          team.run_id !== run.run_id ||
+          team.state !== "completed" ||
+          team.base_commit !== teams[0]?.base_commit ||
+          team.target_branch === null ||
+          team.target_branch !== teams[0]?.target_branch,
+      )
+    ) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "Integration requires completed teams with one common base",
+      );
+    }
+    const baseCommit = teams[0]?.base_commit ?? "";
+    for (const team of teams) {
+      const status = await git(team.working_directory, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      if (
+        status.stdout.trim() ||
+        (await currentBranch(team.working_directory)) !== team.branch
+      ) {
+        throw new ArkTeamError(
+          "UNSAFE_AGENT_WORKSPACE",
+          `completed team ${team.team_id} does not have a clean recorded branch`,
+        );
+      }
+      try {
+        await git(projectPath, [
+          "merge-base",
+          "--is-ancestor",
+          baseCommit,
+          team.branch,
+        ]);
+      } catch (error) {
+        throw new ArkTeamError(
+          "UNSAFE_AGENT_WORKSPACE",
+          `team branch ${team.team_id} does not descend from the common base`,
+          { cause: error },
+        );
+      }
+    }
+    const currentHead = (
+      await git(projectPath, ["rev-parse", "HEAD"])
+    ).stdout.trim();
+    if (currentHead !== baseCommit) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        "Original checkout HEAD changed after team work started",
+      );
+    }
+    const targetBranch = teams[0]?.target_branch ?? "";
+    if ((await currentBranch(projectPath)) !== targetBranch) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        "Original checkout branch changed after team work started",
+      );
+    }
+
+    await mkdir(this.root_path, { recursive: true, mode: 0o700 });
+    const actualWorktreeRoot = await realpath(this.root_path);
+    assertOutsideProject(projectPath, actualWorktreeRoot);
+    const workingDirectory = path.join(
+      actualWorktreeRoot,
+      run.run_id,
+      "integration",
+    );
+    const branch = `orchestrator/${run.run_id}`;
+    if (await pathExists(workingDirectory)) {
+      throw new ArkTeamError(
+        "WORKSPACE_PREPARATION_FAILED",
+        `integration worktree path already exists: ${workingDirectory}`,
+      );
+    }
+    if (await branchExists(projectPath, branch)) {
+      throw new ArkTeamError(
+        "WORKSPACE_PREPARATION_FAILED",
+        `integration branch already exists: ${branch}`,
+      );
+    }
+    try {
+      await git(projectPath, [
+        "worktree",
+        "add",
+        "-b",
+        branch,
+        workingDirectory,
+        baseCommit,
+      ]);
+    } catch (error) {
+      throw workspaceFailure(
+        "Unable to create the integration linked worktree",
+        error,
+      );
+    }
+    return {
+      run_id: run.run_id,
+      strategy,
+      team_ids: teams.map((team) => team.team_id),
+      working_directory: workingDirectory,
+      branch,
+      target_branch: targetBranch,
+      base_commit: baseCommit,
+    };
+  }
+
+  async verify(
+    projectPath: string,
+    integration: IntegrationRecord,
+    teams: TeamRecord[],
+    reportedCommit: string,
+  ): Promise<string> {
+    const repositoryRoot = await assertRepositoryRoot(projectPath);
+    const expectedPath = path.join(
+      await realpath(this.root_path),
+      integration.run_id,
+      "integration",
+    );
+    if (
+      path.normalize(integration.working_directory) !== expectedPath ||
+      integration.team_ids.length !== teams.length
+    ) {
+      throw new ArkTeamError(
+        "INVALID_INPUT",
+        "integration workspace is not the registered managed worktree",
+      );
+    }
+    const status = await git(integration.working_directory, [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+    ]);
+    if (status.stdout.trim()) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        "integration worktree must be clean before verification",
+      );
+    }
+    const branch = await currentBranch(integration.working_directory);
+    const head = (
+      await git(integration.working_directory, ["rev-parse", "HEAD"])
+    ).stdout.trim();
+    if (
+      branch !== integration.branch ||
+      head !== reportedCommit ||
+      !/^[0-9a-f]{40,64}$/.test(head)
+    ) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        "integration branch or reported commit does not match Git",
+      );
+    }
+    for (const team of teams) {
+      if (!integration.team_ids.includes(team.team_id)) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          `integration record omits team ${team.team_id}`,
+        );
+      }
+      const teamTip = (
+        await git(repositoryRoot, ["rev-parse", `refs/heads/${team.branch}`])
+      ).stdout.trim();
+      try {
+        await git(repositoryRoot, [
+          "merge-base",
+          "--is-ancestor",
+          teamTip,
+          head,
+        ]);
+      } catch (error) {
+        throw new ArkTeamError(
+          "UNSAFE_AGENT_WORKSPACE",
+          `integration commit does not contain team ${team.team_id}`,
+          { cause: error },
+        );
+      }
+    }
+    return head;
+  }
+
+  async mergeLocal(
+    projectPath: string,
+    integration: IntegrationRecord,
+  ): Promise<string> {
+    const repositoryRoot = await assertCleanRepositoryRoot(projectPath);
+    const checkedOutBranch = await currentBranch(repositoryRoot);
+    const currentHead = (
+      await git(repositoryRoot, ["rev-parse", "HEAD"])
+    ).stdout.trim();
+    const integrationHead = (
+      await git(repositoryRoot, [
+        "rev-parse",
+        `refs/heads/${integration.branch}`,
+      ])
+    ).stdout.trim();
+    if (
+      integration.state !== "verified" ||
+      checkedOutBranch !== integration.target_branch ||
+      currentHead !== integration.base_commit ||
+      integrationHead !== integration.integration_commit_sha
+    ) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        "Original branch or integration ref changed before local merge",
+      );
+    }
+    try {
+      await git(repositoryRoot, ["merge", "--ff-only", integration.branch]);
+    } catch (error) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        "Local integration is not a clean fast-forward",
+        { cause: error },
+      );
+    }
+    const mergedHead = (
+      await git(repositoryRoot, ["rev-parse", "HEAD"])
+    ).stdout.trim();
+    if (mergedHead !== integrationHead) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        "Local merge did not reach the verified integration commit",
+      );
+    }
+    return mergedHead;
+  }
+
+  async cleanupPrepared(
+    projectPath: string,
+    workspace: PreparedIntegrationWorkspace,
+  ): Promise<void> {
+    const repositoryRoot = await assertRepositoryRoot(projectPath);
+    await git(repositoryRoot, [
+      "worktree",
+      "remove",
+      "--force",
+      workspace.working_directory,
+    ]);
   }
 }
 
@@ -291,6 +574,29 @@ async function git(
     });
   } catch (error) {
     throw error;
+  }
+}
+
+async function currentBranch(workingDirectory: string): Promise<string> {
+  try {
+    const branch = (
+      await git(workingDirectory, [
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+      ])
+    ).stdout.trim();
+    if (!branch) {
+      throw new Error("empty branch");
+    }
+    return branch;
+  } catch (error) {
+    throw new ArkTeamError(
+      "UNSAFE_AGENT_WORKSPACE",
+      "Managed Git checkout must remain on its recorded branch",
+      { cause: error },
+    );
   }
 }
 

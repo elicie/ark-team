@@ -35,7 +35,8 @@ Do not activate Ark Team for a normal coding request merely because subagents co
 4. Detect whether the managed Ark Team runtime is available.
    - Prefer the managed runtime when it can create a dedicated `gpt-5.6-sol`/`xhigh`/read-only PM session, persistent run state, and isolated team sessions.
    - Prefer `ark_team_execute` for a writing run so the runtime creates the run, invokes the managed PM for a strict `pm_plan`, records usage, materializes team worktrees, and advances all dependency-ready PL and worker turns in one call.
-   - The managed coordinator asks each Terra PL for one strict worker plan, dispatches its Luna workers in dependency waves, routes their strict reports to that PL, and resumes the same PL session for the final team report. It repeats this across ready teams until every team is complete, an approval is waiting, or the run reaches integration.
+   - The managed coordinator asks each Terra PL for one strict worker plan, dispatches its Luna workers in dependency waves, routes their strict reports to that PL, and resumes the same PL session for the final team report. It repeats this across ready teams and then assigns a separate Terra integration PL in `orchestrator/<run-id>`.
+   - The integration PL merges every clean recorded team branch, runs cross-team verification, and returns `integration_report`. The controller independently checks branch ancestry, cleanliness, and the reported commit. For `local_merge`, it fast-forwards only an unchanged clean original branch, then resumes the original Sol PM session for `pm_report`.
    - Use `ark_team_start` plus `ark_team_plan_apply` only for a manual plan or to retry a stored PM plan after worktree preparation failed. Retain the returned run, PM session, team worktree, and branch records.
    - When managed assignment tools are available, retain every returned assignment ID and use them for explicit PL/worker start, status, approval, and cancellation operations.
    - Otherwise use the named native Codex custom agents only for read-only work, respect the surfaced concurrency limit, and schedule work in waves.
@@ -89,6 +90,11 @@ Use a temporary shadow Git workspace when the source is not a Git repository. Ne
 
 After team completion, appoint a Terra/xhigh integration PL to combine local commits on an `orchestrator/<run-id>` branch and run cross-team verification.
 
+With the managed runtime, let `ark_team_execute` or `ark_team_advance` create
+the integration worktree and integration PL. Do not manually substitute a
+directory or merge in the PM session. Treat `integration_pl` as a Terra role,
+not another team and not a worker owner.
+
 Apply these rules:
 
 - Keep local branches after removing completed worktrees.
@@ -96,6 +102,9 @@ Apply these rules:
 - Permit clean local integration without extra approval.
 - Require user approval before push, pull-request creation, remote merge, deployment, or another external side effect.
 - Stop before integration when the target branch is dirty, changed since run start, or has unresolved conflicts.
+- For `pull_request`, stop after verified local integration with
+  `remote_action_required`; do not push or create the PR until the remote
+  approval operation is available and the user explicitly approves it.
 
 ## Verify and retry
 

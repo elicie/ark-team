@@ -32,6 +32,10 @@ test("TEST-701 prepares isolated worktrees with distinct preserved branches", as
       prepared.map((workspace) => workspace.base_commit),
       [baseCommit, baseCommit],
     );
+    assert.deepEqual(
+      prepared.map((workspace) => workspace.target_branch),
+      ["main", "main"],
+    );
     assert.notEqual(prepared[0]?.branch, prepared[1]?.branch);
     for (const workspace of prepared) {
       assert.equal((await stat(path.join(workspace.working_directory, ".git"))).isFile(), true);

@@ -1,4 +1,9 @@
-import type { PmSessionRecord, RunRecord, TeamRecord } from "./domain.js";
+import type {
+  IntegrationRecord,
+  PmSessionRecord,
+  RunRecord,
+  TeamRecord,
+} from "./domain.js";
 import { ArkTeamError } from "./errors.js";
 import {
   ManagedCodexSessionLauncher,
@@ -6,7 +11,7 @@ import {
   type ManagedSessionResult,
 } from "./managed-session.js";
 import { PlanMaterializer } from "./plan-materializer.js";
-import type { PmPlan } from "./role-contracts.js";
+import type { PmPlan, PmReport } from "./role-contracts.js";
 import {
   type RecordPmPlanResult,
   RunStore,
@@ -16,6 +21,10 @@ import {
   type TeamCoordinatorResult,
 } from "./team-coordinator.js";
 import { ManagedAssignmentScheduler } from "./assignment-scheduler.js";
+import {
+  ArkTeamRunCoordinator,
+  IntegrationCoordinator,
+} from "./integration-coordinator.js";
 
 export interface ManagedPmLauncher {
   run(request: ManagedSessionRequest): Promise<ManagedSessionResult>;
@@ -38,6 +47,9 @@ export interface ExecuteArkTeamResult {
   pm_session: PmSessionRecord;
   teams: TeamRecord[];
   assignments: TeamCoordinatorResult["assignments"];
+  integration: IntegrationRecord | null;
+  pm_report: PmReport | null;
+  remote_action_required: boolean;
   progressed: boolean;
   waiting_approvals: number;
   waiting_retries: number;
@@ -65,9 +77,25 @@ export class ArkTeamOrchestrator {
           "codex",
       });
     this.materializer = options.materializer ?? new PlanMaterializer(store);
-    this.coordinator =
-      options.coordinator ??
-      new TeamCoordinator(store, new ManagedAssignmentScheduler(store));
+    if (options.coordinator) {
+      this.coordinator = options.coordinator;
+    } else {
+      const scheduler = new ManagedAssignmentScheduler(store, {
+        ...(options.codex_path === undefined
+          ? {}
+          : { codex_path: options.codex_path }),
+      });
+      this.coordinator = new ArkTeamRunCoordinator(
+        store,
+        new TeamCoordinator(store, scheduler),
+        new IntegrationCoordinator(store, scheduler, {
+          pm_launcher: this.pmLauncher,
+          ...(options.codex_path === undefined
+            ? {}
+            : { codex_path: options.codex_path }),
+        }),
+      );
+    }
   }
 
   async execute(input: ExecuteArkTeamInput): Promise<ExecuteArkTeamResult> {
@@ -103,11 +131,16 @@ export class ArkTeamOrchestrator {
     const plan = pmResult.structured_report;
     await this.materializer.apply(run.run_id, plan);
     const advanced = await this.coordinator.advance(run.run_id);
+    const current = await this.store.getRunContext(run.run_id);
     return {
       run: advanced.run,
-      pm_session: recorded.pm_session,
+      pm_session: current.pm_session ?? recorded.pm_session,
       teams: advanced.teams,
       assignments: advanced.assignments,
+      integration: current.integration,
+      pm_report: current.pm_session?.final_report ?? null,
+      remote_action_required:
+        current.integration?.state === "awaiting_remote",
       progressed: advanced.progressed,
       waiting_approvals: advanced.waiting_approvals,
       waiting_retries: advanced.waiting_retries,

@@ -21,6 +21,7 @@ import {
   type AssignmentRecord,
   type AssignmentRole,
   type AssignmentState,
+  type IntegrationRecord,
   persistedRunSchema,
   type PersistedRun,
   type PmSessionRecord,
@@ -46,6 +47,7 @@ import {
   pmPlanSchema,
   type ManagedOutputContract,
   type PmPlan,
+  type PmReport,
 } from "./role-contracts.js";
 import { assertRunId, createRunId } from "./run-id.js";
 import type { PreparedTeamWorkspace } from "./worktree-manager.js";
@@ -139,6 +141,23 @@ export interface CompleteTeamResult {
   team: TeamRecord;
 }
 
+export interface MaterializeIntegrationInput {
+  run_id: string;
+  strategy: "local_merge" | "pull_request";
+  team_ids: string[];
+  working_directory: string;
+  branch: string;
+  target_branch: string;
+  base_commit: string;
+}
+
+export interface CompletePmReviewInput {
+  run_id: string;
+  session_id: string;
+  report: PmReport;
+  usage: PmSessionRecord["usage"];
+}
+
 export interface PmPlanEvidence {
   session_id: string;
   agent_name: "ark_pm";
@@ -159,6 +178,7 @@ export interface RunContextResult {
   run: RunRecord;
   plan: PmPlan | null;
   pm_session: PmSessionRecord | null;
+  integration: IntegrationRecord | null;
 }
 
 const ACTIVE_STATES = new Set<RunState>([
@@ -270,6 +290,7 @@ export class RunStore {
           teams: [],
           plan: null,
           pm_session: null,
+          integration: null,
         });
       } catch (error) {
         await rm(this.runDirectory(runId), { recursive: true, force: true });
@@ -290,6 +311,7 @@ export class RunStore {
       run: persisted.run,
       plan: persisted.plan,
       pm_session: persisted.pm_session,
+      integration: persisted.integration,
     };
   }
 
@@ -407,6 +429,10 @@ export class RunStore {
         approval_policy: evidence.approval_policy,
         usage: evidence.usage,
         planned_at: timestamp,
+        turn_count: 1,
+        final_report: null,
+        final_usage: null,
+        completed_at: null,
       };
       const event: RunEvent = {
         schema_version: 1,
@@ -432,6 +458,7 @@ export class RunStore {
         teams: persisted.teams,
         plan: parsedPlan.data,
         pm_session: pmSession,
+        integration: persisted.integration,
       });
       return {
         run,
@@ -485,6 +512,7 @@ export class RunStore {
         teams: persisted.teams,
         plan: persisted.plan,
         pm_session: persisted.pm_session,
+        integration: persisted.integration,
       });
       return run;
     });
@@ -559,6 +587,7 @@ export class RunStore {
           isolation_mode: workspace.isolation_mode,
           working_directory: path.normalize(workspace.working_directory),
           branch: workspace.branch,
+          target_branch: workspace.target_branch,
           base_commit: workspace.base_commit,
           state: "ready",
           created_at: timestamp,
@@ -610,6 +639,7 @@ export class RunStore {
         teams,
         plan: parsedPlan.data,
         pm_session: persisted.pm_session,
+        integration: persisted.integration,
       });
       return { run, teams };
     });
@@ -622,6 +652,102 @@ export class RunStore {
       teams: persisted.teams,
       total: persisted.teams.length,
     };
+  }
+
+  async getIntegration(runId: string): Promise<IntegrationRecord | null> {
+    return (await this.readPersistedRun(runId)).integration;
+  }
+
+  async materializeIntegration(
+    input: MaterializeIntegrationInput,
+  ): Promise<IntegrationRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(input.run_id);
+      if (
+        persisted.run.state !== "integrating" ||
+        persisted.plan === null ||
+        persisted.integration !== null ||
+        persisted.teams.length === 0 ||
+        persisted.teams.some((team) => team.state !== "completed")
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Integration workspace requires one all-team-complete integrating run",
+        );
+      }
+      if (!path.isAbsolute(input.working_directory)) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "integration working_directory must be absolute",
+        );
+      }
+      const expectedTeamIds = persisted.teams.map((team) => team.team_id);
+      if (
+        JSON.stringify(input.team_ids) !== JSON.stringify(expectedTeamIds)
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "integration team IDs must match the materialized PM plan",
+        );
+      }
+      const baseCommits = new Set(
+        persisted.teams.map((team) => team.base_commit),
+      );
+      if (
+        baseCommits.size !== 1 ||
+        !baseCommits.has(input.base_commit) ||
+        !/^[0-9a-f]{40,64}$/.test(input.base_commit)
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "integration base commit must match every team",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const integration: IntegrationRecord = {
+        schema_version: 1,
+        run_id: persisted.run.run_id,
+        strategy: input.strategy,
+        team_ids: expectedTeamIds,
+        working_directory: path.normalize(input.working_directory),
+        branch: input.branch.trim(),
+        target_branch: input.target_branch.trim(),
+        base_commit: input.base_commit,
+        state: "ready",
+        assignment_id: null,
+        integration_commit_sha: null,
+        created_at: timestamp,
+        updated_at: timestamp,
+        verified_at: null,
+        merged_at: null,
+        revision: 1,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "integration.prepared",
+        timestamp,
+        state: "integrating",
+        message: `Integration worktree prepared on ${integration.branch}`,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return integration;
+    });
   }
 
   async completeTeam(
@@ -704,6 +830,7 @@ export class RunStore {
         teams,
         plan: persisted.plan,
         pm_session: persisted.pm_session,
+        integration: persisted.integration,
       });
       return { run, team };
     });
@@ -719,11 +846,21 @@ export class RunStore {
           "team_id must contain lowercase letters, digits, or hyphens",
         );
       }
-      if (input.role !== "pl" && input.role !== "worker") {
-        throw new ArkTeamError("INVALID_INPUT", "assignment role must be pl or worker");
+      if (
+        input.role !== "pl" &&
+        input.role !== "worker" &&
+        input.role !== "integration_pl"
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "assignment role must be pl, worker, or integration_pl",
+        );
       }
       if (input.output_contract !== undefined) {
-        assertManagedOutputContractRole(input.role, input.output_contract);
+        assertManagedOutputContractRole(
+          input.role === "integration_pl" ? "pl" : input.role,
+          input.output_contract,
+        );
       }
       const taskKey = input.task_key?.trim() ?? null;
       if (
@@ -741,8 +878,11 @@ export class RunStore {
           "managed worker task_key and output_contract must be provided together",
         );
       }
-      if (input.role === "pl" && taskKey !== null) {
-        throw new ArkTeamError("INVALID_INPUT", "PL assignments cannot have task_key");
+      if (input.role !== "worker" && taskKey !== null) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "PL assignments cannot have task_key",
+        );
       }
       const assignmentText = input.assignment.trim();
       if (!assignmentText) {
@@ -759,6 +899,7 @@ export class RunStore {
         (team) => team.team_id === input.team_id,
       );
       if (
+        input.role !== "integration_pl" &&
         persisted.plan !== null &&
         (!plannedTeam ||
           plannedTeam.working_directory !== workingDirectory ||
@@ -807,7 +948,7 @@ export class RunStore {
             "an Ark Team run cannot contain more than four teams",
           );
         }
-      } else {
+      } else if (input.role === "worker") {
         if (
           !input.parent_assignment_id ||
           !ASSIGNMENT_ID_PATTERN.test(input.parent_assignment_id)
@@ -861,6 +1002,23 @@ export class RunStore {
           );
         }
         parentAssignmentId = parent.assignment_id;
+      } else {
+        if (
+          input.team_id !== "integration" ||
+          input.parent_assignment_id !== undefined ||
+          input.output_contract !== "integration_report" ||
+          persisted.run.state !== "integrating" ||
+          persisted.integration?.state !== "ready" ||
+          persisted.integration.working_directory !== workingDirectory ||
+          persisted.assignments.some(
+            (assignment) => assignment.role === "integration_pl",
+          )
+        ) {
+          throw new ArkTeamError(
+            "INVALID_TRANSITION",
+            "Integration PL requires the one prepared integration worktree",
+          );
+        }
       }
 
       const timestamp = this.now().toISOString();
@@ -877,7 +1035,9 @@ export class RunStore {
             ? input.output_contract === "pl_worker_plan"
               ? { type: "controller" }
               : { type: "pm" }
-            : { type: "assignment", assignment_id: parentAssignmentId ?? "" },
+            : input.role === "integration_pl"
+              ? { type: "pm" }
+              : { type: "assignment", assignment_id: parentAssignmentId ?? "" },
         assignment: assignmentText,
         task_key: taskKey,
         working_directory: workingDirectory,
@@ -900,7 +1060,11 @@ export class RunStore {
         correction_count: 0,
       };
       const nextState =
-        persisted.run.state === "waiting_user" ? "waiting_user" : "executing";
+        persisted.run.state === "waiting_user"
+          ? "waiting_user"
+          : input.role === "integration_pl"
+            ? "integrating"
+            : "executing";
       const event: RunEvent = {
         schema_version: 1,
         sequence: persisted.run.event_count + 1,
@@ -936,6 +1100,16 @@ export class RunStore {
                 : team,
             )
           : persisted.teams;
+      const integration =
+        input.role === "integration_pl" && persisted.integration !== null
+          ? {
+              ...persisted.integration,
+              state: "active" as const,
+              assignment_id: assignmentId,
+              updated_at: timestamp,
+              revision: persisted.integration.revision + 1,
+            }
+          : persisted.integration;
 
       await this.writePersistedRun({
         run: updatedRun,
@@ -944,6 +1118,7 @@ export class RunStore {
         teams,
         plan: persisted.plan,
         pm_session: persisted.pm_session,
+        integration,
       });
       return assignment;
     });
@@ -1045,6 +1220,7 @@ export class RunStore {
         teams: persisted.teams,
         plan: persisted.plan,
         pm_session: persisted.pm_session,
+        integration: persisted.integration,
       });
       return assignment;
     });
@@ -1115,7 +1291,9 @@ export class RunStore {
         ? "waiting_user"
         : persisted.run.state === "waiting_user"
           ? persisted.run.resume_state ?? "executing"
-          : "executing";
+          : assignment.role === "integration_pl"
+            ? "integrating"
+            : "executing";
       const events = retryAttemptEvents({
         persisted,
         assignment,
@@ -1146,6 +1324,7 @@ export class RunStore {
         teams: persisted.teams,
         plan: persisted.plan,
         pm_session: persisted.pm_session,
+        integration: persisted.integration,
       });
       return assignment;
     });
@@ -1202,7 +1381,9 @@ export class RunStore {
         ? "waiting_user"
         : persisted.run.state === "waiting_user"
           ? persisted.run.resume_state ?? "executing"
-          : "executing";
+          : assignment.role === "integration_pl"
+            ? "integrating"
+            : "executing";
       const events = retryAttemptEvents({
         persisted,
         assignment,
@@ -1233,6 +1414,7 @@ export class RunStore {
         teams: persisted.teams,
         plan: persisted.plan,
         pm_session: persisted.pm_session,
+        integration: persisted.integration,
       });
       return assignment;
     });
@@ -1339,6 +1521,7 @@ export class RunStore {
         teams: persisted.teams,
         plan: persisted.plan,
         pm_session: persisted.pm_session,
+        integration: persisted.integration,
       });
       return assignment;
     });
@@ -1388,7 +1571,10 @@ export class RunStore {
           `Cannot update an assignment while it is ${current.state}`,
         );
       }
-      if (update.role !== current.role) {
+      if (
+        update.role !==
+        (current.role === "integration_pl" ? "pl" : current.role)
+      ) {
         throw new ArkTeamError(
           "AGENT_SESSION_PROTOCOL_ERROR",
           "session update role does not match the persisted assignment",
@@ -1561,8 +1747,271 @@ export class RunStore {
         teams: persisted.teams,
         plan: persisted.plan,
         pm_session: persisted.pm_session,
+        integration: persisted.integration,
       });
       return assignment;
+    });
+  }
+
+  async verifyIntegration(
+    runId: string,
+    assignmentId: string,
+    integrationCommitSha: string,
+  ): Promise<IntegrationRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = persisted.integration;
+      const assignment = findAssignment(persisted, assignmentId);
+      const report =
+        assignment.structured_report?.kind === "integration_report"
+          ? assignment.structured_report
+          : null;
+      if (
+        persisted.run.state !== "integrating" ||
+        current?.state !== "active" ||
+        current.assignment_id !== assignmentId ||
+        assignment.role !== "integration_pl" ||
+        assignment.state !== "completed" ||
+        assignment.output_contract !== "integration_report" ||
+        report === null ||
+        report.status !== "completed" ||
+        report.integration_commit_sha !== integrationCommitSha ||
+        JSON.stringify(report.team_ids) !==
+          JSON.stringify(current.team_ids) ||
+        report.verification.some(
+          (verification) => verification.status !== "passed",
+        ) ||
+        report.blockers.length > 0
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Integration verification requires one passing integration PL report",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const integration: IntegrationRecord = {
+        ...current,
+        state: "verified",
+        integration_commit_sha: integrationCommitSha,
+        updated_at: timestamp,
+        verified_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "integration.verified",
+        timestamp,
+        state: "verifying",
+        assignment_id: assignmentId,
+        agent_role: "integration_pl",
+        message: `Integration commit ${integrationCommitSha} verified`,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        state: "verifying",
+        resume_state: null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return integration;
+    });
+  }
+
+  async recordLocalMerge(
+    runId: string,
+    integrationCommitSha: string,
+  ): Promise<IntegrationRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = persisted.integration;
+      if (
+        persisted.run.state !== "verifying" ||
+        current?.state !== "verified" ||
+        current.strategy !== "local_merge" ||
+        current.integration_commit_sha !== integrationCommitSha
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Local merge requires the verified integration commit",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const integration: IntegrationRecord = {
+        ...current,
+        state: "local_merged",
+        updated_at: timestamp,
+        merged_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "integration.local_merged",
+        timestamp,
+        state: "verifying",
+        message: `Original branch fast-forwarded to ${integrationCommitSha}`,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return integration;
+    });
+  }
+
+  async recordAwaitingRemote(runId: string): Promise<IntegrationRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = persisted.integration;
+      if (
+        persisted.run.state !== "verifying" ||
+        current?.state !== "verified" ||
+        current.strategy !== "pull_request"
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Remote handoff requires a verified pull-request integration",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const integration: IntegrationRecord = {
+        ...current,
+        state: "awaiting_remote",
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "integration.awaiting_remote",
+        timestamp,
+        state: "waiting_user",
+        message: "Verified integration is waiting for remote-action approval",
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        state: "waiting_user",
+        resume_state: "verifying",
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return integration;
+    });
+  }
+
+  async completePmReview(input: CompletePmReviewInput): Promise<RunRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(input.run_id);
+      const integration = persisted.integration;
+      const pmSession = persisted.pm_session;
+      const expectedTeamIds = persisted.teams.map((team) => team.team_id);
+      if (
+        persisted.run.state !== "verifying" ||
+        integration?.state !== "local_merged" ||
+        pmSession === null ||
+        pmSession.session_id !== input.session_id ||
+        input.report.status !== "completed" ||
+        input.report.user_decisions.length > 0 ||
+        input.report.integration_verification.some(
+          (verification) => verification.status !== "passed",
+        ) ||
+        input.report.teams.some((team) => team.status !== "completed") ||
+        JSON.stringify(input.report.teams.map((team) => team.team_id)) !==
+          JSON.stringify(expectedTeamIds)
+      ) {
+        throw new ArkTeamError(
+          "AGENT_SESSION_PROTOCOL_ERROR",
+          "PM final report does not accept the verified local integration",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const completedPm: PmSessionRecord = {
+        ...pmSession,
+        turn_count: pmSession.turn_count + 1,
+        final_report: input.report,
+        final_usage: input.usage,
+        completed_at: timestamp,
+      };
+      const events: RunEvent[] = [
+        {
+          schema_version: 1,
+          sequence: persisted.run.event_count + 1,
+          event_id: randomUUID(),
+          event_type: "pm.completed",
+          timestamp,
+          state: "completed",
+          agent_role: "pm",
+          usage: input.usage,
+          message: "PM accepted the integrated result",
+        },
+        {
+          schema_version: 1,
+          sequence: persisted.run.event_count + 2,
+          event_id: randomUUID(),
+          event_type: "run.completed",
+          timestamp,
+          state: "completed",
+          message: "Ark Team run completed",
+        },
+      ];
+      const run: RunRecord = {
+        ...persisted.run,
+        state: "completed",
+        resume_state: null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + events.length,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, ...events],
+        assignments: persisted.assignments,
+        teams: persisted.teams.map((team) => ({
+          ...team,
+          state: "integrated",
+          updated_at: timestamp,
+          revision: team.revision + 1,
+        })),
+        plan: persisted.plan,
+        pm_session: completedPm,
+        integration,
+      });
+      return run;
     });
   }
 
@@ -1706,6 +2155,7 @@ export class RunStore {
         teams: persisted.teams,
         plan: persisted.plan,
         pm_session: persisted.pm_session,
+        integration: persisted.integration,
       });
       return { run: updatedRun, changed: true };
     });
@@ -1798,6 +2248,7 @@ export class RunStore {
         teams: persisted.teams,
         plan: persisted.plan,
         pm_session: persisted.pm_session,
+        integration: persisted.integration,
       });
       return assignment;
     });

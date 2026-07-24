@@ -145,9 +145,15 @@ dependency-ready team. The coordinator asks each Terra PL for a strict
 `pl_worker_plan`, dispatches the selected Luna workers in dependency waves,
 routes strict `worker_report` records to their owning PL, and resumes that same
 PL session for its strict `pl_report`. Independent teams and workers are
-started concurrently. The run stops advancing when it is waiting for a user
-approval, cannot make dependency progress, or all teams are ready to integrate.
-The run lifecycle tools persist and control orchestration records.
+started concurrently. After all teams complete, it creates a separate linked
+worktree on `orchestrator/<run-id>`, starts a Terra/xhigh integration PL for
+strict `integration_report`, verifies every team tip is an ancestor of the
+clean reported commit, and applies the plan strategy. A clean `local_merge`
+uses fast-forward only when the original branch and HEAD remain unchanged,
+then the original Sol PM session resumes for strict `pm_report`. A
+`pull_request` strategy stops at verified local state with
+`remote_action_required`; this slice never pushes or creates a PR. The run
+lifecycle tools persist and control orchestration records.
 `ark_team_plan_apply` accepts one strict `pm_plan`, requires a clean Git
 repository root, creates up to four linked team worktrees and preserved local
 branches, and atomically records their base commit and contracts.
@@ -188,7 +194,11 @@ The scheduler records interim PL worker plans for the controller, worker
 reports for the owning PL, and final PL reports for PM. A team is completed
 only after the final report covers every assigned worker and reports passing
 verification. Once all teams complete, the run enters `integrating`; merge,
-cross-team verification, and cleanup are handled by a later integration stage.
+cross-team verification, local fast-forward, and PM final review are handled by
+the managed integration coordinator. The original checkout must still be
+clean, attached to its recorded branch, and at the common base commit. Team
+worktrees must be clean and every team branch must descend from that base.
+Integration and team worktrees remain until the later cleanup stage.
 Pending approvals remain persisted but cannot yet be reattached after an MCP
 process restart.
 

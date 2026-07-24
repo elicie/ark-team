@@ -35,6 +35,7 @@ test("TEST-703 rolls back every prepared worktree when persistence fails", async
       isolation_mode: "git_worktree" as const,
       working_directory: path.join(root, "worktrees", run.run_id, teamId),
       branch: `ark-team/${run.run_id}/${teamId}`,
+      target_branch: "main",
       base_commit: "a".repeat(40),
     }));
     const manager = new ScriptedWorkspaceManager(workspaces);

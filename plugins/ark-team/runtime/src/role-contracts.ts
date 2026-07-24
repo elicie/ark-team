@@ -120,6 +120,43 @@ export const plReportSchema = z
     }
   });
 
+export const integrationReportSchema = z
+  .strictObject({
+    kind: z.literal("integration_report"),
+    status: z.enum(["completed", "blocked"]),
+    summary: boundedTextSchema,
+    team_ids: z.array(identifierSchema).min(1).max(4),
+    integration_commit_sha: z
+      .string()
+      .regex(/^[0-9a-f]{40,64}$/)
+      .nullable(),
+    verification: z.array(verificationSchema).min(1).max(50),
+    blockers: boundedTextListSchema,
+  })
+  .superRefine((report, context) => {
+    const seen = new Set<string>();
+    for (const [index, teamId] of report.team_ids.entries()) {
+      if (seen.has(teamId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["team_ids", index],
+          message: `duplicate integrated team ID: ${teamId}`,
+        });
+      }
+      seen.add(teamId);
+    }
+    if (
+      report.status === "completed" &&
+      report.integration_commit_sha === null
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["integration_commit_sha"],
+        message: "completed integration reports require a commit SHA",
+      });
+    }
+  });
+
 const pmTeamResultSchema = z.strictObject({
   team_id: identifierSchema,
   status: z.enum(["completed", "blocked"]),
@@ -161,6 +198,7 @@ export const managedOutputContracts = [
   "pl_worker_plan",
   "worker_report",
   "pl_report",
+  "integration_report",
   "pm_report",
 ] as const;
 export type ManagedOutputContract = (typeof managedOutputContracts)[number];
@@ -169,12 +207,14 @@ export type PmPlan = z.infer<typeof pmPlanSchema>;
 export type PlWorkerPlan = z.infer<typeof plWorkerPlanSchema>;
 export type WorkerReport = z.infer<typeof workerReportSchema>;
 export type PlReport = z.infer<typeof plReportSchema>;
+export type IntegrationReport = z.infer<typeof integrationReportSchema>;
 export type PmReport = z.infer<typeof pmReportSchema>;
 export type ManagedOutput =
   | PmPlan
   | PlWorkerPlan
   | WorkerReport
   | PlReport
+  | IntegrationReport
   | PmReport;
 
 const contractSchemas = {
@@ -182,6 +222,7 @@ const contractSchemas = {
   pl_worker_plan: plWorkerPlanSchema,
   worker_report: workerReportSchema,
   pl_report: plReportSchema,
+  integration_report: integrationReportSchema,
   pm_report: pmReportSchema,
 } as const;
 
@@ -190,12 +231,17 @@ export const managedOutputSchema = z.union([
   plWorkerPlanSchema,
   workerReportSchema,
   plReportSchema,
+  integrationReportSchema,
   pmReportSchema,
 ]);
 
 const allowedContractsByRole = {
   pm: new Set<ManagedOutputContract>(["pm_plan", "pm_report"]),
-  pl: new Set<ManagedOutputContract>(["pl_worker_plan", "pl_report"]),
+  pl: new Set<ManagedOutputContract>([
+    "pl_worker_plan",
+    "pl_report",
+    "integration_report",
+  ]),
   worker: new Set<ManagedOutputContract>(["worker_report"]),
 } satisfies Record<ManagedRole, ReadonlySet<ManagedOutputContract>>;
 

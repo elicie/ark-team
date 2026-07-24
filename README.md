@@ -108,7 +108,17 @@ parallel, validates their exact worker counts, runs dependency-ready Luna
 workers in waves, and resumes each original PL session with the consolidated
 worker reports. `ark_team_advance` continues that process after an approval
 decision. When all PL reports cover their workers with passing verification,
-the run enters `integrating`.
+the run enters `integrating`. The top-level coordinator then creates
+`orchestrator/<run-id>` in a separate linked worktree and assigns a Terra/xhigh
+integration PL. It independently verifies a clean reported commit containing
+every team branch tip.
+
+For `local_merge`, the runtime fast-forwards the original branch only when its
+branch, HEAD, and cleanliness still match the recorded start boundary. It then
+resumes the original Sol/xhigh read-only PM session for a strict final
+`pm_report` and completes the run. For `pull_request`, it keeps the verified
+integration local and returns `remote_action_required`; no push or PR occurs
+without the later guarded remote flow.
 
 Internal PL/worker session failures receive at most two automatic fresh-session
 retries. Valid but deficient plans and reports receive at most two
@@ -156,7 +166,7 @@ Controller code can select a strict `output_contract` for machine-readable
 turns:
 
 - `pm_plan` and `pm_report` for PM;
-- `pl_worker_plan` and `pl_report` for PL; and
+- `pl_worker_plan`, `pl_report`, and `integration_report` for PL; and
 - `worker_report` for workers.
 
 Structured calls pass the matching JSON Schema to Codex and return the parsed
@@ -321,8 +331,10 @@ that PM-planning path from one MCP call.
 The runtime now dispatches independent teams and workers concurrently, gates
 dependencies, routes stored worker reports into same-session PL continuations,
 applies bounded internal failure retries and report corrections, and stops with
-durable approval or retry-choice state. The next runtime slices are still
-required to integrate and verify commits, select local merge versus guarded
-remote work, clean worktrees, add explicit external-provider adapters, and
+durable approval or retry-choice state. It also runs a distinct integration PL,
+checks Git ancestry and cleanliness, performs guarded local fast-forward, and
+resumes the PM for final acceptance. The next runtime slices are still required
+to approve and execute remote push/PR work, clean verified worktrees while
+preserving branches, add explicit external-provider and non-Git adapters, and
 reattach interrupted live sessions. The current control plane does not claim
 those remaining guarantees.

@@ -4,6 +4,7 @@ import {
   managedOutputContracts,
   managedOutputSchema,
   pmPlanSchema,
+  pmReportSchema,
 } from "./role-contracts.js";
 
 export const RUN_ID_PATTERN = /^ark-\d{8}t\d{6}z-[a-z0-9]{6}$/;
@@ -47,9 +48,14 @@ export const teamStateSchema = z.enum([
 
 export type TeamState = z.infer<typeof teamStateSchema>;
 
-export const assignmentRoleSchema = z.enum(["pl", "worker"]);
+export const assignmentRoleSchema = z.enum(["pl", "worker", "integration_pl"]);
 export type AssignmentRole = z.infer<typeof assignmentRoleSchema>;
-export const eventAgentRoleSchema = z.enum(["pm", "pl", "worker"]);
+export const eventAgentRoleSchema = z.enum([
+  "pm",
+  "pl",
+  "worker",
+  "integration_pl",
+]);
 
 export const usageSchema = z.object({
   input_tokens: z.number().int().nonnegative(),
@@ -168,6 +174,20 @@ export const assignmentRecordSchema = z
       context.addIssue({
         code: "custom",
         message: "PL assignments require a PL output contract",
+      });
+    }
+    if (
+      assignment.role === "integration_pl" &&
+      (assignment.team_id !== "integration" ||
+        assignment.parent_assignment_id !== null ||
+        assignment.report_target.type !== "pm" ||
+        assignment.task_key !== null ||
+        assignment.output_contract !== "integration_report")
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "integration PL assignments require the integration identity and report contract",
       });
     }
     if (
@@ -294,6 +314,7 @@ export const teamRecordSchema = z.object({
   isolation_mode: z.literal("git_worktree"),
   working_directory: z.string().min(1),
   branch: z.string().min(1),
+  target_branch: z.string().min(1).nullable().default(null),
   base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),
   state: teamStateSchema,
   created_at: z.string().min(1),
@@ -302,6 +323,36 @@ export const teamRecordSchema = z.object({
 });
 
 export type TeamRecord = z.infer<typeof teamRecordSchema>;
+
+export const integrationStateSchema = z.enum([
+  "ready",
+  "active",
+  "verified",
+  "local_merged",
+  "awaiting_remote",
+  "failed",
+]);
+
+export const integrationRecordSchema = z.object({
+  schema_version: z.literal(1),
+  run_id: z.string().regex(RUN_ID_PATTERN),
+  strategy: z.enum(["local_merge", "pull_request"]),
+  team_ids: z.array(z.string().regex(TEAM_ID_PATTERN)).min(1).max(4),
+  working_directory: z.string().min(1),
+  branch: z.string().min(1),
+  target_branch: z.string().min(1),
+  base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),
+  state: integrationStateSchema,
+  assignment_id: z.string().regex(ASSIGNMENT_ID_PATTERN).nullable(),
+  integration_commit_sha: z.string().regex(/^[0-9a-f]{40,64}$/).nullable(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
+  verified_at: z.string().min(1).nullable(),
+  merged_at: z.string().min(1).nullable(),
+  revision: z.number().int().positive(),
+});
+
+export type IntegrationRecord = z.infer<typeof integrationRecordSchema>;
 
 export const pmSessionRecordSchema = z.object({
   session_id: z.string().min(1),
@@ -312,6 +363,10 @@ export const pmSessionRecordSchema = z.object({
   approval_policy: z.literal("never"),
   usage: usageSchema,
   planned_at: z.string().min(1),
+  turn_count: z.number().int().positive().default(1),
+  final_report: pmReportSchema.nullable().default(null),
+  final_usage: usageSchema.nullable().default(null),
+  completed_at: z.string().min(1).nullable().default(null),
 });
 
 export type PmSessionRecord = z.infer<typeof pmSessionRecordSchema>;
@@ -348,6 +403,12 @@ export const runEventSchema = z.object({
     "team.prepared",
     "team.completed",
     "team.cleaned",
+    "integration.prepared",
+    "integration.verified",
+    "integration.local_merged",
+    "integration.awaiting_remote",
+    "pm.completed",
+    "run.completed",
     "assignment.started",
     "assignment.resumed",
     "assignment.waiting_user",
@@ -391,6 +452,7 @@ export const persistedRunSchema = z
     teams: z.array(teamRecordSchema).default([]),
     plan: pmPlanSchema.nullable().default(null),
     pm_session: pmSessionRecordSchema.nullable().default(null),
+    integration: integrationRecordSchema.nullable().default(null),
   })
   .superRefine((value, context) => {
     if (value.run.event_count !== value.events.length) {
@@ -465,6 +527,15 @@ export const persistedRunSchema = z
       context.addIssue({
         code: "custom",
         message: "persisted PM session requires its structured plan",
+      });
+    }
+    if (
+      value.integration !== null &&
+      value.integration.run_id !== value.run.run_id
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "integration record belongs to another run",
       });
     }
     if (value.plan !== null && value.teams.length > 0) {
