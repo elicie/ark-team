@@ -127,10 +127,33 @@ The current bundled control-plane slice exposes these MCP tools:
 - `ark_team_pause`
 - `ark_team_resume`
 - `ark_team_cancel`
+- `ark_team_assignment_start`
+- `ark_team_assignment_list`
+- `ark_team_assignment_status`
+- `ark_team_assignment_decide`
+- `ark_team_assignment_cancel`
 
-These tools persist and control orchestration records only. Until later runtime
-slices add session scheduling and Git isolation, continue to use the native
-fallback for actual team execution.
+The run lifecycle tools persist and control orchestration records. The
+assignment tools also start explicitly defined PL/worker app-server sessions,
+persist approval and completion updates, and stop active sessions on assignment
+cancel or owning-run pause/cancel.
+
+Before `ark_team_assignment_start`, create or select the linked Git worktree.
+Use one `team_id` per team, start its PL first, and pass that PL
+`assignment_id` as each worker's `parent_assignment_id`. The scheduler enforces
+one PL per team, four teams per run, five workers per PL, and a shared team
+worktree.
+
+Retain every assignment ID. Read `ark_team_assignment_status` or
+`ark_team_assignment_list` for stored reports and usage. When the state is
+`waiting_user`, show the pending request and call
+`ark_team_assignment_decide` only with the exact opaque approval ID and the
+user's explicit decision.
+
+The scheduler records PL reports for PM and worker reports for the owning PL.
+This is durable routing evidence, not yet an automatic follow-up turn: a later
+slice must resume the PL with accumulated worker reports. Pending approvals
+remain persisted but cannot be reattached after MCP process restart.
 
 The bundled managed-session CLI is:
 
@@ -172,9 +195,9 @@ pending request.
 
 On completion the gateway returns only role metadata, session and turn IDs,
 the final report, and usage. Pending approvals are process-local and are not
-recoverable after controller restart. The gateway remains an execution
-primitive; it does not create teams or worktrees, route reports, or persist
-assignments.
+recoverable after controller restart. The gateway remains the session
+primitive. The MCP scheduler persists and routes its updates, but neither
+component creates worktrees or performs PM planning.
 
 ### Native fallback
 

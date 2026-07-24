@@ -7,7 +7,8 @@
       ],
       "cwd": ".",
       "env_vars": [
-        "ARK_TEAM_STATE_ROOT"
+        "ARK_TEAM_STATE_ROOT",
+        "ARK_TEAM_CODEX_PATH"
       ]
     }
   }

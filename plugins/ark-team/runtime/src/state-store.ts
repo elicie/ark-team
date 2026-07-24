@@ -14,7 +14,13 @@ import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 
 import {
+  ASSIGNMENT_ID_PATTERN,
   RUN_ID_PATTERN,
+  TEAM_ID_PATTERN,
+  type AssignmentListResult,
+  type AssignmentRecord,
+  type AssignmentRole,
+  type AssignmentState,
   persistedRunSchema,
   type PersistedRun,
   type RunEvent,
@@ -24,28 +30,53 @@ import {
   type RunState,
   type TransitionResult,
 } from "./domain.js";
+import type {
+  ApprovalDecision,
+  ApprovalSessionUpdate,
+} from "./approval-session.js";
 import { ArkTeamError } from "./errors.js";
 import { assertRunId, createRunId } from "./run-id.js";
 
-interface RunStoreOptions {
+export interface RunStoreOptions {
   root_path?: string;
   now?: () => Date;
   suffix?: () => string;
+  assignment_suffix?: () => string;
 }
 
-interface CreateRunInput {
+export interface CreateRunInput {
   objective: string;
   project_path: string;
 }
 
-interface ListRunsInput {
+export interface ListRunsInput {
   states?: RunState[];
   limit?: number;
 }
 
-interface LogsInput {
+export interface LogsInput {
   after_sequence?: number;
   limit?: number;
+}
+
+export interface CreateAssignmentInput {
+  run_id: string;
+  team_id: string;
+  role: AssignmentRole;
+  parent_assignment_id?: string;
+  assignment: string;
+  working_directory: string;
+}
+
+export interface ListAssignmentsInput {
+  states?: AssignmentState[];
+  team_id?: string;
+  parent_assignment_id?: string;
+}
+
+export interface ResolvedApproval {
+  approval_id: string;
+  decision: ApprovalDecision;
 }
 
 const ACTIVE_STATES = new Set<RunState>([
@@ -86,12 +117,15 @@ export class RunStore {
 
   private readonly now: () => Date;
   private readonly suffix: () => string;
+  private readonly assignmentSuffix: () => string;
   private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(options: RunStoreOptions = {}) {
     this.root_path = path.resolve(options.root_path ?? resolveStateRoot());
     this.now = options.now ?? (() => new Date());
     this.suffix = options.suffix ?? (() => randomBytes(3).toString("hex"));
+    this.assignmentSuffix =
+      options.assignment_suffix ?? (() => randomBytes(6).toString("hex"));
   }
 
   async createRun(input: CreateRunInput): Promise<RunRecord> {
@@ -133,6 +167,7 @@ export class RunStore {
         updated_at: timestampText,
         revision: 1,
         event_count: 1,
+        assignment_count: 0,
       };
       const event: RunEvent = {
         schema_version: 1,
@@ -145,7 +180,7 @@ export class RunStore {
       };
 
       try {
-        await this.writePersistedRun({ run, events: [event] });
+        await this.writePersistedRun({ run, events: [event], assignments: [] });
       } catch (error) {
         await rm(this.runDirectory(runId), { recursive: true, force: true });
         throw error;
@@ -222,6 +257,434 @@ export class RunStore {
       next_after_sequence: nextAfterSequence,
       has_more: remaining.length > events.length,
     };
+  }
+
+  async createAssignment(input: CreateAssignmentInput): Promise<AssignmentRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(input.run_id);
+      assertRunAcceptsAssignments(persisted.run.state);
+      if (!TEAM_ID_PATTERN.test(input.team_id)) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "team_id must contain lowercase letters, digits, or hyphens",
+        );
+      }
+      if (input.role !== "pl" && input.role !== "worker") {
+        throw new ArkTeamError("INVALID_INPUT", "assignment role must be pl or worker");
+      }
+      const assignmentText = input.assignment.trim();
+      if (!assignmentText) {
+        throw new ArkTeamError("INVALID_INPUT", "assignment must not be empty");
+      }
+      if (!path.isAbsolute(input.working_directory)) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "working_directory must be absolute",
+        );
+      }
+      const workingDirectory = path.normalize(input.working_directory);
+
+      let parentAssignmentId: string | null = null;
+      if (input.role === "pl") {
+        if (input.parent_assignment_id !== undefined) {
+          throw new ArkTeamError(
+            "INVALID_INPUT",
+            "PL assignments cannot have parent_assignment_id",
+          );
+        }
+        if (
+          persisted.assignments.some(
+            (assignment) =>
+              assignment.role === "pl" && assignment.team_id === input.team_id,
+          )
+        ) {
+          throw new ArkTeamError(
+            "INVALID_INPUT",
+            `team ${input.team_id} already has a PL assignment`,
+          );
+        }
+        const teamCount = new Set(
+          persisted.assignments
+            .filter((assignment) => assignment.role === "pl")
+            .map((assignment) => assignment.team_id),
+        ).size;
+        if (teamCount >= 4) {
+          throw new ArkTeamError(
+            "INVALID_INPUT",
+            "an Ark Team run cannot contain more than four teams",
+          );
+        }
+      } else {
+        if (
+          !input.parent_assignment_id ||
+          !ASSIGNMENT_ID_PATTERN.test(input.parent_assignment_id)
+        ) {
+          throw new ArkTeamError(
+            "INVALID_INPUT",
+            "worker assignments require a valid parent_assignment_id",
+          );
+        }
+        const parent = persisted.assignments.find(
+          (assignment) =>
+            assignment.assignment_id === input.parent_assignment_id,
+        );
+        if (!parent || parent.role !== "pl") {
+          throw new ArkTeamError(
+            "INVALID_INPUT",
+            "worker parent_assignment_id must identify a PL in the same run",
+          );
+        }
+        if (
+          parent.team_id !== input.team_id ||
+          parent.working_directory !== workingDirectory
+        ) {
+          throw new ArkTeamError(
+            "INVALID_INPUT",
+            "worker team and worktree must match the owning PL",
+          );
+        }
+        const workerCount = persisted.assignments.filter(
+          (assignment) =>
+            assignment.role === "worker" &&
+            assignment.parent_assignment_id === parent.assignment_id,
+        ).length;
+        if (workerCount >= 5) {
+          throw new ArkTeamError(
+            "INVALID_INPUT",
+            "a PL cannot own more than five worker assignments",
+          );
+        }
+        parentAssignmentId = parent.assignment_id;
+      }
+
+      const timestamp = this.now().toISOString();
+      const assignmentId = this.allocateAssignmentId(persisted);
+      const assignment: AssignmentRecord = {
+        schema_version: 1,
+        assignment_id: assignmentId,
+        run_id: persisted.run.run_id,
+        team_id: input.team_id,
+        role: input.role,
+        parent_assignment_id: parentAssignmentId,
+        report_target:
+          input.role === "pl"
+            ? { type: "pm" }
+            : { type: "assignment", assignment_id: parentAssignmentId ?? "" },
+        assignment: assignmentText,
+        working_directory: workingDirectory,
+        state: "running",
+        session_id: null,
+        turn_id: null,
+        pending_approval: null,
+        final_report: null,
+        usage: null,
+        failure_message: null,
+        report_routed_at: null,
+        created_at: timestamp,
+        updated_at: timestamp,
+        revision: 1,
+      };
+      const nextState =
+        persisted.run.state === "waiting_user" ? "waiting_user" : "executing";
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "assignment.started",
+        timestamp,
+        state: nextState,
+        assignment_id: assignmentId,
+        team_id: assignment.team_id,
+        agent_role: assignment.role,
+        message: `${assignment.role} assignment started`,
+      };
+      const updatedRun: RunRecord = {
+        ...persisted.run,
+        state: nextState,
+        resume_state:
+          nextState === "waiting_user" ? persisted.run.resume_state : null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+        assignment_count: persisted.run.assignment_count + 1,
+      };
+
+      await this.writePersistedRun({
+        run: updatedRun,
+        events: [...persisted.events, event],
+        assignments: [...persisted.assignments, assignment],
+      });
+      return assignment;
+    });
+  }
+
+  async getAssignment(
+    runId: string,
+    assignmentId: string,
+  ): Promise<AssignmentRecord> {
+    const persisted = await this.readPersistedRun(runId);
+    return findAssignment(persisted, assignmentId);
+  }
+
+  async listAssignments(
+    runId: string,
+    input: ListAssignmentsInput = {},
+  ): Promise<AssignmentListResult> {
+    if (input.team_id !== undefined && !TEAM_ID_PATTERN.test(input.team_id)) {
+      throw new ArkTeamError("INVALID_INPUT", "team_id is invalid");
+    }
+    if (
+      input.parent_assignment_id !== undefined &&
+      !ASSIGNMENT_ID_PATTERN.test(input.parent_assignment_id)
+    ) {
+      throw new ArkTeamError("INVALID_INPUT", "parent_assignment_id is invalid");
+    }
+    const persisted = await this.readPersistedRun(runId);
+    const requestedStates = input.states ? new Set(input.states) : null;
+    const assignments = persisted.assignments.filter(
+      (assignment) =>
+        (!requestedStates || requestedStates.has(assignment.state)) &&
+        (input.team_id === undefined || assignment.team_id === input.team_id) &&
+        (input.parent_assignment_id === undefined ||
+          assignment.parent_assignment_id === input.parent_assignment_id),
+    );
+    return {
+      run_id: persisted.run.run_id,
+      assignments,
+      total: assignments.length,
+    };
+  }
+
+  async recordAssignmentUpdate(
+    runId: string,
+    assignmentId: string,
+    update: ApprovalSessionUpdate,
+    resolvedApproval?: ResolvedApproval,
+  ): Promise<AssignmentRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = findAssignment(persisted, assignmentId);
+      if (current.state !== "running" && current.state !== "waiting_user") {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          `Cannot update an assignment while it is ${current.state}`,
+        );
+      }
+      if (update.role !== current.role) {
+        throw new ArkTeamError(
+          "AGENT_SESSION_PROTOCOL_ERROR",
+          "session update role does not match the persisted assignment",
+        );
+      }
+      if (
+        (current.session_id !== null &&
+          current.session_id !== update.session_id) ||
+        (current.turn_id !== null && current.turn_id !== update.turn_id)
+      ) {
+        throw new ArkTeamError(
+          "AGENT_SESSION_PROTOCOL_ERROR",
+          "session update does not match the persisted assignment session and turn",
+        );
+      }
+      if (resolvedApproval) {
+        if (
+          current.pending_approval?.approval_id !==
+          resolvedApproval.approval_id
+        ) {
+          throw new ArkTeamError(
+            "INVALID_INPUT",
+            "approval_id is unknown or already resolved",
+          );
+        }
+      } else if (current.state === "waiting_user") {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "a waiting assignment requires its current approval decision",
+        );
+      }
+
+      const timestamp = this.now().toISOString();
+      const assignment: AssignmentRecord =
+        update.status === "waiting_user"
+          ? {
+              ...current,
+              state: "waiting_user",
+              session_id: update.session_id,
+              turn_id: update.turn_id,
+              pending_approval: update.approval,
+              updated_at: timestamp,
+              revision: current.revision + 1,
+            }
+          : {
+              ...current,
+              state: "completed",
+              session_id: update.session_id,
+              turn_id: update.turn_id,
+              pending_approval: null,
+              final_report: update.final_report.trim(),
+              usage: update.usage,
+              failure_message: null,
+              report_routed_at: timestamp,
+              updated_at: timestamp,
+              revision: current.revision + 1,
+            };
+      const assignments = persisted.assignments.map((candidate) =>
+        candidate.assignment_id === assignmentId ? assignment : candidate,
+      );
+
+      const events: RunEvent[] = [];
+      if (resolvedApproval) {
+        events.push({
+          schema_version: 1,
+          sequence: 0,
+          event_id: randomUUID(),
+          event_type: "assignment.approval_resolved",
+          timestamp,
+          state: persisted.run.state,
+          assignment_id: assignment.assignment_id,
+          team_id: assignment.team_id,
+          agent_role: assignment.role,
+          approval_id: resolvedApproval.approval_id,
+          approval_decision: resolvedApproval.decision,
+          message: "Assignment approval decision delivered",
+        });
+      }
+      if (update.status === "waiting_user") {
+        events.push({
+          schema_version: 1,
+          sequence: 0,
+          event_id: randomUUID(),
+          event_type: "assignment.waiting_user",
+          timestamp,
+          state: "waiting_user",
+          assignment_id: assignment.assignment_id,
+          team_id: assignment.team_id,
+          agent_role: assignment.role,
+          approval_id: update.approval.approval_id,
+          message: `Assignment is waiting for ${update.approval.kind} approval`,
+        });
+      } else {
+        events.push(
+          {
+            schema_version: 1,
+            sequence: 0,
+            event_id: randomUUID(),
+            event_type: "assignment.completed",
+            timestamp,
+            state: persisted.run.state,
+            assignment_id: assignment.assignment_id,
+            team_id: assignment.team_id,
+            agent_role: assignment.role,
+            usage: update.usage,
+            message: `${assignment.role} assignment completed`,
+          },
+          {
+            schema_version: 1,
+            sequence: 0,
+            event_id: randomUUID(),
+            event_type: "assignment.report_routed",
+            timestamp,
+            state: persisted.run.state,
+            assignment_id: assignment.assignment_id,
+            team_id: assignment.team_id,
+            agent_role: assignment.role,
+            report_target: assignment.report_target,
+            message:
+              assignment.report_target.type === "pm"
+                ? "PL report routed to PM inbox"
+                : "Worker report routed to owning PL inbox",
+          },
+        );
+      }
+
+      const nextState =
+        update.status === "waiting_user" ||
+        assignments.some((candidate) => candidate.state === "waiting_user")
+          ? "waiting_user"
+          : persisted.run.state === "waiting_user"
+            ? persisted.run.resume_state ?? "executing"
+            : persisted.run.state;
+      const resumeState =
+        nextState === "waiting_user"
+          ? persisted.run.state === "waiting_user"
+            ? persisted.run.resume_state ?? "executing"
+            : persisted.run.state
+          : null;
+      const sequencedEvents = events.map((event, index) => ({
+        ...event,
+        sequence: persisted.run.event_count + index + 1,
+        state:
+          event.event_type === "assignment.waiting_user"
+            ? "waiting_user" as const
+            : nextState,
+      }));
+      const updatedRun: RunRecord = {
+        ...persisted.run,
+        state: nextState,
+        resume_state: resumeState,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + sequencedEvents.length,
+      };
+
+      await this.writePersistedRun({
+        run: updatedRun,
+        events: [...persisted.events, ...sequencedEvents],
+        assignments,
+      });
+      return assignment;
+    });
+  }
+
+  async failAssignment(
+    runId: string,
+    assignmentId: string,
+    failureMessage: string,
+  ): Promise<AssignmentRecord> {
+    return this.finishAssignmentAbnormally(
+      runId,
+      assignmentId,
+      "failed",
+      failureMessage,
+    );
+  }
+
+  async stopAssignment(
+    runId: string,
+    assignmentId: string,
+    state: "paused" | "cancelled",
+    message?: string,
+  ): Promise<AssignmentRecord> {
+    return this.finishAssignmentAbnormally(
+      runId,
+      assignmentId,
+      state,
+      message ?? `Assignment ${state}`,
+    );
+  }
+
+  async stopActiveAssignments(
+    runId: string,
+    state: "paused" | "cancelled",
+    message?: string,
+  ): Promise<AssignmentRecord[]> {
+    const active = (
+      await this.listAssignments(runId, {
+        states: ["running", "waiting_user"],
+      })
+    ).assignments;
+    const stopped: AssignmentRecord[] = [];
+    for (const assignment of active) {
+      stopped.push(
+        await this.stopAssignment(
+          runId,
+          assignment.assignment_id,
+          state,
+          message,
+        ),
+      );
+    }
+    return stopped;
   }
 
   async pauseRun(runId: string, reason?: string): Promise<TransitionResult> {
@@ -309,9 +772,94 @@ export class RunStore {
       await this.writePersistedRun({
         run: updatedRun,
         events: [...persisted.events, event],
+        assignments: persisted.assignments,
       });
       return { run: updatedRun, changed: true };
     });
+  }
+
+  private async finishAssignmentAbnormally(
+    runId: string,
+    assignmentId: string,
+    state: "failed" | "paused" | "cancelled",
+    rawMessage: string,
+  ): Promise<AssignmentRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = findAssignment(persisted, assignmentId);
+      if (current.state === state) {
+        return current;
+      }
+      if (current.state !== "running" && current.state !== "waiting_user") {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          `Cannot mark an assignment ${state} while it is ${current.state}`,
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const message =
+        rawMessage.trim().slice(0, 1000) || `Assignment ${state}`;
+      const assignment: AssignmentRecord = {
+        ...current,
+        state,
+        pending_approval: null,
+        failure_message: state === "failed" ? message : null,
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const assignments = persisted.assignments.map((candidate) =>
+        candidate.assignment_id === assignmentId ? assignment : candidate,
+      );
+      const nextState =
+        persisted.run.state === "waiting_user" &&
+        !assignments.some((candidate) => candidate.state === "waiting_user")
+          ? persisted.run.resume_state ?? "executing"
+          : persisted.run.state;
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: `assignment.${state}`,
+        timestamp,
+        state: nextState,
+        assignment_id: assignment.assignment_id,
+        team_id: assignment.team_id,
+        agent_role: assignment.role,
+        message,
+      };
+      const updatedRun: RunRecord = {
+        ...persisted.run,
+        state: nextState,
+        resume_state: nextState === "waiting_user" ? persisted.run.resume_state : null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run: updatedRun,
+        events: [...persisted.events, event],
+        assignments,
+      });
+      return assignment;
+    });
+  }
+
+  private allocateAssignmentId(persisted: PersistedRun): string {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const assignmentId = `asg-${this.assignmentSuffix().toLowerCase()}`;
+      if (
+        ASSIGNMENT_ID_PATTERN.test(assignmentId) &&
+        !persisted.assignments.some(
+          (assignment) => assignment.assignment_id === assignmentId,
+        )
+      ) {
+        return assignmentId;
+      }
+    }
+    throw new ArkTeamError(
+      "STATE_ROOT_UNAVAILABLE",
+      "Unable to allocate a unique assignment ID",
+    );
   }
 
   private async ensureRoot(): Promise<void> {
@@ -419,6 +967,34 @@ function invalidTransition(operation: string, state: RunState): ArkTeamError {
     "INVALID_TRANSITION",
     `Cannot ${operation} a run while it is ${state}`,
   );
+}
+
+function assertRunAcceptsAssignments(state: RunState): void {
+  if (state === "paused" || state === "cancelled" || state === "completed" || state === "failed") {
+    throw new ArkTeamError(
+      "INVALID_TRANSITION",
+      `Cannot start an assignment while the run is ${state}`,
+    );
+  }
+}
+
+function findAssignment(
+  persisted: PersistedRun,
+  assignmentId: string,
+): AssignmentRecord {
+  if (!ASSIGNMENT_ID_PATTERN.test(assignmentId)) {
+    throw new ArkTeamError("INVALID_INPUT", "assignment_id is invalid");
+  }
+  const assignment = persisted.assignments.find(
+    (candidate) => candidate.assignment_id === assignmentId,
+  );
+  if (!assignment) {
+    throw new ArkTeamError(
+      "ASSIGNMENT_NOT_FOUND",
+      `Assignment not found: ${assignmentId}`,
+    );
+  }
+  return assignment;
 }
 
 function normalizeReason(reason?: string): string | undefined {

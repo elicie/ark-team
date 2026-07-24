@@ -56,8 +56,9 @@ working in this repository. Project-scoped custom-agent definitions live under
   requires an authenticated `codex` executable on `PATH`.
 - The approval-gated writer backend uses `codex app-server` over local stdio
   and requires a compatible generated stable protocol schema.
-- The MCP control plane persists run state but does not yet schedule managed
-  sessions itself.
+- The MCP control plane persists run and assignment state and can schedule
+  explicitly defined PL/worker sessions. It does not yet run the PM planner or
+  create worktrees.
 
 ## Runtime control plane
 
@@ -71,11 +72,31 @@ It currently exposes:
 - `ark_team_pause`
 - `ark_team_resume`
 - `ark_team_cancel`
+- `ark_team_assignment_start`
+- `ark_team_assignment_list`
+- `ark_team_assignment_status`
+- `ark_team_assignment_decide`
+- `ark_team_assignment_cancel`
 
 Runs are stored as atomic JSON records under
 `~/.codex/team-orchestrator/runs` by default. Set the absolute
 `ARK_TEAM_STATE_ROOT` environment variable before starting Codex to use another
 location.
+
+Managed assignment records live in the same atomic run record. Each record
+retains its team and parent PL, linked worktree, state, session and turn IDs,
+one pending approval, routed final report, and token usage. Logs record
+observable state changes and usage, not raw model reasoning or event history.
+
+The scheduler enforces one PL per team, at most four teams per run, and at most
+five workers per PL. Workers must use the same team worktree and identify their
+owning PL assignment. A completed worker report is routed to that PL record; a
+completed PL report is routed to PM.
+
+If the MCP process restarts while approval is pending, the record remains
+visible but its live app-server session is intentionally unavailable. Cancel
+the orphaned assignment or preserve it for later recovery tooling; never start
+a replacement session to bypass its unanswered approval.
 
 Build and verify the bundled server from the repository root:
 
@@ -84,9 +105,9 @@ npm install
 npm test
 ```
 
-`npm test` type-checks the source, runs persistence and approval-gateway tests,
-builds the MCP server, managed-session CLI, and approval-session library, and
-exercises the CLI and MCP entry points.
+`npm test` type-checks the source, runs persistence, scheduler, and
+approval-gateway tests, builds the MCP server, managed-session CLI, and
+approval-session library, and exercises the CLI and MCP entry points.
 
 ## Managed role sessions
 
@@ -234,12 +255,11 @@ explicit license plus durable publisher metadata.
 
 This repository currently provides the validated skill contract, project
 defaults, plugin package, persistent run records, MCP lifecycle/status tools,
-project-scoped native custom agents, an official-SDK role launcher, and a
-tested app-server approval gateway for separately permissioned PL and worker
-sessions. These execution primitives are not yet connected to the persistent
-team scheduler.
+project-scoped native custom agents, an official-SDK role launcher, a tested
+app-server approval gateway, and a persistent MCP scheduler for explicitly
+defined PL and worker assignments.
 
-The next runtime slices are still required to persist teams and assignments,
-schedule up to four teams, create and manage worktrees, route hierarchical
-reports, and integrate verified commits. The current control plane does not
-claim those guarantees.
+The next runtime slices are still required to run the PM planner, parse spawn
+requests, create and manage worktrees, dispatch independent teams in parallel,
+resume PL sessions with worker reports, apply retries, and integrate verified
+commits. The current control plane does not claim those guarantees.

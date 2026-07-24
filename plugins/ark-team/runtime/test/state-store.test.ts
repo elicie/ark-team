@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -133,5 +133,162 @@ test("TEST-005 rejects relative project paths and unsafe run identifiers", async
   await assert.rejects(
     () => store.getRun("../escape"),
     (error: unknown) => error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+  );
+});
+
+test("TEST-501 reopens a schema-version-1 run without assignment fields", async () => {
+  const runId = "ark-20260724t000000z-abc123";
+  const runDirectory = path.join(stateRoot, runId);
+  await mkdir(runDirectory, { recursive: true });
+  await writeFile(
+    path.join(runDirectory, "run.json"),
+    `${JSON.stringify(
+      {
+        run: {
+          schema_version: 1,
+          run_id: runId,
+          objective: "Legacy persisted run",
+          project_path: projectRoot,
+          state: "planning",
+          resume_state: null,
+          created_at: "2026-07-24T00:00:00.000Z",
+          updated_at: "2026-07-24T00:00:00.000Z",
+          revision: 1,
+          event_count: 1,
+        },
+        events: [
+          {
+            schema_version: 1,
+            sequence: 1,
+            event_id: "legacy-event",
+            event_type: "run.created",
+            timestamp: "2026-07-24T00:00:00.000Z",
+            state: "planning",
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+
+  const store = new RunStore({ root_path: stateRoot });
+  assert.equal((await store.getRun(runId)).assignment_count, 0);
+  assert.deepEqual(await store.listAssignments(runId), {
+    run_id: runId,
+    assignments: [],
+    total: 0,
+  });
+});
+
+test("TEST-502 enforces team, PL, worker ownership, and count bounds", async () => {
+  let sequence = 0;
+  const store = new RunStore({
+    root_path: stateRoot,
+    assignment_suffix: () => (++sequence).toString(16).padStart(12, "0"),
+  });
+  const run = await store.createRun({
+    objective: "Exercise assignment hierarchy",
+    project_path: projectRoot,
+  });
+
+  const firstPl = await store.createAssignment({
+    run_id: run.run_id,
+    team_id: "team-a",
+    role: "pl",
+    assignment: "Lead team A",
+    working_directory: projectRoot,
+  });
+  await assert.rejects(
+    store.createAssignment({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Duplicate PL",
+      working_directory: projectRoot,
+    }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+  );
+  await assert.rejects(
+    store.createAssignment({
+      run_id: run.run_id,
+      team_id: "team-b",
+      role: "worker",
+      parent_assignment_id: firstPl.assignment_id,
+      assignment: "Wrong team",
+      working_directory: projectRoot,
+    }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+  );
+
+  for (let worker = 1; worker <= 5; worker += 1) {
+    await store.createAssignment({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "worker",
+      parent_assignment_id: firstPl.assignment_id,
+      assignment: `Worker ${worker}`,
+      working_directory: projectRoot,
+    });
+  }
+  await assert.rejects(
+    store.createAssignment({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "worker",
+      parent_assignment_id: firstPl.assignment_id,
+      assignment: "Sixth worker",
+      working_directory: projectRoot,
+    }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+  );
+
+  for (const teamId of ["team-b", "team-c", "team-d"]) {
+    await store.createAssignment({
+      run_id: run.run_id,
+      team_id: teamId,
+      role: "pl",
+      assignment: `Lead ${teamId}`,
+      working_directory: projectRoot,
+    });
+  }
+  await assert.rejects(
+    store.createAssignment({
+      run_id: run.run_id,
+      team_id: "team-e",
+      role: "pl",
+      assignment: "Fifth team",
+      working_directory: projectRoot,
+    }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+  );
+
+  const assignments = await store.listAssignments(run.run_id);
+  assert.equal(assignments.total, 9);
+  assert.equal((await store.getRun(run.run_id)).assignment_count, 9);
+  const logs = await store.getLogs(run.run_id, { limit: 200 });
+  assert.equal(logs.events.length, 10);
+  assert.deepEqual(
+    logs.events.map((event) => event.sequence),
+    Array.from({ length: 10 }, (_value, index) => index + 1),
+  );
+
+  await store.pauseRun(run.run_id);
+  await assert.rejects(
+    store.createAssignment({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "worker",
+      parent_assignment_id: firstPl.assignment_id,
+      assignment: "Paused run worker",
+      working_directory: projectRoot,
+    }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_TRANSITION",
   );
 });
