@@ -116,6 +116,25 @@ model, reasoning, sandbox, and approval configuration. It returns only the
 thread ID, final role report, configuration metadata, and token usage; raw
 reasoning and event items are not returned.
 
+Controller code can select a strict `output_contract` for machine-readable
+turns:
+
+- `pm_plan` and `pm_report` for PM;
+- `pl_worker_plan` and `pl_report` for PL; and
+- `worker_report` for workers.
+
+Structured calls pass the matching JSON Schema to Codex and return the parsed
+`structured_report` only after a second strict runtime validation. Plans reject
+unknown fields, more than four teams, more than five workers, duplicate IDs,
+unknown dependencies, and dependency cycles.
+
+Pass the prior `session_id` as `resume_session_id` to continue a completed
+role thread. PM continuation uses the SDK's persisted thread; PL/worker
+continuation uses app-server `thread/resume`. Both paths reapply the exact
+managed role profile and reject a different thread ID. The writer path also
+rechecks the worktree cwd, workspace-write roots, disabled network, user
+approval routing, model, and xhigh effort before starting the new turn.
+
 Run a read-only PM session:
 
 ```sh
@@ -257,9 +276,11 @@ This repository currently provides the validated skill contract, project
 defaults, plugin package, persistent run records, MCP lifecycle/status tools,
 project-scoped native custom agents, an official-SDK role launcher, a tested
 app-server approval gateway, and a persistent MCP scheduler for explicitly
-defined PL and worker assignments.
+defined PL and worker assignments. Role sessions now expose strict planning and
+report JSON contracts and can continue completed PM, PL, and worker threads.
 
 The next runtime slices are still required to run the PM planner, parse spawn
 requests, create and manage worktrees, dispatch independent teams in parallel,
-resume PL sessions with worker reports, apply retries, and integrate verified
-commits. The current control plane does not claim those guarantees.
+route stored worker reports into those PL continuations, apply retries, and
+integrate verified commits. The current control plane does not claim those
+guarantees.

@@ -14,6 +14,13 @@ import {
 } from "@openai/codex-sdk";
 
 import { ArkTeamError } from "./errors.js";
+import {
+  assertManagedOutputContractRole,
+  managedOutputJsonSchemas,
+  parseManagedOutput,
+  type ManagedOutput,
+  type ManagedOutputContract,
+} from "./role-contracts.js";
 
 export const managedRoleNames = ["pm", "pl", "worker"] as const;
 export type ManagedRole = (typeof managedRoleNames)[number];
@@ -89,6 +96,8 @@ export interface ManagedSessionRequest {
   role: ManagedRole;
   assignment: string;
   working_directory: string;
+  resume_session_id?: string;
+  output_contract?: ManagedOutputContract;
   signal?: AbortSignal;
 }
 
@@ -101,6 +110,7 @@ export interface ManagedSessionResult {
   sandbox_mode: SandboxMode;
   requested_approval_policy: ApprovalMode;
   final_report: string;
+  structured_report?: ManagedOutput;
   usage: Usage;
 }
 
@@ -111,11 +121,18 @@ interface SessionTurn {
 
 interface SessionThread {
   readonly id: string | null;
-  run(input: string, options: { signal: AbortSignal }): Promise<SessionTurn>;
+  run(
+    input: string,
+    options: {
+      signal: AbortSignal;
+      outputSchema?: Record<string, unknown>;
+    },
+  ): Promise<SessionTurn>;
 }
 
 export interface CodexSessionClient {
   startThread(options: ThreadOptions): SessionThread;
+  resumeThread(id: string, options: ThreadOptions): SessionThread;
 }
 
 export interface ManagedSessionLauncherOptions {
@@ -160,7 +177,14 @@ export class ManagedCodexSessionLauncher {
       request.working_directory,
     );
     const profile = managedRoleProfiles[request.role];
-    const thread = this.client.startThread({
+    if (request.output_contract !== undefined) {
+      assertManagedOutputContractRole(request.role, request.output_contract);
+    }
+    const resumeSessionId = request.resume_session_id?.trim();
+    if (request.resume_session_id !== undefined && !resumeSessionId) {
+      throw new ArkTeamError("INVALID_INPUT", "resume_session_id must not be empty");
+    }
+    const threadOptions: ThreadOptions = {
       model: profile.model,
       modelReasoningEffort: profile.model_reasoning_effort,
       sandboxMode: profile.sandbox_mode,
@@ -169,7 +193,11 @@ export class ManagedCodexSessionLauncher {
       skipGitRepoCheck: request.role === "pm",
       networkAccessEnabled: false,
       webSearchMode: "disabled",
-    });
+    };
+    const thread =
+      resumeSessionId === undefined
+        ? this.client.startThread(threadOptions)
+        : this.client.resumeThread(resumeSessionId, threadOptions);
     const abortController = new AbortController();
     const forwardAbort = (): void => {
       abortController.abort(request.signal?.reason);
@@ -185,9 +213,17 @@ export class ManagedCodexSessionLauncher {
 
     let turn: SessionTurn;
     try {
-      turn = await thread.run(buildManagedPrompt(request.role, assignment), {
-        signal: abortController.signal,
-      });
+      turn = await thread.run(
+        buildManagedPrompt(request.role, assignment, request.output_contract),
+        {
+          signal: abortController.signal,
+          ...(request.output_contract === undefined
+            ? {}
+            : {
+                outputSchema: managedOutputJsonSchemas[request.output_contract],
+              }),
+        },
+      );
     } catch (error) {
       const message =
         abortController.signal.aborted
@@ -207,6 +243,16 @@ export class ManagedCodexSessionLauncher {
         "Managed Codex session completed without an ID, final report, or usage",
       );
     }
+    if (resumeSessionId !== undefined && sessionId !== resumeSessionId) {
+      throw new ArkTeamError(
+        "AGENT_SESSION_PROTOCOL_ERROR",
+        `Resumed Codex session returned a different thread ID: ${sessionId}`,
+      );
+    }
+    const structuredReport =
+      request.output_contract === undefined
+        ? undefined
+        : parseManagedOutput(request.output_contract, finalReport);
 
     return {
       session_id: sessionId,
@@ -217,6 +263,9 @@ export class ManagedCodexSessionLauncher {
       sandbox_mode: profile.sandbox_mode,
       requested_approval_policy: profile.approval_policy,
       final_report: finalReport,
+      ...(structuredReport === undefined
+        ? {}
+        : { structured_report: structuredReport }),
       usage: turn.usage,
     };
   }
@@ -332,7 +381,11 @@ export async function assertManagedWorkspace(
   return workingDirectory;
 }
 
-export function buildManagedPrompt(role: ManagedRole, assignment: string): string {
+export function buildManagedPrompt(
+  role: ManagedRole,
+  assignment: string,
+  outputContract?: ManagedOutputContract,
+): string {
   const profile = managedRoleProfiles[role];
   return [
     "<ark_team_managed_role>",
@@ -340,7 +393,9 @@ export function buildManagedPrompt(role: ManagedRole, assignment: string): strin
     `Model contract: ${profile.model} / ${profile.model_reasoning_effort}`,
     `Permission contract: ${profile.sandbox_mode} / ${profile.approval_policy}`,
     profile.instructions,
-    "Return only the observable role report. Never expose private chain-of-thought.",
+    outputContract === undefined
+      ? "Return only the observable role report. Never expose private chain-of-thought."
+      : `Return only JSON matching the ${outputContract} output contract. Never expose private chain-of-thought.`,
     "</ark_team_managed_role>",
     "<ark_team_assignment>",
     assignment,

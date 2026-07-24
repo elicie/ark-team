@@ -11,6 +11,7 @@ const requiredTokens = {
   "ClientRequest.ts": [
     '"method": "initialize"',
     '"method": "thread/start"',
+    '"method": "thread/resume"',
     '"method": "turn/start"',
     '"method": "turn/interrupt"',
   ],
@@ -34,6 +35,22 @@ const requiredTokens = {
     "sandbox:",
     "reasoningEffort:",
   ],
+  "v2/ThreadResumeParams.ts": [
+    "threadId:",
+    "model?:",
+    "cwd?:",
+    "approvalPolicy?:",
+    "approvalsReviewer?:",
+    "sandbox?:",
+    "config?:",
+    "developerInstructions?:",
+  ],
+  "v2/ThreadResumeResponse.ts": [
+    "approvalPolicy:",
+    "approvalsReviewer:",
+    "sandbox:",
+    "reasoningEffort:",
+  ],
   "v2/TurnStartParams.ts": [
     "threadId:",
     "input:",
@@ -41,6 +58,7 @@ const requiredTokens = {
     "approvalsReviewer?:",
     "model?:",
     "effort?:",
+    "outputSchema?:",
   ],
   "v2/UserInput.ts": ['"type": "text"', "text_elements:"],
   "v2/CommandExecutionApprovalDecision.ts": [

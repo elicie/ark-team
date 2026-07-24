@@ -207,6 +207,9 @@ test("TEST-304 fails closed when the SDK omits required session evidence", async
           };
         },
       }),
+      resumeThread: () => {
+        throw new Error("not used");
+      },
     };
     const launcher = new ManagedCodexSessionLauncher({ client });
 
@@ -239,6 +242,9 @@ test("TEST-305 aborts an over-time session and reports a closed failure", async 
             );
           }),
       }),
+      resumeThread: () => {
+        throw new Error("not used");
+      },
     };
     const launcher = new ManagedCodexSessionLauncher({
       client,
@@ -271,6 +277,109 @@ test("TEST-305 aborts an over-time session and reports a closed failure", async 
       cancellation,
       (error: unknown) =>
         error instanceof ArkTeamError && error.code === "AGENT_SESSION_FAILED",
+    );
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("TEST-603 starts and resumes structured PM turns on the same SDK thread", async () => {
+  const temporaryRoot = await mkdtemp(path.join(tmpdir(), "ark-team-resume-test-"));
+  try {
+    const client = new StructuredCodexClient([
+      JSON.stringify(validPmPlan()),
+      JSON.stringify(validPmReport()),
+    ]);
+    const launcher = new ManagedCodexSessionLauncher({ client });
+
+    const planned = await launcher.run({
+      role: "pm",
+      assignment: "Create a bounded team plan.",
+      working_directory: temporaryRoot,
+      output_contract: "pm_plan",
+    });
+    const reported = await launcher.run({
+      role: "pm",
+      assignment: "Review the completed PL reports.",
+      working_directory: temporaryRoot,
+      resume_session_id: planned.session_id,
+      output_contract: "pm_report",
+    });
+
+    assert.equal(planned.structured_report?.kind, "pm_plan");
+    assert.equal(reported.structured_report?.kind, "pm_report");
+    assert.equal(reported.session_id, planned.session_id);
+    assert.equal(client.starts.length, 1);
+    assert.deepEqual(client.resumes, [
+      {
+        id: planned.session_id,
+        options: client.starts[0],
+      },
+    ]);
+    assert.equal(client.turnOptions.length, 2);
+    assert.equal(
+      client.turnOptions[0]?.outputSchema?.additionalProperties,
+      false,
+    );
+    assert.match(client.prompts[0] ?? "", /pm_plan output contract/);
+    assert.match(client.prompts[1] ?? "", /pm_report output contract/);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("TEST-604 fails closed on invalid structured or mismatched resumed SDK output", async () => {
+  const temporaryRoot = await mkdtemp(path.join(tmpdir(), "ark-team-structured-fail-"));
+  try {
+    const wrongRoleClient = new StructuredCodexClient([JSON.stringify(validPmPlan())]);
+    const wrongRoleLauncher = new ManagedCodexSessionLauncher({
+      client: wrongRoleClient,
+    });
+    await assert.rejects(
+      wrongRoleLauncher.run({
+        role: "pm",
+        assignment: "Use the wrong contract.",
+        working_directory: temporaryRoot,
+        output_contract: "worker_report",
+      }),
+      (error: unknown) =>
+        error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+    );
+    assert.equal(wrongRoleClient.starts.length, 0);
+
+    const malformedLauncher = new ManagedCodexSessionLauncher({
+      client: new StructuredCodexClient(["not-json"]),
+    });
+    await assert.rejects(
+      malformedLauncher.run({
+        role: "pm",
+        assignment: "Return invalid JSON.",
+        working_directory: temporaryRoot,
+        output_contract: "pm_plan",
+      }),
+      (error: unknown) =>
+        error instanceof ArkTeamError &&
+        error.code === "AGENT_SESSION_PROTOCOL_ERROR",
+    );
+
+    const mismatchedClient = new StructuredCodexClient(
+      [JSON.stringify(validPmReport())],
+      "different-thread",
+    );
+    const mismatchedLauncher = new ManagedCodexSessionLauncher({
+      client: mismatchedClient,
+    });
+    await assert.rejects(
+      mismatchedLauncher.run({
+        role: "pm",
+        assignment: "Resume with mismatched evidence.",
+        working_directory: temporaryRoot,
+        resume_session_id: "expected-thread",
+        output_contract: "pm_report",
+      }),
+      (error: unknown) =>
+        error instanceof ArkTeamError &&
+        error.code === "AGENT_SESSION_PROTOCOL_ERROR",
     );
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
@@ -329,4 +438,104 @@ class FakeCodexClient implements CodexSessionClient {
       },
     };
   }
+
+  resumeThread(_id: string, _options: ThreadOptions): never {
+    throw new Error("not used");
+  }
+}
+
+class StructuredCodexClient implements CodexSessionClient {
+  readonly starts: ThreadOptions[] = [];
+  readonly resumes: Array<{ id: string; options: ThreadOptions }> = [];
+  readonly prompts: string[] = [];
+  readonly turnOptions: Array<{
+    signal: AbortSignal;
+    outputSchema?: Record<string, unknown>;
+  }> = [];
+  private sequence = 0;
+
+  constructor(
+    private readonly responses: string[],
+    private readonly resumedIdOverride?: string,
+  ) {}
+
+  startThread(options: ThreadOptions) {
+    this.starts.push(options);
+    return this.thread(`pm-thread-${++this.sequence}`);
+  }
+
+  resumeThread(id: string, options: ThreadOptions) {
+    this.resumes.push({ id, options });
+    return this.thread(this.resumedIdOverride ?? id);
+  }
+
+  private thread(id: string) {
+    return {
+      id,
+      run: async (
+        prompt: string,
+        options: {
+          signal: AbortSignal;
+          outputSchema?: Record<string, unknown>;
+        },
+      ) => {
+        this.prompts.push(prompt);
+        this.turnOptions.push(options);
+        const finalResponse = this.responses.shift();
+        if (finalResponse === undefined) {
+          throw new Error("No scripted response");
+        }
+        return {
+          finalResponse,
+          usage,
+        };
+      },
+    };
+  }
+}
+
+function validPmPlan() {
+  return {
+    kind: "pm_plan",
+    objective: "Deliver one bounded feature.",
+    teams: [
+      {
+        team_id: "team-a",
+        mission: "Implement the feature.",
+        owned_paths: ["src/feature.ts"],
+        dependencies: [],
+        acceptance_criteria: ["The requested behavior is implemented."],
+        verification: ["Run focused tests."],
+        worker_count: 1,
+      },
+    ],
+    integration: {
+      strategy: "local_merge",
+      acceptance_criteria: ["The integrated branch remains buildable."],
+      verification: ["Run the repository tests."],
+    },
+  };
+}
+
+function validPmReport() {
+  return {
+    kind: "pm_report",
+    status: "completed",
+    summary: "The bounded feature is complete.",
+    teams: [
+      {
+        team_id: "team-a",
+        status: "completed",
+        summary: "Team A completed its mission.",
+      },
+    ],
+    integration_verification: [
+      {
+        name: "repository tests",
+        status: "passed",
+        evidence: "All focused tests passed.",
+      },
+    ],
+    user_decisions: [],
+  };
 }

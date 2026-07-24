@@ -17,6 +17,13 @@ import {
   managedRoleProfiles,
   type ManagedRole,
 } from "./managed-session.js";
+import {
+  assertManagedOutputContractRole,
+  managedOutputJsonSchemas,
+  parseManagedOutput,
+  type ManagedOutput,
+  type ManagedOutputContract,
+} from "./role-contracts.js";
 
 export type ApprovalDecision =
   | "approve_once"
@@ -28,6 +35,8 @@ export interface ApprovalSessionRequest {
   role: ManagedRole;
   assignment: string;
   working_directory: string;
+  resume_session_id?: string;
+  output_contract?: ManagedOutputContract;
   signal?: AbortSignal;
 }
 
@@ -60,6 +69,7 @@ export interface ApprovalCompletedUpdate {
   sandbox_mode: "workspace-write";
   approval_policy: "on-request";
   final_report: string;
+  structured_report?: ManagedOutput;
   usage: Usage;
 }
 
@@ -99,10 +109,13 @@ const threadStartResponseSchema = z.object({
     id: z.string().min(1),
   }),
   model: z.string().min(1),
+  cwd: z.string().min(1),
   approvalPolicy: z.literal("on-request"),
   approvalsReviewer: z.literal("user"),
   sandbox: z.object({
     type: z.literal("workspaceWrite"),
+    writableRoots: z.array(z.string()),
+    networkAccess: z.literal(false),
   }),
   reasoningEffort: z.literal("xhigh"),
 });
@@ -218,6 +231,7 @@ export class AppServerApprovalSession {
   private readonly timeoutMs: number;
   private client: AppServerProtocolClient | null = null;
   private role: Exclude<ManagedRole, "pm"> | null = null;
+  private outputContract: ManagedOutputContract | null = null;
   private sessionId: string | null = null;
   private turnId: string | null = null;
   private pendingApproval: WireApproval | null = null;
@@ -271,6 +285,14 @@ export class AppServerApprovalSession {
       request.role,
       request.working_directory,
     );
+    if (request.output_contract !== undefined) {
+      assertManagedOutputContractRole(request.role, request.output_contract);
+      this.outputContract = request.output_contract;
+    }
+    const resumeSessionId = request.resume_session_id?.trim();
+    if (request.resume_session_id !== undefined && !resumeSessionId) {
+      throw new ArkTeamError("INVALID_INPUT", "resume_session_id must not be empty");
+    }
     this.role = request.role;
     this.client = this.suppliedClient ?? new StdioAppServerClient({ codex_path: this.codexPath });
     this.removeMessageListener = this.client.onMessage((message) => {
@@ -294,29 +316,58 @@ export class AppServerApprovalSession {
       });
       this.client.notify("initialized");
 
-      const threadResponse = threadStartResponseSchema.parse(
-        await this.client.request("thread/start", {
-          model: profile.model,
-          cwd: workingDirectory,
-          approvalPolicy: "on-request",
-          approvalsReviewer: "user",
-          sandbox: "workspace-write",
-          config: {
-            ...managedCodexConfig,
-            model_reasoning_effort: profile.model_reasoning_effort,
-            web_search: "disabled",
-            sandbox_workspace_write: {
-              network_access: false,
-            },
+      const threadParams = {
+        model: profile.model,
+        cwd: workingDirectory,
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        sandbox: "workspace-write",
+        config: {
+          ...managedCodexConfig,
+          model_reasoning_effort: profile.model_reasoning_effort,
+          web_search: "disabled",
+          sandbox_workspace_write: {
+            network_access: false,
           },
-          developerInstructions: profile.instructions,
-          ephemeral: false,
-        }),
+        },
+        developerInstructions: profile.instructions,
+      };
+      const threadResponse = threadStartResponseSchema.parse(
+        resumeSessionId === undefined
+          ? await this.client.request("thread/start", {
+              ...threadParams,
+              ephemeral: false,
+            })
+          : await this.client.request("thread/resume", {
+              threadId: resumeSessionId,
+              ...threadParams,
+            }),
       );
       if (threadResponse.model !== profile.model) {
         throw new ArkTeamError(
           "AGENT_SESSION_PROTOCOL_ERROR",
           `app-server selected ${threadResponse.model} instead of ${profile.model}`,
+        );
+      }
+      if (threadResponse.cwd !== workingDirectory) {
+        throw new ArkTeamError(
+          "AGENT_SESSION_PROTOCOL_ERROR",
+          `app-server selected a different working directory: ${threadResponse.cwd}`,
+        );
+      }
+      if (!threadResponse.sandbox.writableRoots.includes(workingDirectory)) {
+        throw new ArkTeamError(
+          "AGENT_SESSION_PROTOCOL_ERROR",
+          "app-server workspace-write sandbox does not include the assigned worktree",
+        );
+      }
+      if (
+        resumeSessionId !== undefined &&
+        threadResponse.thread.id !== resumeSessionId
+      ) {
+        throw new ArkTeamError(
+          "AGENT_SESSION_PROTOCOL_ERROR",
+          `Resumed app-server session returned a different thread ID: ${threadResponse.thread.id}`,
         );
       }
       this.sessionId = threadResponse.thread.id;
@@ -327,7 +378,11 @@ export class AppServerApprovalSession {
           input: [
             {
               type: "text",
-              text: buildManagedPrompt(request.role, assignment),
+              text: buildManagedPrompt(
+                request.role,
+                assignment,
+                request.output_contract,
+              ),
               text_elements: [],
             },
           ],
@@ -336,6 +391,12 @@ export class AppServerApprovalSession {
           approvalsReviewer: "user",
           model: profile.model,
           effort: profile.model_reasoning_effort,
+          ...(request.output_contract === undefined
+            ? {}
+            : {
+                outputSchema:
+                  managedOutputJsonSchemas[request.output_contract],
+              }),
         }),
       );
       this.turnId = turnResponse.turn.id;
@@ -569,6 +630,16 @@ export class AppServerApprovalSession {
 
     const role = this.requireRole();
     const profile = managedRoleProfiles[role];
+    let structuredReport: ManagedOutput | undefined;
+    if (this.outputContract !== null) {
+      try {
+        structuredReport = parseManagedOutput(this.outputContract, this.finalReport);
+      } catch (error) {
+        this.fail("Completed app-server turn returned an invalid structured report", error);
+        void this.cleanup();
+        return;
+      }
+    }
     this.terminal = true;
     this.clearDeadline();
     this.emitUpdate({
@@ -582,6 +653,9 @@ export class AppServerApprovalSession {
       sandbox_mode: "workspace-write",
       approval_policy: "on-request",
       final_report: this.finalReport,
+      ...(structuredReport === undefined
+        ? {}
+        : { structured_report: structuredReport }),
       usage: this.usage,
     });
     void this.cleanup();

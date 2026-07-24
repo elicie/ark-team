@@ -429,6 +429,118 @@ test("TEST-406 fails closed on timeout, cancellation, connection, and protocol e
   });
 });
 
+test("TEST-605 resumes a structured writer turn with the exact app-server profile", async () => {
+  await withWorktree(async (workingDirectory) => {
+    const client = new FakeAppServerClient();
+    const session = new AppServerApprovalSession({ client });
+    const completion = session.start({
+      role: "pl",
+      assignment: "Consolidate the completed worker reports.",
+      working_directory: workingDirectory,
+      resume_session_id: "thread-existing",
+      output_contract: "pl_report",
+    });
+
+    await client.waitForRequest("turn/start");
+    emitCompletion(client, JSON.stringify(validPlReport()), {
+      threadId: "thread-existing",
+    });
+    const update = await completion;
+    assert.equal(update.status, "completed");
+    if (update.status !== "completed") {
+      return;
+    }
+    assert.equal(update.session_id, "thread-existing");
+    assert.equal(update.structured_report?.kind, "pl_report");
+    assert.deepEqual(
+      client.requests.map(({ method }) => method),
+      ["initialize", "thread/resume", "turn/start"],
+    );
+    assert.deepEqual(client.params("thread/resume"), {
+      threadId: "thread-existing",
+      model: "gpt-5.6-terra",
+      cwd: workingDirectory,
+      approvalPolicy: "on-request",
+      approvalsReviewer: "user",
+      sandbox: "workspace-write",
+      config: {
+        agents: { enabled: false },
+        apps: { _default: { enabled: false } },
+        features: { multi_agent: false },
+        model_reasoning_effort: "xhigh",
+        web_search: "disabled",
+        sandbox_workspace_write: { network_access: false },
+      },
+      developerInstructions:
+        "Lead exactly one bounded Ark Team team inside the assigned linked Git worktree. " +
+        "Preserve unrelated user work and verify observable evidence. " +
+        "Do not spawn native subagents from this session. " +
+        "Return WORKER_SPAWN_REQUEST records for work that the Ark Team controller should assign to managed worker sessions. " +
+        "Consolidate worker outcomes into one PL report for the PM.",
+    });
+    const turnParams = client.params("turn/start");
+    assert.equal(
+      typeof turnParams === "object" &&
+        turnParams !== null &&
+        "outputSchema" in turnParams &&
+        typeof turnParams.outputSchema === "object" &&
+        turnParams.outputSchema !== null &&
+        "additionalProperties" in turnParams.outputSchema
+        ? turnParams.outputSchema.additionalProperties
+        : undefined,
+      false,
+    );
+  });
+});
+
+test("TEST-606 fails closed on writer resume mismatch and invalid structured output", async () => {
+  await withWorktree(async (workingDirectory) => {
+    const mismatchClient = new FakeAppServerClient({
+      resumed_thread_id: "another-thread",
+    });
+    await assertSessionFailure(
+      new AppServerApprovalSession({ client: mismatchClient }).start({
+        role: "worker",
+        assignment: "Reject mismatched resume evidence.",
+        working_directory: workingDirectory,
+        resume_session_id: "expected-thread",
+        output_contract: "worker_report",
+      }),
+      "AGENT_SESSION_PROTOCOL_ERROR",
+    );
+
+    const weakenedProfileClient = new FakeAppServerClient({
+      network_access: true,
+    });
+    await assertSessionFailure(
+      new AppServerApprovalSession({ client: weakenedProfileClient }).start({
+        role: "worker",
+        assignment: "Reject a weakened sandbox profile.",
+        working_directory: workingDirectory,
+        resume_session_id: "expected-thread",
+        output_contract: "worker_report",
+      }),
+      "AGENT_SESSION_PROTOCOL_ERROR",
+    );
+
+    const invalidClient = new FakeAppServerClient();
+    const invalid = new AppServerApprovalSession({ client: invalidClient }).start({
+      role: "worker",
+      assignment: "Return invalid structured output.",
+      working_directory: workingDirectory,
+      output_contract: "worker_report",
+    });
+    await invalidClient.waitForRequest("turn/start");
+    emitCompletion(invalidClient, "not-json");
+    await assertSessionFailure(invalid, "AGENT_SESSION_PROTOCOL_ERROR");
+  });
+});
+
+interface FakeAppServerOptions {
+  resumed_thread_id?: string;
+  network_access?: boolean;
+}
+
 class FakeAppServerClient implements AppServerProtocolClient {
   readonly requests: Array<{ method: string; params: unknown }> = [];
   readonly notifications: string[] = [];
@@ -437,12 +549,14 @@ class FakeAppServerClient implements AppServerProtocolClient {
   private readonly messageListeners = new Set<(message: AppServerMessage) => void>();
   private readonly failureListeners = new Set<(error: Error) => void>();
 
+  constructor(private readonly options: FakeAppServerOptions = {}) {}
+
   async request(method: string, params: unknown): Promise<unknown> {
     this.requests.push({ method, params });
     if (method === "initialize" || method === "turn/interrupt") {
       return {};
     }
-    if (method === "thread/start") {
+    if (method === "thread/start" || method === "thread/resume") {
       const model =
         typeof params === "object" &&
         params !== null &&
@@ -450,16 +564,37 @@ class FakeAppServerClient implements AppServerProtocolClient {
         typeof params.model === "string"
           ? params.model
           : "unknown";
+      const cwd =
+        typeof params === "object" &&
+        params !== null &&
+        "cwd" in params &&
+        typeof params.cwd === "string"
+          ? params.cwd
+          : "/unknown";
+      const threadId =
+        method === "thread/resume" &&
+        typeof params === "object" &&
+        params !== null &&
+        "threadId" in params &&
+        typeof params.threadId === "string"
+          ? params.threadId
+          : "thread-1";
       return {
-        thread: { id: "thread-1" },
+        thread: {
+          id:
+            method === "thread/resume"
+              ? (this.options.resumed_thread_id ?? threadId)
+              : threadId,
+        },
         model,
+        cwd,
         approvalPolicy: "on-request",
         approvalsReviewer: "user",
         sandbox: {
           type: "workspaceWrite",
-          writableRoots: [],
+          writableRoots: [cwd],
           readOnlyAccess: { type: "fullAccess" },
-          networkAccess: false,
+          networkAccess: this.options.network_access ?? false,
         },
         reasoningEffort: "xhigh",
       };
@@ -574,12 +709,18 @@ function permissionApproval(id: number): AppServerMessage {
   };
 }
 
-function emitCompletion(client: FakeAppServerClient): void {
+function emitCompletion(
+  client: FakeAppServerClient,
+  finalReport = "VISIBLE_FINAL_REPORT",
+  ids: { threadId?: string; turnId?: string } = {},
+): void {
+  const threadId = ids.threadId ?? "thread-1";
+  const turnId = ids.turnId ?? "turn-1";
   client.emit({
     method: "item/completed",
     params: {
-      threadId: "thread-1",
-      turnId: "turn-1",
+      threadId,
+      turnId,
       item: {
         id: "reasoning-1",
         type: "reasoning",
@@ -590,12 +731,12 @@ function emitCompletion(client: FakeAppServerClient): void {
   client.emit({
     method: "item/completed",
     params: {
-      threadId: "thread-1",
-      turnId: "turn-1",
+      threadId,
+      turnId,
       item: {
         id: "message-1",
         type: "agentMessage",
-        text: "VISIBLE_FINAL_REPORT",
+        text: finalReport,
         phase: "final_answer",
       },
     },
@@ -603,8 +744,8 @@ function emitCompletion(client: FakeAppServerClient): void {
   client.emit({
     method: "thread/tokenUsage/updated",
     params: {
-      threadId: "thread-1",
-      turnId: "turn-1",
+      threadId,
+      turnId,
       tokenUsage: {
         last: {
           inputTokens: 120,
@@ -619,21 +760,58 @@ function emitCompletion(client: FakeAppServerClient): void {
   client.emit({
     method: "turn/completed",
     params: {
-      threadId: "thread-1",
+      threadId,
       turn: {
-        id: "turn-1",
+        id: turnId,
         status: "completed",
         items: [
           {
             id: "message-1",
             type: "agentMessage",
-            text: "VISIBLE_FINAL_REPORT",
+            text: finalReport,
             phase: "final_answer",
           },
         ],
       },
     },
   });
+}
+
+function validPlReport() {
+  return {
+    kind: "pl_report",
+    team_id: "team-a",
+    status: "completed",
+    summary: "The team mission is complete.",
+    worker_reports: [
+      {
+        kind: "worker_report",
+        team_id: "team-a",
+        worker_key: "worker-a",
+        status: "completed",
+        summary: "The bounded worker task is complete.",
+        changed_files: ["src/feature.ts"],
+        commit_sha: "abcdef1",
+        verification: [
+          {
+            name: "focused tests",
+            status: "passed",
+            evidence: "The focused test passed.",
+          },
+        ],
+        blockers: [],
+      },
+    ],
+    integration_commit_sha: "abcdef2",
+    verification: [
+      {
+        name: "team tests",
+        status: "passed",
+        evidence: "All team tests passed.",
+      },
+    ],
+    blockers: [],
+  };
 }
 
 async function finishAfterDecision(
