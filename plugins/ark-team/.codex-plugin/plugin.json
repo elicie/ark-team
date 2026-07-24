@@ -2,10 +2,12 @@
   "name": "ark-team",
   "version": "0.1.0",
   "description": "PM-led multi-team orchestration for complex Codex work",
+  "repository": "https://github.com/elicie/ark-team",
   "author": {
     "name": "Ark Team"
   },
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Ark Team",
     "shortDescription": "Coordinate managed PM, PL, and worker agent teams.",

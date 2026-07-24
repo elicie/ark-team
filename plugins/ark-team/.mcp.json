@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ark-team": {
+      "command": "node",
+      "args": [
+        "runtime/dist/server.js"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "ARK_TEAM_STATE_ROOT"
+      ]
+    }
+  }
+}

@@ -97,6 +97,20 @@ Prefer a managed Ark Team runtime when it exposes:
 
 Use the runtime's actual tool schemas. Do not invent command names or fields.
 
+The current bundled control-plane slice exposes these MCP tools:
+
+- `ark_team_start`
+- `ark_team_list`
+- `ark_team_status`
+- `ark_team_logs`
+- `ark_team_pause`
+- `ark_team_resume`
+- `ark_team_cancel`
+
+These tools persist and control orchestration records only. Until later runtime
+slices add session scheduling and Git isolation, continue to use the native
+fallback for actual team execution.
+
 ### Native fallback
 
 Use native Codex subagents when no managed runtime exists.

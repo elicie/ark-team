@@ -19,7 +19,12 @@ The skill implements the operating contract agreed for:
   -> ../../plugins/ark-team/skills/ark-team
 .codex/team-orchestrator.toml
 plugins/ark-team/
+  .mcp.json
   .codex-plugin/plugin.json
+  runtime/
+    dist/server.js
+    src/
+    test/
   skills/ark-team/
     SKILL.md
     agents/openai.yaml
@@ -32,9 +37,39 @@ The plugin copy under `plugins/ark-team` is the canonical source. The `.agents/s
 
 - Use a Codex release that supports skills and subagents.
 - Keep multi-agent support enabled.
+- Use Node.js 18 or later to run the bundled local MCP server.
 - Install Git with worktree support for isolated writing teams, or provide an equivalent managed-runtime isolation backend.
 - Expect native fallback to obey the host's concurrency limit.
-- Install the planned managed runtime later if dedicated model-pinned sessions and persistent orchestration are required.
+- The current MCP control plane persists run state but does not yet create model-pinned agent sessions.
+
+## Runtime control plane
+
+The plugin bundles a local stdio MCP server and registers it through `.mcp.json`.
+It currently exposes:
+
+- `ark_team_start`
+- `ark_team_list`
+- `ark_team_status`
+- `ark_team_logs`
+- `ark_team_pause`
+- `ark_team_resume`
+- `ark_team_cancel`
+
+Runs are stored as atomic JSON records under
+`~/.codex/team-orchestrator/runs` by default. Set the absolute
+`ARK_TEAM_STATE_ROOT` environment variable before starting Codex to use another
+location.
+
+Build and verify the bundled server from the repository root:
+
+```sh
+npm install
+npm test
+```
+
+`npm test` type-checks the source, runs persistence tests, builds
+`plugins/ark-team/runtime/dist/server.js`, and exercises the built server over
+MCP stdio.
 
 ## Use in this repository
 
@@ -90,10 +125,18 @@ Use $skill-creator. Read /absolute/path/to/arc/plugins/ark-team/skills/ark-team/
 and its references, then create a project-specific variant without modifying the source.
 ```
 
-Before distributing this repository through Git, track the skill files and publish a reviewed commit or tag. Add an explicit license, canonical repository URL, and durable publisher metadata before public distribution.
+Before public distribution, publish a reviewed commit or tag and add an
+explicit license plus durable publisher metadata.
 
 ## Current implementation boundary
 
-This repository currently provides the validated skill contract, project defaults, and plugin scaffold. Without a managed Ark Team runtime, the skill uses native Codex subagents and schedules work within the host's concurrency limit.
+This repository currently provides the validated skill contract, project
+defaults, plugin package, and the first managed-runtime slice: persistent run
+records plus MCP lifecycle/status tools. Without the later scheduler, the skill
+still uses native Codex subagents and schedules work within the host's
+concurrency limit.
 
-The planned TypeScript Codex SDK/MCP runtime is required to guarantee a separate Sol/xhigh PM session, independent team sessions, persistent execution, and runtime status controls.
+The next runtime slices are still required to create and pin a separate
+Sol/xhigh PM session, independently schedule Terra PL and Luna worker sessions,
+manage worktrees and integration, and continue approval-gated work. The current
+control plane does not claim those guarantees.
