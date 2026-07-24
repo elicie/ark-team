@@ -1,0 +1,6 @@
+interface:
+  display_name: "Ark Team"
+  short_description: "Run managed PM, PL, and worker agent teams"
+  default_prompt: "Use $ark-team to organize and execute this task with managed PM, PL, and worker teams."
+policy:
+  allow_implicit_invocation: false

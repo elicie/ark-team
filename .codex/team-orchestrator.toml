@@ -1,0 +1,40 @@
+version = 1
+
+[organization]
+max_teams = 4
+min_workers_per_team = 1
+max_workers_per_team = 5
+allow_direct_pl_communication = true
+
+[models]
+pm = "gpt-5.6-sol"
+pm_reasoning_effort = "xhigh"
+pl = "gpt-5.6-terra"
+pl_reasoning_effort = "xhigh"
+worker = "gpt-5.6-luna"
+worker_reasoning_effort = "xhigh"
+
+[execution]
+agent_timeout_minutes = 60
+run_timeout_minutes = 360
+worker_correction_rounds = 2
+pl_correction_rounds = 2
+internal_agent_retries = 2
+external_provider_retries = 3
+pause_when_host_stops = true
+
+[git]
+integration_branch_prefix = "orchestrator/"
+preserve_local_branches = true
+cleanup_verified_worktrees = true
+require_approval_for_remote_actions = true
+
+[logging]
+root = "~/.codex/team-orchestrator/runs"
+retention_days = 30
+record_usage = true
+record_private_reasoning = false
+
+[external_models]
+explicit_request_only = true
+automatic_luna_fallback = false

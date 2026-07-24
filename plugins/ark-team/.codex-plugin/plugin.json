@@ -1,0 +1,23 @@
+{
+  "name": "ark-team",
+  "version": "0.1.0",
+  "description": "PM-led multi-team orchestration for complex Codex work",
+  "author": {
+    "name": "Ark Team"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Ark Team",
+    "shortDescription": "Coordinate managed PM, PL, and worker agent teams.",
+    "longDescription": "Ark Team defines a guarded PM-led workflow that dynamically forms PL-led teams, isolates their work, integrates verified results, and reports observable evidence.",
+    "developerName": "Ark Team",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use $ark-team to complete this task with managed teams."
+    ]
+  }
+}
