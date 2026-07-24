@@ -27,6 +27,7 @@ plugins/ark-team/
   .codex-plugin/plugin.json
   runtime/
     dist/
+      approval-session.js
       server.js
       session-cli.js
     src/
@@ -53,6 +54,8 @@ working in this repository. Project-scoped custom-agent definitions live under
   Luna/xhigh.
 - The managed session launcher uses the official TypeScript Codex SDK and
   requires an authenticated `codex` executable on `PATH`.
+- The approval-gated writer backend uses `codex app-server` over local stdio
+  and requires a compatible generated stable protocol schema.
 - The MCP control plane persists run state but does not yet schedule managed
   sessions itself.
 
@@ -81,8 +84,9 @@ npm install
 npm test
 ```
 
-`npm test` type-checks the source, runs persistence tests, builds
-the MCP server and managed-session CLI, and exercises both built entry points.
+`npm test` type-checks the source, runs persistence and approval-gateway tests,
+builds the MCP server, managed-session CLI, and approval-session library, and
+exercises the CLI and MCP entry points.
 
 ## Managed role sessions
 
@@ -119,11 +123,41 @@ temporary repository and therefore consumes model usage:
 npm run verify:managed-sessions
 ```
 
-The current official TypeScript SDK uses non-interactive `codex exec`. In the
-locally verified Codex release, a requested `on-request` writer policy appeared
-as `never` in the actual turn context because no interactive approval channel
-was available. Until the approval-gateway slice is implemented, do not assign
-dangerous work to this launcher; stop and ask the user first.
+The official TypeScript SDK backend still uses non-interactive `codex exec`. In
+the locally verified Codex release, a requested `on-request` writer policy
+appeared as `never` in that turn context because no interactive approval
+channel was available. Continue to use it for the read-only PM and for writer
+assignments that cannot require interactive approval.
+
+For PL and worker assignments that may need approval, import
+`AppServerApprovalSession` from
+`plugins/ark-team/runtime/dist/approval-session.js`. It starts
+`codex app-server` over stdio, verifies the selected writer profile, and returns
+either:
+
+- `waiting_user`, with one opaque command, file-change, or permission approval;
+  or
+- `completed`, with the final role report and token usage.
+
+Call `decide()` with `approve_once`, `approve_session`, `decline`, or `cancel`
+only after obtaining the required user decision. The object continues waiting
+on the same thread and turn. It rejects PM sessions and writer directories that
+are not linked Git worktree roots. It does not persist a pending approval after
+the controller process exits.
+
+Check protocol compatibility without consuming model usage:
+
+```sh
+npm run verify:app-server-schema
+```
+
+The optional live verification consumes Luna usage. It creates a disposable
+repository, surfaces and declines one outside-worktree command approval,
+confirms that the file was not created, and removes the fixture:
+
+```sh
+npm run verify:approval-gateway
+```
 
 ## Use in this repository
 
@@ -200,12 +234,12 @@ explicit license plus durable publisher metadata.
 
 This repository currently provides the validated skill contract, project
 defaults, plugin package, persistent run records, MCP lifecycle/status tools,
-project-scoped native custom agents, and an official-SDK managed launcher for
-separately permissioned PM, PL, and worker sessions. The launcher is available
-as a library and CLI but is not yet connected to a persistent team scheduler.
+project-scoped native custom agents, an official-SDK role launcher, and a
+tested app-server approval gateway for separately permissioned PL and worker
+sessions. These execution primitives are not yet connected to the persistent
+team scheduler.
 
 The next runtime slices are still required to persist teams and assignments,
 schedule up to four teams, create and manage worktrees, route hierarchical
-reports, integrate verified commits, and continue approval-gated work through
-an interactive gateway. The current control plane does not claim those
-guarantees.
+reports, and integrate verified commits. The current control plane does not
+claim those guarantees.

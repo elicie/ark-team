@@ -332,7 +332,7 @@ export async function assertManagedWorkspace(
   return workingDirectory;
 }
 
-function buildManagedPrompt(role: ManagedRole, assignment: string): string {
+export function buildManagedPrompt(role: ManagedRole, assignment: string): string {
   const profile = managedRoleProfiles[role];
   return [
     "<ark_team_managed_role>",

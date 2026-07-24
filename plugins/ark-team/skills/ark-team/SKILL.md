@@ -103,6 +103,12 @@ Use an external model only when the user explicitly requests it. Retry an extern
 
 Continue ordinary in-scope work without approval. Pause for the dangerous actions listed in the operating contract.
 
+When a managed PL or worker returns `waiting_user`, present the redacted request
+to the user and leave it unanswered. Pass `approve_once`, `approve_session`,
+`decline`, or `cancel` to the approval gateway only after the user's decision,
+then continue the same managed turn. Never infer approval from the original
+task or silently substitute a new session.
+
 When the user changes requirements, pause only affected teams, update their contracts, and allow unaffected work to continue.
 
 When the user cancels a run, stop active agents and preserve worktrees, branches, commits, and logs. Do not clean them until the user explicitly requests cleanup. Preserve enough state to resume by run identifier.

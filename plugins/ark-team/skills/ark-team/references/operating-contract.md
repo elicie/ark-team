@@ -171,6 +171,12 @@ Allow without additional approval:
 
 Follow any stricter repository, system, or user instruction.
 
+For an interactive managed writer session, treat every surfaced approval as a
+single unresolved `waiting_user` state. Do not answer it automatically. Resume
+the same turn only after the user selects one-time approval, session approval,
+decline, or cancel. Treat an expired, unknown, or already resolved approval ID
+as an error instead of replaying the decision.
+
 ## Failure, timeout, and cancellation policy
 
 - Permit two worker correction rounds.

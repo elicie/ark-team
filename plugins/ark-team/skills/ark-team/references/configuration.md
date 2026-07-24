@@ -153,9 +153,28 @@ persisted assignments.
 
 The SDK currently uses non-interactive `codex exec`. Local live verification
 showed that a requested `on-request` writer policy became `never` in the actual
-turn context. Until an interactive app-server approval gateway is implemented,
-never send dangerous work to the managed-session CLI. Pause the run and obtain
-the user's decision first.
+turn context. Never send work that may need an interactive decision to the
+managed-session CLI.
+
+For managed PL and worker assignments that may need approval, use the bundled
+`AppServerApprovalSession` library from
+`plugins/ark-team/runtime/dist/approval-session.js`. It launches
+`codex app-server` over local stdio, requires a linked Git worktree, and verifies
+the returned model, `xhigh` effort, `workspace-write` sandbox,
+`on-request` policy, and user reviewer before beginning the turn.
+
+The gateway returns `waiting_user` for command, file-change, and permission
+requests without answering them. Present the redacted request to the user, then
+call `decide()` with `approve_once`, `approve_session`, `decline`, or `cancel`.
+Continue using the returned update from that same object and turn. Never
+auto-approve, reuse an approval ID, or create a replacement session to bypass a
+pending request.
+
+On completion the gateway returns only role metadata, session and turn IDs,
+the final report, and usage. Pending approvals are process-local and are not
+recoverable after controller restart. The gateway remains an execution
+primitive; it does not create teams or worktrees, route reports, or persist
+assignments.
 
 ### Native fallback
 
