@@ -10,14 +10,17 @@ import {
 } from "./domain.js";
 import { ManagedAssignmentScheduler } from "./assignment-scheduler.js";
 import { normalizeError } from "./errors.js";
+import { PlanMaterializer } from "./plan-materializer.js";
+import { pmPlanSchema } from "./role-contracts.js";
 import { RunStore } from "./state-store.js";
 
 const SERVER_INSTRUCTIONS =
-  "Use Ark Team tools only after explicit user invocation. Start with ark_team_start and retain the run_id. Managed PL/worker assignments require an existing linked Git worktree. Keep every returned assignment_id. When an assignment returns waiting_user, present its pending approval and call ark_team_assignment_decide only after the user's decision. Use assignment status/list for stored reports and usage. Run pause/cancel stops active managed assignments.";
+  "Use Ark Team tools only after explicit user invocation. Start with ark_team_start and retain the run_id. Apply one validated pm_plan with ark_team_plan_apply to create durable linked team worktrees, then inspect them with ark_team_team_list. Managed PL/worker assignments require those linked Git worktrees. Keep every returned assignment_id. When an assignment returns waiting_user, present its pending approval and call ark_team_assignment_decide only after the user's decision. Use assignment status/list for stored reports and usage. Run pause/cancel stops active managed assignments.";
 
 export function createArkTeamMcpServer(
   store: RunStore,
   scheduler = new ManagedAssignmentScheduler(store),
+  materializer = new PlanMaterializer(store),
 ): McpServer {
   const server = new McpServer(
     {
@@ -120,6 +123,51 @@ export function createArkTeamMcpServer(
           ...(after_sequence === undefined ? {} : { after_sequence }),
           ...(limit === undefined ? {} : { limit }),
         })),
+      })),
+  );
+
+  server.registerTool(
+    "ark_team_plan_apply",
+    {
+      title: "Apply Ark Team PM plan",
+      description:
+        "Validate and persist one PM plan while creating an isolated linked Git worktree for each team.",
+      inputSchema: {
+        run_id: z.string().min(1),
+        plan: pmPlanSchema,
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ run_id, plan }) =>
+      handleTool(async () => ({
+        ...(await materializer.apply(run_id, plan)),
+      })),
+  );
+
+  server.registerTool(
+    "ark_team_team_list",
+    {
+      title: "List Ark Team team workspaces",
+      description:
+        "List durable PM-planned teams and their linked worktree, branch, base commit, dependencies, and state.",
+      inputSchema: {
+        run_id: z.string().min(1),
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ run_id }) =>
+      handleTool(async () => ({
+        ...(await materializer.list(run_id)),
       })),
   );
 

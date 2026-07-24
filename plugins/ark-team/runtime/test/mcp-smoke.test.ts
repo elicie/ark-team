@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
+import { promisify } from "node:util";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
@@ -14,6 +16,7 @@ import {
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(testDirectory, "../../../..");
 const pluginRoot = path.join(repositoryRoot, "plugins/ark-team");
+const execFileAsync = promisify(execFile);
 
 let temporaryRoot: string;
 let projectRoot: string;
@@ -24,6 +27,29 @@ before(async () => {
   temporaryRoot = await mkdtemp(path.join(tmpdir(), "ark-team-mcp-test-"));
   projectRoot = path.join(temporaryRoot, "project");
   await mkdir(projectRoot);
+  await execFileAsync("git", ["init", "-b", "main", projectRoot]);
+  await execFileAsync("git", [
+    "-C",
+    projectRoot,
+    "config",
+    "user.name",
+    "Ark Team Test",
+  ]);
+  await execFileAsync("git", [
+    "-C",
+    projectRoot,
+    "config",
+    "user.email",
+    "ark-team-test@example.invalid",
+  ]);
+  await execFileAsync("git", [
+    "-C",
+    projectRoot,
+    "commit",
+    "--allow-empty",
+    "-m",
+    "baseline",
+  ]);
 
   const pluginConfig = JSON.parse(
     await readFile(path.join(pluginRoot, ".mcp.json"), "utf8"),
@@ -79,9 +105,11 @@ test("TEST-006 exposes lifecycle tools and persists a run through MCP", async ()
       "ark_team_list",
       "ark_team_logs",
       "ark_team_pause",
+      "ark_team_plan_apply",
       "ark_team_resume",
       "ark_team_start",
       "ark_team_status",
+      "ark_team_team_list",
     ],
   );
 
@@ -115,4 +143,60 @@ test("TEST-006 exposes lifecycle tools and persists a run through MCP", async ()
     | undefined;
   assert.equal(statusPayload?.ok, true);
   assert.equal(statusPayload?.run?.run_id, runId);
+
+  const applied = await client.callTool({
+    name: "ark_team_plan_apply",
+    arguments: {
+      run_id: runId,
+      plan: {
+        kind: "pm_plan",
+        objective: "MCP smoke test",
+        teams: [
+          {
+            team_id: "team-a",
+            mission: "Prepare the bounded team workspace.",
+            owned_paths: ["src/team-a.ts"],
+            dependencies: [],
+            acceptance_criteria: ["The workspace is ready."],
+            verification: ["Verify the linked worktree."],
+            worker_count: 1,
+          },
+        ],
+        integration: {
+          strategy: "local_merge",
+          acceptance_criteria: ["The team result can be integrated."],
+          verification: ["Run repository tests."],
+        },
+      },
+    },
+  });
+  assert.equal(applied.isError, undefined);
+  const appliedPayload = applied.structuredContent as
+    | {
+        ok?: boolean;
+        run?: { state?: string; team_count?: number };
+        teams?: Array<{ working_directory?: string }>;
+      }
+    | undefined;
+  assert.equal(appliedPayload?.ok, true);
+  assert.equal(appliedPayload?.run?.state, "staffing");
+  assert.equal(appliedPayload?.run?.team_count, 1);
+  const worktreePath = appliedPayload?.teams?.[0]?.working_directory;
+  assert.equal(typeof worktreePath, "string");
+  assert.equal(
+    (await readFile(path.join(worktreePath ?? "", ".git"), "utf8")).startsWith(
+      "gitdir:",
+    ),
+    true,
+  );
+
+  const teams = await client.callTool({
+    name: "ark_team_team_list",
+    arguments: { run_id: runId },
+  });
+  const teamsPayload = teams.structuredContent as
+    | { ok?: boolean; total?: number }
+    | undefined;
+  assert.equal(teamsPayload?.ok, true);
+  assert.equal(teamsPayload?.total, 1);
 });

@@ -34,6 +34,7 @@ Do not activate Ark Team for a normal coding request merely because subagents co
 3. Inspect the repository or workspace without changing it. Verify that Git and worktree support are available before scheduling isolated writing teams. Permit a read-only run without Git; stop a writing run with an unsupported-environment report when neither Git worktrees nor the managed runtime's equivalent isolation is available.
 4. Detect whether the managed Ark Team runtime is available.
    - Prefer the managed runtime when it can create a dedicated `gpt-5.6-sol`/`xhigh`/read-only PM session, persistent run state, and isolated team sessions.
+   - After `ark_team_start`, require the PM result to match the managed `pm_plan` contract and pass it once to `ark_team_plan_apply`. Retain the returned team worktree and branch records.
    - When managed assignment tools are available, retain every returned assignment ID and use them for explicit PL/worker start, status, approval, and cancellation operations.
    - Otherwise use the named native Codex custom agents only for read-only work, respect the surfaced concurrency limit, and schedule work in waves.
 5. State any degraded guarantees before execution. Never claim that native fallback pinned a model, created an independent session, or exceeded a host concurrency limit unless the runtime confirms it.
@@ -79,6 +80,8 @@ When native concurrency cannot hold every PL and worker at once, run teams or wo
 ## Isolate and integrate changes
 
 Use one Git worktree per writing team when the project is a Git repository.
+With the managed runtime, create these only through `ark_team_plan_apply`; do
+not pre-create or substitute arbitrary team directories.
 
 Use a temporary shadow Git workspace when the source is not a Git repository. Never initialize Git inside the user's original non-Git directory without explicit permission.
 

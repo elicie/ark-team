@@ -8,6 +8,8 @@ export type ArkTeamErrorCode =
   | "INVALID_TRANSITION"
   | "RUN_NOT_FOUND"
   | "STATE_ROOT_UNAVAILABLE"
+  | "TEAM_NOT_FOUND"
+  | "WORKSPACE_PREPARATION_FAILED"
   | "UNSAFE_AGENT_WORKSPACE";
 
 export class ArkTeamError extends Error {

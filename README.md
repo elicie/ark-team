@@ -57,8 +57,8 @@ working in this repository. Project-scoped custom-agent definitions live under
 - The approval-gated writer backend uses `codex app-server` over local stdio
   and requires a compatible generated stable protocol schema.
 - The MCP control plane persists run and assignment state and can schedule
-  explicitly defined PL/worker sessions. It does not yet run the PM planner or
-  create worktrees.
+  explicitly defined PL/worker sessions and materialize a validated PM plan
+  into linked team worktrees. It does not yet invoke the PM planner.
 
 ## Runtime control plane
 
@@ -72,6 +72,8 @@ It currently exposes:
 - `ark_team_pause`
 - `ark_team_resume`
 - `ark_team_cancel`
+- `ark_team_plan_apply`
+- `ark_team_team_list`
 - `ark_team_assignment_start`
 - `ark_team_assignment_list`
 - `ark_team_assignment_status`
@@ -82,6 +84,15 @@ Runs are stored as atomic JSON records under
 `~/.codex/team-orchestrator/runs` by default. Set the absolute
 `ARK_TEAM_STATE_ROOT` environment variable before starting Codex to use another
 location.
+
+`ark_team_plan_apply` accepts one validated `pm_plan`. For a clean Git
+repository root it creates one linked worktree and
+`ark-team/<run-id>/<team-id>` branch per team from the same base commit, then
+atomically stores the plan and team records. `ark_team_team_list` returns their
+mission, dependencies, branch, worktree, base commit, worker count, and state.
+Set `ARK_TEAM_WORKTREE_ROOT` to an absolute path or `~/...` to override the
+default `<state-root>/.worktrees` location. The resolved location must be
+outside the project checkout.
 
 Managed assignment records live in the same atomic run record. Each record
 retains its team and parent PL, linked worktree, state, session and turn IDs,
@@ -278,9 +289,10 @@ project-scoped native custom agents, an official-SDK role launcher, a tested
 app-server approval gateway, and a persistent MCP scheduler for explicitly
 defined PL and worker assignments. Role sessions now expose strict planning and
 report JSON contracts and can continue completed PM, PL, and worker threads.
+The control plane can also materialize a validated PM plan into durable linked
+team worktrees and preserved local branches.
 
-The next runtime slices are still required to run the PM planner, parse spawn
-requests, create and manage worktrees, dispatch independent teams in parallel,
-route stored worker reports into those PL continuations, apply retries, and
-integrate verified commits. The current control plane does not claim those
-guarantees.
+The next runtime slices are still required to invoke the PM planner, dispatch
+independent teams in parallel, route stored worker reports into PL
+continuations, apply retries, and integrate verified commits. The current
+control plane does not claim those guarantees.

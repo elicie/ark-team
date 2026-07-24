@@ -28,6 +28,8 @@ import {
   type RunLogsResult,
   type RunRecord,
   type RunState,
+  type TeamListResult,
+  type TeamRecord,
   type TransitionResult,
 } from "./domain.js";
 import type {
@@ -35,7 +37,12 @@ import type {
   ApprovalSessionUpdate,
 } from "./approval-session.js";
 import { ArkTeamError } from "./errors.js";
+import {
+  pmPlanSchema,
+  type PmPlan,
+} from "./role-contracts.js";
 import { assertRunId, createRunId } from "./run-id.js";
+import type { PreparedTeamWorkspace } from "./worktree-manager.js";
 
 export interface RunStoreOptions {
   root_path?: string;
@@ -77,6 +84,17 @@ export interface ListAssignmentsInput {
 export interface ResolvedApproval {
   approval_id: string;
   decision: ApprovalDecision;
+}
+
+export interface MaterializePlanInput {
+  run_id: string;
+  plan: PmPlan;
+  workspaces: PreparedTeamWorkspace[];
+}
+
+export interface MaterializePlanResult {
+  run: RunRecord;
+  teams: TeamRecord[];
 }
 
 const ACTIVE_STATES = new Set<RunState>([
@@ -168,6 +186,7 @@ export class RunStore {
         revision: 1,
         event_count: 1,
         assignment_count: 0,
+        team_count: 0,
       };
       const event: RunEvent = {
         schema_version: 1,
@@ -180,7 +199,13 @@ export class RunStore {
       };
 
       try {
-        await this.writePersistedRun({ run, events: [event], assignments: [] });
+        await this.writePersistedRun({
+          run,
+          events: [event],
+          assignments: [],
+          teams: [],
+          plan: null,
+        });
       } catch (error) {
         await rm(this.runDirectory(runId), { recursive: true, force: true });
         throw error;
@@ -259,6 +284,130 @@ export class RunStore {
     };
   }
 
+  async materializePlan(input: MaterializePlanInput): Promise<MaterializePlanResult> {
+    return this.withMutation(async () => {
+      const parsedPlan = pmPlanSchema.safeParse(input.plan);
+      if (!parsedPlan.success) {
+        throw new ArkTeamError("INVALID_INPUT", "plan does not match pm_plan", {
+          cause: parsedPlan.error,
+        });
+      }
+      const persisted = await this.readPersistedRun(input.run_id);
+      if (persisted.run.state !== "planning" || persisted.plan !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          `Cannot materialize a PM plan while the run is ${persisted.run.state}`,
+        );
+      }
+      if (persisted.teams.length > 0 || persisted.assignments.length > 0) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "Cannot materialize a PM plan after teams or assignments exist",
+        );
+      }
+      if (input.workspaces.length !== parsedPlan.data.teams.length) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "prepared workspaces do not match the PM plan",
+        );
+      }
+
+      const baseCommits = new Set<string>();
+      const timestamp = this.now().toISOString();
+      const teams: TeamRecord[] = parsedPlan.data.teams.map((plannedTeam, index) => {
+        const workspace = input.workspaces[index];
+        if (
+          workspace === undefined ||
+          workspace.run_id !== persisted.run.run_id ||
+          workspace.team_id !== plannedTeam.team_id ||
+          workspace.isolation_mode !== "git_worktree" ||
+          !path.isAbsolute(workspace.working_directory) ||
+          workspace.branch !==
+            `ark-team/${persisted.run.run_id}/${plannedTeam.team_id}`
+        ) {
+          throw new ArkTeamError(
+            "INVALID_INPUT",
+            `prepared workspace does not match team ${plannedTeam.team_id}`,
+          );
+        }
+        baseCommits.add(workspace.base_commit);
+        return {
+          schema_version: 1,
+          run_id: persisted.run.run_id,
+          team_id: plannedTeam.team_id,
+          mission: plannedTeam.mission,
+          worker_count: plannedTeam.worker_count,
+          dependencies: plannedTeam.dependencies,
+          owned_paths: plannedTeam.owned_paths,
+          acceptance_criteria: plannedTeam.acceptance_criteria,
+          verification: plannedTeam.verification,
+          isolation_mode: workspace.isolation_mode,
+          working_directory: path.normalize(workspace.working_directory),
+          branch: workspace.branch,
+          base_commit: workspace.base_commit,
+          state: "ready",
+          created_at: timestamp,
+          updated_at: timestamp,
+          revision: 1,
+        };
+      });
+      if (baseCommits.size !== 1) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "all team worktrees must share one base commit",
+        );
+      }
+
+      const events: RunEvent[] = [
+        {
+          schema_version: 1,
+          sequence: persisted.run.event_count + 1,
+          event_id: randomUUID(),
+          event_type: "plan.materialized",
+          timestamp,
+          state: "staffing",
+          message: `PM plan materialized with ${teams.length} team(s)`,
+        },
+        ...teams.map((team, index) => ({
+          schema_version: 1 as const,
+          sequence: persisted.run.event_count + index + 2,
+          event_id: randomUUID(),
+          event_type: "team.prepared" as const,
+          timestamp,
+          state: "staffing" as const,
+          team_id: team.team_id,
+          message: `Linked worktree prepared for ${team.team_id}`,
+        })),
+      ];
+      const run: RunRecord = {
+        ...persisted.run,
+        state: "staffing",
+        resume_state: null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + events.length,
+        team_count: teams.length,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, ...events],
+        assignments: persisted.assignments,
+        teams,
+        plan: parsedPlan.data,
+      });
+      return { run, teams };
+    });
+  }
+
+  async listTeams(runId: string): Promise<TeamListResult> {
+    const persisted = await this.readPersistedRun(runId);
+    return {
+      run_id: persisted.run.run_id,
+      teams: persisted.teams,
+      total: persisted.teams.length,
+    };
+  }
+
   async createAssignment(input: CreateAssignmentInput): Promise<AssignmentRecord> {
     return this.withMutation(async () => {
       const persisted = await this.readPersistedRun(input.run_id);
@@ -283,6 +432,21 @@ export class RunStore {
         );
       }
       const workingDirectory = path.normalize(input.working_directory);
+      const plannedTeam = persisted.teams.find(
+        (team) => team.team_id === input.team_id,
+      );
+      if (
+        persisted.plan !== null &&
+        (!plannedTeam ||
+          plannedTeam.working_directory !== workingDirectory ||
+          plannedTeam.state === "cleaned" ||
+          plannedTeam.state === "failed")
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "assignment team and worktree must match an available materialized PM team",
+        );
+      }
 
       let parentAssignmentId: string | null = null;
       if (input.role === "pl") {
@@ -301,6 +465,12 @@ export class RunStore {
           throw new ArkTeamError(
             "INVALID_INPUT",
             `team ${input.team_id} already has a PL assignment`,
+          );
+        }
+        if (plannedTeam && plannedTeam.state !== "ready") {
+          throw new ArkTeamError(
+            "INVALID_TRANSITION",
+            `team ${input.team_id} is ${plannedTeam.state}, not ready`,
           );
         }
         const teamCount = new Set(
@@ -408,11 +578,26 @@ export class RunStore {
         event_count: persisted.run.event_count + 1,
         assignment_count: persisted.run.assignment_count + 1,
       };
+      const teams =
+        input.role === "pl" && plannedTeam
+          ? persisted.teams.map((team) =>
+              team.team_id === plannedTeam.team_id
+                ? {
+                    ...team,
+                    state: "active" as const,
+                    updated_at: timestamp,
+                    revision: team.revision + 1,
+                  }
+                : team,
+            )
+          : persisted.teams;
 
       await this.writePersistedRun({
         run: updatedRun,
         events: [...persisted.events, event],
         assignments: [...persisted.assignments, assignment],
+        teams,
+        plan: persisted.plan,
       });
       return assignment;
     });
@@ -631,6 +816,8 @@ export class RunStore {
         run: updatedRun,
         events: [...persisted.events, ...sequencedEvents],
         assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
       });
       return assignment;
     });
@@ -773,6 +960,8 @@ export class RunStore {
         run: updatedRun,
         events: [...persisted.events, event],
         assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
       });
       return { run: updatedRun, changed: true };
     });
@@ -839,6 +1028,8 @@ export class RunStore {
         run: updatedRun,
         events: [...persisted.events, event],
         assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
       });
       return assignment;
     });

@@ -1,5 +1,7 @@
 import { z } from "zod/v4";
 
+import { pmPlanSchema } from "./role-contracts.js";
+
 export const RUN_ID_PATTERN = /^ark-\d{8}t\d{6}z-[a-z0-9]{6}$/;
 export const ASSIGNMENT_ID_PATTERN = /^asg-[a-f0-9]{12}$/;
 export const TEAM_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -29,6 +31,16 @@ export const assignmentStateSchema = z.enum([
 ]);
 
 export type AssignmentState = z.infer<typeof assignmentStateSchema>;
+
+export const teamStateSchema = z.enum([
+  "ready",
+  "active",
+  "integrated",
+  "cleaned",
+  "failed",
+]);
+
+export type TeamState = z.infer<typeof teamStateSchema>;
 
 export const assignmentRoleSchema = z.enum(["pl", "worker"]);
 export type AssignmentRole = z.infer<typeof assignmentRoleSchema>;
@@ -145,6 +157,28 @@ export const assignmentRecordSchema = z
 
 export type AssignmentRecord = z.infer<typeof assignmentRecordSchema>;
 
+export const teamRecordSchema = z.object({
+  schema_version: z.literal(1),
+  run_id: z.string().regex(RUN_ID_PATTERN),
+  team_id: z.string().regex(TEAM_ID_PATTERN),
+  mission: z.string().min(1),
+  worker_count: z.number().int().min(1).max(5),
+  dependencies: z.array(z.string().regex(TEAM_ID_PATTERN)).max(3),
+  owned_paths: z.array(z.string().min(1)).max(100),
+  acceptance_criteria: z.array(z.string().min(1)).min(1).max(50),
+  verification: z.array(z.string().min(1)).min(1).max(50),
+  isolation_mode: z.literal("git_worktree"),
+  working_directory: z.string().min(1),
+  branch: z.string().min(1),
+  base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),
+  state: teamStateSchema,
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
+  revision: z.number().int().positive(),
+});
+
+export type TeamRecord = z.infer<typeof teamRecordSchema>;
+
 export const runRecordSchema = z.object({
   schema_version: z.literal(1),
   run_id: z.string().regex(RUN_ID_PATTERN),
@@ -157,6 +191,7 @@ export const runRecordSchema = z.object({
   revision: z.number().int().positive(),
   event_count: z.number().int().nonnegative(),
   assignment_count: z.number().int().nonnegative().default(0),
+  team_count: z.number().int().min(0).max(4).default(0),
 });
 
 export type RunRecord = z.infer<typeof runRecordSchema>;
@@ -170,6 +205,9 @@ export const runEventSchema = z.object({
     "run.paused",
     "run.resumed",
     "run.cancelled",
+    "plan.materialized",
+    "team.prepared",
+    "team.cleaned",
     "assignment.started",
     "assignment.waiting_user",
     "assignment.approval_resolved",
@@ -200,6 +238,8 @@ export const persistedRunSchema = z
     run: runRecordSchema,
     events: z.array(runEventSchema),
     assignments: z.array(assignmentRecordSchema).default([]),
+    teams: z.array(teamRecordSchema).default([]),
+    plan: pmPlanSchema.nullable().default(null),
   })
   .superRefine((value, context) => {
     if (value.run.event_count !== value.events.length) {
@@ -212,6 +252,12 @@ export const persistedRunSchema = z
       context.addIssue({
         code: "custom",
         message: "run.assignment_count does not match persisted assignments",
+      });
+    }
+    if (value.run.team_count !== value.teams.length) {
+      context.addIssue({
+        code: "custom",
+        message: "run.team_count does not match persisted teams",
       });
     }
 
@@ -230,6 +276,53 @@ export const persistedRunSchema = z
         });
       }
       assignmentIds.add(assignment.assignment_id);
+    }
+
+    const teamIds = new Set<string>();
+    for (const team of value.teams) {
+      if (team.run_id !== value.run.run_id) {
+        context.addIssue({
+          code: "custom",
+          message: `team ${team.team_id} belongs to another run`,
+        });
+      }
+      if (teamIds.has(team.team_id)) {
+        context.addIssue({
+          code: "custom",
+          message: `duplicate team ID: ${team.team_id}`,
+        });
+      }
+      teamIds.add(team.team_id);
+    }
+    for (const team of value.teams) {
+      for (const dependency of team.dependencies) {
+        if (dependency === team.team_id || !teamIds.has(dependency)) {
+          context.addIssue({
+            code: "custom",
+            message: `team ${team.team_id} has invalid dependency ${dependency}`,
+          });
+        }
+      }
+    }
+    if (value.plan === null && value.teams.length > 0) {
+      context.addIssue({
+        code: "custom",
+        message: "persisted teams require a PM plan",
+      });
+    }
+    if (value.plan !== null) {
+      const plannedTeamIds = value.plan.teams.map((team) => team.team_id);
+      if (
+        plannedTeamIds.length !== value.teams.length ||
+        plannedTeamIds.some(
+          (teamId, index) => value.teams[index]?.team_id !== teamId,
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: "persisted teams do not match the PM plan",
+        });
+      }
     }
 
     value.events.forEach((event, index) => {
@@ -264,5 +357,11 @@ export interface TransitionResult {
 export interface AssignmentListResult {
   run_id: string;
   assignments: AssignmentRecord[];
+  total: number;
+}
+
+export interface TeamListResult {
+  run_id: string;
+  teams: TeamRecord[];
   total: number;
 }

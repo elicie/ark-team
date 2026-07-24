@@ -175,11 +175,133 @@ test("TEST-501 reopens a schema-version-1 run without assignment fields", async 
 
   const store = new RunStore({ root_path: stateRoot });
   assert.equal((await store.getRun(runId)).assignment_count, 0);
+  assert.equal((await store.getRun(runId)).team_count, 0);
   assert.deepEqual(await store.listAssignments(runId), {
     run_id: runId,
     assignments: [],
     total: 0,
   });
+  assert.deepEqual(await store.listTeams(runId), {
+    run_id: runId,
+    teams: [],
+    total: 0,
+  });
+});
+
+test("TEST-704 persists one PM plan and its prepared teams atomically", async () => {
+  const store = new RunStore({ root_path: stateRoot });
+  const run = await store.createRun({
+    objective: "Persist a materialized plan",
+    project_path: projectRoot,
+  });
+  const plan = {
+    kind: "pm_plan" as const,
+    objective: "Deliver two bounded teams.",
+    teams: [
+      {
+        team_id: "team-a",
+        mission: "Deliver A.",
+        owned_paths: ["src/a.ts"],
+        dependencies: [] as string[],
+        acceptance_criteria: ["A is complete."],
+        verification: ["Verify A."],
+        worker_count: 2,
+      },
+      {
+        team_id: "team-b",
+        mission: "Deliver B.",
+        owned_paths: ["src/b.ts"],
+        dependencies: ["team-a"],
+        acceptance_criteria: ["B is complete."],
+        verification: ["Verify B."],
+        worker_count: 1,
+      },
+    ],
+    integration: {
+      strategy: "local_merge" as const,
+      acceptance_criteria: ["A and B integrate."],
+      verification: ["Run all tests."],
+    },
+  };
+  const baseCommit = "a".repeat(40);
+  const workspaces = plan.teams.map((team) => ({
+    run_id: run.run_id,
+    team_id: team.team_id,
+    isolation_mode: "git_worktree" as const,
+    working_directory: path.join(testRoot, "worktrees", team.team_id),
+    branch: `ark-team/${run.run_id}/${team.team_id}`,
+    base_commit: baseCommit,
+  }));
+
+  const result = await store.materializePlan({
+    run_id: run.run_id,
+    plan,
+    workspaces,
+  });
+  assert.equal(result.run.state, "staffing");
+  assert.equal(result.run.team_count, 2);
+  assert.equal(result.run.event_count, 4);
+  assert.deepEqual(
+    result.teams.map((team) => ({
+      team_id: team.team_id,
+      state: team.state,
+      branch: team.branch,
+      base_commit: team.base_commit,
+    })),
+    workspaces.map((workspace) => ({
+      team_id: workspace.team_id,
+      state: "ready",
+      branch: workspace.branch,
+      base_commit: baseCommit,
+    })),
+  );
+  assert.deepEqual(await store.listTeams(run.run_id), {
+    run_id: run.run_id,
+    teams: result.teams,
+    total: 2,
+  });
+  assert.deepEqual(
+    (await store.getLogs(run.run_id)).events.map((event) => event.event_type),
+    ["run.created", "plan.materialized", "team.prepared", "team.prepared"],
+  );
+
+  const before = await readFile(
+    path.join(stateRoot, run.run_id, "run.json"),
+    "utf8",
+  );
+  await assert.rejects(
+    store.materializePlan({
+      run_id: run.run_id,
+      plan,
+      workspaces,
+    }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_TRANSITION",
+  );
+  assert.equal(
+    await readFile(path.join(stateRoot, run.run_id, "run.json"), "utf8"),
+    before,
+  );
+
+  await assert.rejects(
+    store.createAssignment({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Use an unplanned worktree",
+      working_directory: path.join(testRoot, "wrong-worktree"),
+    }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+  );
+  await store.createAssignment({
+    run_id: run.run_id,
+    team_id: "team-a",
+    role: "pl",
+    assignment: "Lead the materialized team",
+    working_directory: workspaces[0]?.working_directory ?? "",
+  });
+  assert.equal((await store.listTeams(run.run_id)).teams[0]?.state, "active");
 });
 
 test("TEST-502 enforces team, PL, worker ownership, and count bounds", async () => {

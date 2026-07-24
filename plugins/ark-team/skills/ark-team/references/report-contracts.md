@@ -1,5 +1,12 @@
 # Ark Team Report Contracts
 
+The managed runtime uses strict JSON contracts named `pm_plan`,
+`pl_worker_plan`, `worker_report`, `pl_report`, and `pm_report`. Select only a
+contract permitted for the active role. Reject malformed JSON, unknown fields,
+wrong-role output, duplicate IDs, unknown or cyclic dependencies, more than
+four teams, or more than five workers. Keep the text shapes below for native
+fallback and user-facing reports.
+
 ## Contents
 
 1. Worker report

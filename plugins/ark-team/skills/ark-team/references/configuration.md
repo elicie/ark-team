@@ -127,22 +127,34 @@ The current bundled control-plane slice exposes these MCP tools:
 - `ark_team_pause`
 - `ark_team_resume`
 - `ark_team_cancel`
+- `ark_team_plan_apply`
+- `ark_team_team_list`
 - `ark_team_assignment_start`
 - `ark_team_assignment_list`
 - `ark_team_assignment_status`
 - `ark_team_assignment_decide`
 - `ark_team_assignment_cancel`
 
-The run lifecycle tools persist and control orchestration records. The
-assignment tools also start explicitly defined PL/worker app-server sessions,
-persist approval and completion updates, and stop active sessions on assignment
-cancel or owning-run pause/cancel.
+The run lifecycle tools persist and control orchestration records.
+`ark_team_plan_apply` accepts one strict `pm_plan`, requires a clean Git
+repository root, creates up to four linked team worktrees and preserved local
+branches, and atomically records their base commit and contracts.
+`ark_team_team_list` reads those records. The assignment tools start explicitly
+defined PL/worker app-server sessions, persist approval and completion updates,
+and stop active sessions on assignment cancel or owning-run pause/cancel.
 
-Before `ark_team_assignment_start`, create or select the linked Git worktree.
-Use one `team_id` per team, start its PL first, and pass that PL
+Before `ark_team_assignment_start`, call `ark_team_plan_apply` and use only the
+returned team worktree. Use one `team_id` per team, start its PL first, and pass that PL
 `assignment_id` as each worker's `parent_assignment_id`. The scheduler enforces
 one PL per team, four teams per run, five workers per PL, and a shared team
 worktree.
+
+The bundled runtime reads `ARK_TEAM_WORKTREE_ROOT` as an optional absolute
+managed-worktree root (a leading `~/` is expanded). Without it, worktrees live
+under `.worktrees` inside `ARK_TEAM_STATE_ROOT`. The worktree root must resolve
+outside the project checkout. Plan application rejects dirty repositories,
+non-Git projects, nested project paths, existing target paths, and existing
+team branches.
 
 Retain every assignment ID. Read `ark_team_assignment_status` or
 `ark_team_assignment_list` for stored reports and usage. When the state is
@@ -196,8 +208,9 @@ pending request.
 On completion the gateway returns only role metadata, session and turn IDs,
 the final report, and usage. Pending approvals are process-local and are not
 recoverable after controller restart. The gateway remains the session
-primitive. The MCP scheduler persists and routes its updates, but neither
-component creates worktrees or performs PM planning.
+primitive. The MCP control plane persists and routes its updates and can
+materialize an already validated PM plan, but it does not yet invoke the PM or
+route child reports into resumed parent turns.
 
 ### Native fallback
 
