@@ -51,8 +51,8 @@ export interface RunCoordinatorResult extends TeamCoordinatorResult {
 export class IntegrationCoordinator {
   private readonly materializer: IntegrationMaterializer;
   private readonly pmLauncher: PmReviewLauncher;
-  private readonly internalAgentRetries: number;
-  private readonly correctionRounds: number;
+  private readonly internalAgentRetries: number | null;
+  private readonly correctionRounds: number | null;
   private readonly remoteActions: RemoteActionCoordinator;
   private readonly cleanup: WorktreeCleanupCoordinator;
   private operationQueue: Promise<void> = Promise.resolve();
@@ -77,16 +77,22 @@ export class IntegrationCoordinator {
           (process.env.ARK_TEAM_CODEX_PATH?.trim() || undefined) ??
           "codex",
       });
-    this.internalAgentRetries = policyValue(
-      options.internal_agent_retries,
-      2,
-      "internal_agent_retries",
-    );
-    this.correctionRounds = policyValue(
-      options.correction_rounds,
-      2,
-      "correction_rounds",
-    );
+    this.internalAgentRetries =
+      options.internal_agent_retries === undefined
+        ? null
+        : policyValue(
+            options.internal_agent_retries,
+            2,
+            "internal_agent_retries",
+          );
+    this.correctionRounds =
+      options.correction_rounds === undefined
+        ? null
+        : policyValue(
+            options.correction_rounds,
+            2,
+            "correction_rounds",
+          );
     this.remoteActions =
       options.remote_actions ?? new RemoteActionCoordinator(store);
     this.cleanup =
@@ -103,6 +109,9 @@ export class IntegrationCoordinator {
       let progressed = false;
       for (let pass = 0; pass < 50; pass += 1) {
         const context = await this.store.getRunContext(runId);
+        const internalAgentRetries =
+          this.internalAgentRetries ??
+          context.run.project_config.execution.internal_agent_retries;
         if (context.run.state === "completed") {
           break;
         }
@@ -182,7 +191,7 @@ export class IntegrationCoordinator {
         if (integrationAssignment.state === "failed") {
           if (
             integrationAssignment.session_attempt_count <=
-            this.internalAgentRetries
+            internalAgentRetries
           ) {
             await runRetryable(async () =>
               this.scheduler.retry({
@@ -196,7 +205,7 @@ export class IntegrationCoordinator {
               assignment_id: integrationAssignment.assignment_id,
               kind: "internal_failure_exhausted",
               mode: "fresh_session",
-              reason: `Integration PL exhausted ${this.internalAgentRetries} automatic retries: ${integrationAssignment.failure_message ?? "managed session failed"}`,
+              reason: `Integration PL exhausted ${internalAgentRetries} automatic retries: ${integrationAssignment.failure_message ?? "managed session failed"}`,
             });
           }
           progressed = true;
@@ -302,6 +311,10 @@ export class IntegrationCoordinator {
     assignment: AssignmentRecord,
     problem: string,
   ): Promise<void> {
+    const run = await this.store.getRun(runId);
+    const correctionRounds =
+      this.correctionRounds ??
+      run.project_config.execution.pl_correction_rounds;
     const correction = [
       "Integration correction required.",
       `Run: ${runId}`,
@@ -311,7 +324,7 @@ export class IntegrationCoordinator {
       "Inspect and repair only the integration worktree. Do not push, create a PR, or modify the original checkout.",
       "Return one corrected strict integration_report.",
     ].join("\n");
-    if (assignment.correction_count < this.correctionRounds) {
+    if (assignment.correction_count < correctionRounds) {
       await runRetryable(async () =>
         this.scheduler.correct({
           run_id: runId,
@@ -370,6 +383,7 @@ export class IntegrationCoordinator {
       working_directory: run.project_path,
       resume_session_id: pmSessionId,
       output_contract: "pm_report",
+      timeout_ms: run.project_config.execution.agent_timeout_minutes * 60_000,
     });
     if (
       result.session_id !== pmSessionId ||

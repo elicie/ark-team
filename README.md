@@ -92,6 +92,17 @@ Runs are stored as atomic JSON records under
 `ARK_TEAM_STATE_ROOT` environment variable before starting Codex to use another
 location.
 
+At run creation the runtime strictly loads
+`.codex/team-orchestrator.toml` from the selected project, applies documented
+defaults, and stores the complete resolved snapshot in the run. Project
+overrides can narrow team and worker counts, tune managed session, retry, and
+correction limits, set a safe integration branch prefix, and add literal
+verification commands. Fixed Sol/Terra/Luna `xhigh` roles, PM/writer
+permissions, remote approval, branch preservation, usage-only logging, and
+private-reasoning exclusion cannot be weakened. Unknown keys, credentials,
+unsafe paths, and invalid values fail before a run is created. Later edits to
+the TOML do not alter an existing run.
+
 `ark_team_plan_apply` accepts one validated `pm_plan`. For a clean Git
 repository root it creates one linked worktree and
 `ark-team/<run-id>/<team-id>` branch per team from the same base commit, then
@@ -360,5 +371,5 @@ tuple behind one explicit approval and cleans verified linked worktrees while
 preserving branches. Persisted approval waits can be explicitly recovered after
 a controller restart on the same thread without carrying the lost approval into
 the new turn. The next runtime slices are still required to add explicit
-external-provider and non-Git adapters and parse project runtime overrides. The
-current control plane does not claim those remaining guarantees.
+external-provider and non-Git adapters. The current control plane does not
+claim those remaining guarantees.

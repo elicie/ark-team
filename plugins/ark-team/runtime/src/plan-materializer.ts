@@ -68,6 +68,21 @@ export class PlanMaterializer {
           "A PM plan has already been materialized for this run",
         );
       }
+      if (
+        parsed.data.teams.length > run.project_config.organization.max_teams ||
+        parsed.data.teams.some(
+          (team) =>
+            team.worker_count <
+              run.project_config.organization.min_workers_per_team ||
+            team.worker_count >
+              run.project_config.organization.max_workers_per_team,
+        )
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "plan exceeds the persisted project organization bounds",
+        );
+      }
       const prepared = await this.worktreeManager.prepare(run, parsed.data);
       try {
         return await this.store.materializePlan({

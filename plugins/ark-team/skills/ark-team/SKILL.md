@@ -24,6 +24,11 @@ Do not activate Ark Team for a normal coding request merely because subagents co
 ## Establish the run
 
 1. Resolve `.codex/team-orchestrator.toml` from the active project. Use the defaults in the configuration reference when it is absent.
+   - With the managed runtime, rely on the configuration snapshot returned in
+     the created run. Do not reread or reinterpret the file for that run.
+   - Reject unknown keys, credentials, unsafe verification paths, or attempts
+     to weaken fixed model, permission, approval, branch-preservation, or
+     usage-only logging rules.
 2. Resolve the project custom agents `ark_pm`, `ark_pl`, and `ark_worker`.
    - Codex reapplies the parent turn's live sandbox and approval overrides to spawned agents. Do not treat custom-agent TOML permissions as an isolation boundary.
    - For a read-only run, use the native hierarchy only when the parent turn is also read-only.

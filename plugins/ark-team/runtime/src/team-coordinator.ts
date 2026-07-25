@@ -31,30 +31,39 @@ export interface TeamCoordinatorOptions {
 
 export class TeamCoordinator {
   private operationQueue: Promise<void> = Promise.resolve();
-  private readonly internalAgentRetries: number;
-  private readonly workerCorrectionRounds: number;
-  private readonly plCorrectionRounds: number;
+  private readonly internalAgentRetries: number | null;
+  private readonly workerCorrectionRounds: number | null;
+  private readonly plCorrectionRounds: number | null;
 
   constructor(
     private readonly store: RunStore,
     private readonly scheduler: ManagedAssignmentScheduler,
     options: TeamCoordinatorOptions = {},
   ) {
-    this.internalAgentRetries = boundedPolicyValue(
-      options.internal_agent_retries,
-      2,
-      "internal_agent_retries",
-    );
-    this.workerCorrectionRounds = boundedPolicyValue(
-      options.worker_correction_rounds,
-      2,
-      "worker_correction_rounds",
-    );
-    this.plCorrectionRounds = boundedPolicyValue(
-      options.pl_correction_rounds,
-      2,
-      "pl_correction_rounds",
-    );
+    this.internalAgentRetries =
+      options.internal_agent_retries === undefined
+        ? null
+        : boundedPolicyValue(
+            options.internal_agent_retries,
+            2,
+            "internal_agent_retries",
+          );
+    this.workerCorrectionRounds =
+      options.worker_correction_rounds === undefined
+        ? null
+        : boundedPolicyValue(
+            options.worker_correction_rounds,
+            2,
+            "worker_correction_rounds",
+          );
+    this.plCorrectionRounds =
+      options.pl_correction_rounds === undefined
+        ? null
+        : boundedPolicyValue(
+            options.pl_correction_rounds,
+            2,
+            "pl_correction_rounds",
+          );
   }
 
   async advance(runId: string): Promise<TeamCoordinatorResult> {
@@ -62,6 +71,15 @@ export class TeamCoordinator {
       let anyProgress = false;
       for (let pass = 0; pass < MAX_COORDINATOR_PASSES; pass += 1) {
         const run = await this.store.getRun(runId);
+        const internalAgentRetries =
+          this.internalAgentRetries ??
+          run.project_config.execution.internal_agent_retries;
+        const workerCorrectionRounds =
+          this.workerCorrectionRounds ??
+          run.project_config.execution.worker_correction_rounds;
+        const plCorrectionRounds =
+          this.plCorrectionRounds ??
+          run.project_config.execution.pl_correction_rounds;
         if (run.state === "integrating") {
           break;
         }
@@ -87,7 +105,7 @@ export class TeamCoordinator {
           const exhaustedOperations: Array<() => Promise<AssignmentRecord>> = [];
           for (const assignment of failedAssignments) {
             if (
-              assignment.session_attempt_count <= this.internalAgentRetries
+              assignment.session_attempt_count <= internalAgentRetries
             ) {
               retryOperations.push(
                 async () =>
@@ -104,7 +122,7 @@ export class TeamCoordinator {
                     assignment_id: assignment.assignment_id,
                     kind: "internal_failure_exhausted",
                     mode: "fresh_session",
-                    reason: `${assignment.role} assignment exhausted ${this.internalAgentRetries} automatic internal retries: ${assignment.failure_message ?? "managed session failed"}`,
+                    reason: `${assignment.role} assignment exhausted ${internalAgentRetries} automatic internal retries: ${assignment.failure_message ?? "managed session failed"}`,
                   }),
               );
             }
@@ -157,7 +175,7 @@ export class TeamCoordinator {
             pl,
             problem,
           );
-          if (pl.correction_count < this.plCorrectionRounds) {
+          if (pl.correction_count < plCorrectionRounds) {
             finalCorrections.push(
               async () =>
                 this.scheduler.correct({
@@ -251,7 +269,7 @@ export class TeamCoordinator {
             pl,
             problem,
           );
-          if (pl.correction_count < this.plCorrectionRounds) {
+          if (pl.correction_count < plCorrectionRounds) {
             planCorrections.push(
               async () =>
                 this.scheduler.correct({
@@ -323,7 +341,7 @@ export class TeamCoordinator {
               worker,
               problem,
             );
-            if (worker.correction_count < this.workerCorrectionRounds) {
+            if (worker.correction_count < workerCorrectionRounds) {
               workerCorrections.push(
                 async () =>
                   this.scheduler.correct({

@@ -11,6 +11,13 @@ import {
   type ManagedSessionResult,
 } from "./managed-session.js";
 import { PlanMaterializer } from "./plan-materializer.js";
+import {
+  DEFAULT_PROJECT_CONFIG,
+  loadProjectConfig,
+  resolveVerificationCommands,
+  type ProjectConfig,
+  type ResolvedProjectConfig,
+} from "./project-config.js";
 import type { PmPlan, PmReport } from "./role-contracts.js";
 import {
   type RecordPmPlanResult,
@@ -35,6 +42,7 @@ export interface ArkTeamOrchestratorOptions {
   materializer?: PlanMaterializer;
   coordinator?: TeamExecutionCoordinator;
   codex_path?: string;
+  config_loader?: (projectPath: string) => Promise<ResolvedProjectConfig>;
 }
 
 export interface ExecuteArkTeamInput {
@@ -63,6 +71,9 @@ export class ArkTeamOrchestrator {
   private readonly pmLauncher: ManagedPmLauncher;
   private readonly materializer: PlanMaterializer;
   private readonly coordinator: TeamExecutionCoordinator;
+  private readonly configLoader: (
+    projectPath: string,
+  ) => Promise<ResolvedProjectConfig>;
 
   constructor(
     private readonly store: RunStore,
@@ -77,6 +88,7 @@ export class ArkTeamOrchestrator {
           "codex",
       });
     this.materializer = options.materializer ?? new PlanMaterializer(store);
+    this.configLoader = options.config_loader ?? loadProjectConfig;
     if (options.coordinator) {
       this.coordinator = options.coordinator;
     } else {
@@ -99,17 +111,28 @@ export class ArkTeamOrchestrator {
   }
 
   async execute(input: ExecuteArkTeamInput): Promise<ExecuteArkTeamResult> {
-    const run = await this.store.createRun(input);
+    const resolvedConfig = await this.configLoader(input.project_path);
+    const run = await this.store.createRun({
+      ...input,
+      project_config: resolvedConfig.config,
+      project_config_source: resolvedConfig.source_path,
+    });
     let pmResult: ManagedSessionResult;
     let recorded: RecordPmPlanResult;
     try {
       pmResult = await this.pmLauncher.run({
         role: "pm",
-        assignment: buildPmPlanningAssignment(run),
+        assignment: buildPmPlanningAssignment(run, resolvedConfig.config),
         working_directory: run.project_path,
         output_contract: "pm_plan",
+        timeout_ms:
+          resolvedConfig.config.execution.agent_timeout_minutes * 60_000,
       });
       assertPmResult(pmResult);
+      assertPlanWithinProjectConfig(
+        pmResult.structured_report,
+        resolvedConfig.config,
+      );
       recorded = await this.store.recordPmPlan(
         run.run_id,
         pmResult.structured_report,
@@ -158,16 +181,50 @@ export class ArkTeamOrchestrator {
   }
 }
 
-export function buildPmPlanningAssignment(run: RunRecord): string {
+export function buildPmPlanningAssignment(
+  run: Pick<RunRecord, "run_id" | "objective" | "project_path"> &
+    Record<string, unknown>,
+  config: ProjectConfig = DEFAULT_PROJECT_CONFIG,
+): string {
+  const verificationCommands = resolveVerificationCommands(
+    config,
+    run.project_path,
+  );
   return [
     `Run ID: ${run.run_id}`,
     `User objective: ${run.objective}`,
     "Inspect the project read-only and produce one strict pm_plan.",
-    "Choose one to four teams dynamically. Give each team one to five workers based on scope.",
+    `Choose one to ${countWord(config.organization.max_teams)} teams dynamically.`,
+    `Give each team ${countWord(config.organization.min_workers_per_team)} to ${countWord(config.organization.max_workers_per_team)} workers based on scope.`,
     "Define bounded missions, owned paths, dependencies, acceptance criteria, and verification.",
+    `Project verification commands (literal argv, no shell): ${JSON.stringify(verificationCommands)}`,
     "Choose local_merge when local Git integration is appropriate, pull_request only when a supported remote workflow is warranted, or no_git for a non-Git source.",
     "Do not edit files, create commits, merge, spawn agents, or perform external actions.",
   ].join("\n");
+}
+
+function countWord(value: number): string {
+  return ["zero", "one", "two", "three", "four", "five"][value] ??
+    String(value);
+}
+
+function assertPlanWithinProjectConfig(
+  plan: PmPlan,
+  config: ProjectConfig,
+): void {
+  if (
+    plan.teams.length > config.organization.max_teams ||
+    plan.teams.some(
+      (team) =>
+        team.worker_count < config.organization.min_workers_per_team ||
+        team.worker_count > config.organization.max_workers_per_team,
+    )
+  ) {
+    throw new ArkTeamError(
+      "AGENT_SESSION_PROTOCOL_ERROR",
+      "Managed PM plan exceeds the persisted project organization bounds",
+    );
+  }
 }
 
 function assertPmResult(

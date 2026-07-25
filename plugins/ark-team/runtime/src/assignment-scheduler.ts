@@ -31,7 +31,7 @@ export interface ApprovalSessionHandle {
 }
 
 export interface ManagedAssignmentSchedulerOptions {
-  session_factory?: () => ApprovalSessionHandle;
+  session_factory?: (assignment: AssignmentRecord) => ApprovalSessionHandle;
   codex_path?: string;
 }
 
@@ -45,21 +45,20 @@ interface LiveAssignment {
 
 export class ManagedAssignmentScheduler {
   private readonly liveAssignments = new Map<string, LiveAssignment>();
-  private readonly sessionFactory: () => ApprovalSessionHandle;
+  private readonly sessionFactory:
+    | ((assignment: AssignmentRecord) => ApprovalSessionHandle)
+    | null;
+  private readonly codexPath: string;
 
   constructor(
     private readonly store: RunStore,
     options: ManagedAssignmentSchedulerOptions = {},
   ) {
-    this.sessionFactory =
-      options.session_factory ??
-      (() =>
-        new AppServerApprovalSession({
-          codex_path:
-            options.codex_path ??
-            (process.env.ARK_TEAM_CODEX_PATH?.trim() || undefined) ??
-            "codex",
-        }));
+    this.sessionFactory = options.session_factory ?? null;
+    this.codexPath =
+      options.codex_path ??
+      (process.env.ARK_TEAM_CODEX_PATH?.trim() || undefined) ??
+      "codex";
   }
 
   async start(input: CreateAssignmentInput): Promise<AssignmentRecord> {
@@ -376,7 +375,16 @@ export class ManagedAssignmentScheduler {
   ): Promise<AssignmentRecord> {
     let session: ApprovalSessionHandle;
     try {
-      session = this.sessionFactory();
+      if (this.sessionFactory !== null) {
+        session = this.sessionFactory(assignment);
+      } else {
+        const run = await this.store.getRun(assignment.run_id);
+        session = new AppServerApprovalSession({
+          codex_path: this.codexPath,
+          timeout_ms:
+            run.project_config.execution.agent_timeout_minutes * 60_000,
+        });
+      }
     } catch (error) {
       await this.recordSessionFailure(assignment, error);
       throw sessionFailure("Unable to create a managed assignment session", error);

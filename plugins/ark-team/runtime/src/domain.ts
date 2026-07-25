@@ -6,6 +6,10 @@ import {
   pmPlanSchema,
   pmReportSchema,
 } from "./role-contracts.js";
+import {
+  DEFAULT_PROJECT_CONFIG,
+  projectConfigSchema,
+} from "./project-config.js";
 
 export const RUN_ID_PATTERN = /^ark-\d{8}t\d{6}z-[a-z0-9]{6}$/;
 export const ASSIGNMENT_ID_PATTERN = /^asg-[a-f0-9]{12}$/;
@@ -471,6 +475,8 @@ export const runRecordSchema = z.object({
   event_count: z.number().int().nonnegative(),
   assignment_count: z.number().int().nonnegative().default(0),
   team_count: z.number().int().min(0).max(4).default(0),
+  project_config: projectConfigSchema.default(DEFAULT_PROJECT_CONFIG),
+  project_config_source: z.string().min(1).nullable().default(null),
 });
 
 export type RunRecord = z.infer<typeof runRecordSchema>;

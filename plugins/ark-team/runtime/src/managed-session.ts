@@ -98,6 +98,7 @@ export interface ManagedSessionRequest {
   working_directory: string;
   resume_session_id?: string;
   output_contract?: ManagedOutputContract;
+  timeout_ms?: number;
   signal?: AbortSignal;
 }
 
@@ -177,6 +178,13 @@ export class ManagedCodexSessionLauncher {
       request.working_directory,
     );
     const profile = managedRoleProfiles[request.role];
+    const timeoutMs = request.timeout_ms ?? this.timeoutMs;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+      throw new ArkTeamError(
+        "INVALID_INPUT",
+        "request timeout_ms must be a positive integer",
+      );
+    }
     if (request.output_contract !== undefined) {
       assertManagedOutputContractRole(request.role, request.output_contract);
     }
@@ -208,8 +216,8 @@ export class ManagedCodexSessionLauncher {
       request.signal?.addEventListener("abort", forwardAbort, { once: true });
     }
     const timeout = setTimeout(() => {
-      abortController.abort(new Error(`Managed session exceeded ${this.timeoutMs}ms`));
-    }, this.timeoutMs);
+      abortController.abort(new Error(`Managed session exceeded ${timeoutMs}ms`));
+    }, timeoutMs);
 
     let turn: SessionTurn;
     try {

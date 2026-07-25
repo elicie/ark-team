@@ -21,6 +21,7 @@ import {
   PlanMaterializer,
   type TeamWorkspaceManager,
 } from "../src/plan-materializer.js";
+import { DEFAULT_PROJECT_CONFIG } from "../src/project-config.js";
 import type { PmPlan } from "../src/role-contracts.js";
 import { RunStore } from "../src/state-store.js";
 import type { PreparedTeamWorkspace } from "../src/worktree-manager.js";
@@ -90,7 +91,7 @@ test("TEST-801 and TEST-802 execute the exact PM plan and persist usage only", a
       "utf8",
     );
     assert.equal(raw.includes("PRIVATE_PM_FINAL_JSON"), false);
-    assert.equal(raw.includes("private_reasoning"), false);
+    assert.equal(raw.includes('"private_reasoning":'), false);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -207,6 +208,83 @@ test("TEST-804 preserves a PM plan when worktree materialization must be retried
     const recovered = await retry.apply(run?.run_id ?? "", plan);
     assert.equal(recovered.run.state, "staffing");
     assert.equal(recovered.teams.length, 1);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("TEST-1403 enforces the snapshotted project plan contract", async () => {
+  const fixture = await createFixture("configured");
+  try {
+    const config = structuredClone(DEFAULT_PROJECT_CONFIG);
+    config.organization.max_teams = 1;
+    config.organization.min_workers_per_team = 2;
+    config.organization.max_workers_per_team = 2;
+    config.execution.agent_timeout_minutes = 45;
+    config.verification.commands = [
+      {
+        argv: ["npm", "test"],
+        cwd: ".",
+      },
+    ];
+    const configSource = path.join(
+      fixture.project,
+      ".codex",
+      "team-orchestrator.toml",
+    );
+    const launcher = new ScriptedPmLauncher(pmResult(validPlan()));
+    const orchestrator = new ArkTeamOrchestrator(fixture.store, {
+      pm_launcher: launcher,
+      materializer: new PlanMaterializer(fixture.store, {
+        worktree_manager: new FakeWorkspaceManager(fixture.worktrees),
+      }),
+      coordinator: new SnapshotCoordinator(fixture.store),
+      config_loader: async () => ({
+        config,
+        source_path: configSource,
+      }),
+    });
+    const result = await orchestrator.execute({
+      objective: "Use project-specific bounds",
+      project_path: fixture.project,
+    });
+
+    assert.deepEqual(result.run.project_config, config);
+    assert.equal(result.run.project_config_source, configSource);
+    assert.equal(launcher.requests[0]?.timeout_ms, 45 * 60_000);
+    assert.match(launcher.requests[0]?.assignment ?? "", /one to one teams/);
+    assert.match(
+      launcher.requests[0]?.assignment ?? "",
+      /two to two workers/,
+    );
+    assert.match(
+      launcher.requests[0]?.assignment ?? "",
+      /"argv":\["npm","test"\]/,
+    );
+
+    const invalidPlan = validPlan();
+    invalidPlan.teams[0] = {
+      ...invalidPlan.teams[0]!,
+      worker_count: 3,
+    };
+    const rejected = new ArkTeamOrchestrator(fixture.store, {
+      pm_launcher: new ScriptedPmLauncher(pmResult(invalidPlan)),
+      materializer: new PlanMaterializer(fixture.store, {
+        worktree_manager: new FakeWorkspaceManager(fixture.worktrees),
+      }),
+      config_loader: async () => ({
+        config,
+        source_path: configSource,
+      }),
+    });
+    await assert.rejects(
+      rejected.execute({
+        objective: "Reject an oversized PM plan",
+        project_path: fixture.project,
+      }),
+      protocolFailure,
+    );
+    assert.equal((await fixture.store.listRuns()).runs[0]?.state, "failed");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

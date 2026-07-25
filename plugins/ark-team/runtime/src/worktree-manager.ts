@@ -289,7 +289,7 @@ export class IntegrationWorktreeManager {
       run.run_id,
       "integration",
     );
-    const branch = `orchestrator/${run.run_id}`;
+    const branch = `${run.project_config.git.integration_branch_prefix}${run.run_id}`;
     if (await pathExists(workingDirectory)) {
       throw new ArkTeamError(
         "WORKSPACE_PREPARATION_FAILED",

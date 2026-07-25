@@ -7,9 +7,11 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 
 import { ArkTeamError } from "../src/errors.js";
+import { DEFAULT_PROJECT_CONFIG } from "../src/project-config.js";
 import type { PmPlan } from "../src/role-contracts.js";
 import { RunStore } from "../src/state-store.js";
 import {
+  IntegrationWorktreeManager,
   resolveWorktreeRoot,
   WorktreeManager,
 } from "../src/worktree-manager.js";
@@ -228,6 +230,56 @@ test("TEST-705 resolves a bounded configurable worktree root", () => {
     (error: unknown) =>
       error instanceof ArkTeamError && error.code === "INVALID_INPUT",
   );
+});
+
+test("TEST-1405 applies the persisted integration branch prefix", async () => {
+  const fixture = await createFixture("configured-prefix");
+  try {
+    const config = structuredClone(DEFAULT_PROJECT_CONFIG);
+    config.git.integration_branch_prefix = "project-integrations/";
+    const run = await fixture.store.createRun({
+      objective: "Use one project integration branch prefix",
+      project_path: fixture.project,
+      project_config: config,
+    });
+    const teamManager = new WorktreeManager({
+      root_path: fixture.worktrees,
+    });
+    const [workspace] = await teamManager.prepare(run, planFor("team-a"));
+    assert.ok(workspace);
+    const timestamp = new Date().toISOString();
+    const integrationManager = new IntegrationWorktreeManager({
+      root_path: fixture.worktrees,
+    });
+    const integration = await integrationManager.prepare(
+      run,
+      [
+        {
+          schema_version: 1,
+          ...workspace,
+          mission: "Deliver team-a.",
+          worker_count: 1,
+          dependencies: [],
+          owned_paths: ["src/team-a.ts"],
+          acceptance_criteria: ["team-a is complete."],
+          verification: ["Verify team-a."],
+          state: "completed",
+          created_at: timestamp,
+          updated_at: timestamp,
+          revision: 1,
+        },
+      ],
+      "local_merge",
+    );
+    assert.equal(
+      integration.branch,
+      `project-integrations/${run.run_id}`,
+    );
+    await integrationManager.cleanupPrepared(fixture.project, integration);
+    await teamManager.cleanup(fixture.project, workspace);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
 });
 
 async function createFixture(name: string) {

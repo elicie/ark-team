@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -91,7 +91,7 @@ after(async () => {
   await rm(temporaryRoot, { recursive: true, force: true });
 });
 
-test("TEST-006 exposes lifecycle tools and persists a run through MCP", async () => {
+test("TEST-006 and TEST-1406 expose configured lifecycle through MCP", async () => {
   const tools = await client.listTools();
   assert.deepEqual(
     tools.tools.map((tool) => tool.name).sort(),
@@ -118,6 +118,31 @@ test("TEST-006 exposes lifecycle tools and persists a run through MCP", async ()
     ],
   );
 
+  await mkdir(path.join(projectRoot, ".codex"));
+  await writeFile(
+    path.join(projectRoot, ".codex", "team-orchestrator.toml"),
+    [
+      "version = 1",
+      "",
+      "[organization]",
+      "max_teams = 2",
+      "max_workers_per_team = 2",
+    ].join("\n"),
+    "utf8",
+  );
+  await execFileAsync("git", [
+    "-C",
+    projectRoot,
+    "add",
+    ".codex/team-orchestrator.toml",
+  ]);
+  await execFileAsync("git", [
+    "-C",
+    projectRoot,
+    "commit",
+    "-m",
+    "project configuration",
+  ]);
   const started = await client.callTool({
     name: "ark_team_start",
     arguments: {
@@ -127,7 +152,16 @@ test("TEST-006 exposes lifecycle tools and persists a run through MCP", async ()
   });
   assert.equal(started.isError, undefined);
   const startedPayload = started.structuredContent as
-    | { ok?: boolean; run?: { run_id: string } }
+    | {
+        ok?: boolean;
+        run?: {
+          run_id: string;
+          project_config_source?: string | null;
+          project_config?: {
+            organization?: { max_teams?: number; max_workers_per_team?: number };
+          };
+        };
+      }
     | undefined;
   assert.equal(startedPayload?.ok, true);
 
@@ -136,6 +170,12 @@ test("TEST-006 exposes lifecycle tools and persists a run through MCP", async ()
   assert.notEqual(run, null);
   const runId = run?.run_id;
   assert.equal(typeof runId, "string");
+  assert.equal(
+    run?.project_config_source,
+    path.join(projectRoot, ".codex", "team-orchestrator.toml"),
+  );
+  assert.equal(run?.project_config?.organization?.max_teams, 2);
+  assert.equal(run?.project_config?.organization?.max_workers_per_team, 2);
 
   const status = await client.callTool({
     name: "ark_team_status",

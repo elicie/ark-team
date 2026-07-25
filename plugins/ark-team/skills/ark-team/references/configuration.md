@@ -82,6 +82,19 @@ Interpret `argv` as an executable plus literal arguments without a shell. Resolv
 
 Do not execute a command copied from project configuration when a higher-priority safety instruction prohibits it. Require a platform-specific command entry when the executable or arguments differ by operating system.
 
+The managed runtime loads this file only when it creates a run and persists the
+fully resolved snapshot. Later edits do not change that run. It currently
+permits project overrides for organization bounds, agent timeout, internal
+retry and correction budgets, the integration branch prefix, and literal
+verification commands. Fields that protect the accepted operating contract
+must retain the shown values: the three managed models and `xhigh`, direct PL
+communication enabled, 360-minute run limit, three external-provider retries,
+host-stop pausing, branch preservation and verified cleanup, remote approval,
+30-day usage-only logging, and explicit-request-only external models without
+automatic Luna fallback. Use `ARK_TEAM_STATE_ROOT` for the global server state
+root; project configuration never relocates an already running MCP server or
+stores credentials.
+
 ## Execution backends
 
 ### Native custom-agent roles

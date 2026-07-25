@@ -17,6 +17,7 @@ import {
   type TeamExecutionCoordinator,
 } from "./orchestrator.js";
 import { PlanMaterializer } from "./plan-materializer.js";
+import { loadProjectConfig } from "./project-config.js";
 import { pmPlanSchema } from "./role-contracts.js";
 import { RunStore } from "./state-store.js";
 import { TeamCoordinator } from "./team-coordinator.js";
@@ -81,9 +82,17 @@ export function createArkTeamMcpServer(
       },
     },
     async ({ objective, project_path }) =>
-      handleTool(async () => ({
-        run: await store.createRun({ objective, project_path }),
-      })),
+      handleTool(async () => {
+        const resolved = await loadProjectConfig(project_path);
+        return {
+          run: await store.createRun({
+            objective,
+            project_path,
+            project_config: resolved.config,
+            project_config_source: resolved.source_path,
+          }),
+        };
+      }),
   );
 
   server.registerTool(

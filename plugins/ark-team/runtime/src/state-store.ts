@@ -50,6 +50,11 @@ import {
   type PmPlan,
   type PmReport,
 } from "./role-contracts.js";
+import {
+  DEFAULT_PROJECT_CONFIG,
+  projectConfigSchema,
+  type ProjectConfig,
+} from "./project-config.js";
 import { assertRunId, createRunId } from "./run-id.js";
 import type { PreparedTeamWorkspace } from "./worktree-manager.js";
 
@@ -63,6 +68,8 @@ export interface RunStoreOptions {
 export interface CreateRunInput {
   objective: string;
   project_path: string;
+  project_config?: ProjectConfig;
+  project_config_source?: string | null;
 }
 
 export interface ListRunsInput {
@@ -274,6 +281,23 @@ export class RunStore {
       if (!projectStats.isDirectory()) {
         throw new ArkTeamError("INVALID_INPUT", "project_path must point to a directory");
       }
+      const parsedConfig = projectConfigSchema.safeParse(
+        input.project_config ?? DEFAULT_PROJECT_CONFIG,
+      );
+      if (!parsedConfig.success) {
+        throw new ArkTeamError(
+          "INVALID_PROJECT_CONFIG",
+          "project configuration does not match the safe schema",
+          { cause: parsedConfig.error },
+        );
+      }
+      const configSource = input.project_config_source ?? null;
+      if (configSource !== null && !path.isAbsolute(configSource)) {
+        throw new ArkTeamError(
+          "INVALID_PROJECT_CONFIG",
+          "project configuration source must be absolute",
+        );
+      }
 
       await this.ensureRoot();
       const timestamp = this.now();
@@ -292,6 +316,9 @@ export class RunStore {
         event_count: 1,
         assignment_count: 0,
         team_count: 0,
+        project_config: parsedConfig.data,
+        project_config_source:
+          configSource === null ? null : path.normalize(configSource),
       };
       const event: RunEvent = {
         schema_version: 1,
@@ -966,10 +993,12 @@ export class RunStore {
             .filter((assignment) => assignment.role === "pl")
             .map((assignment) => assignment.team_id),
         ).size;
-        if (teamCount >= 4) {
+        if (
+          teamCount >= persisted.run.project_config.organization.max_teams
+        ) {
           throw new ArkTeamError(
             "INVALID_INPUT",
-            "an Ark Team run cannot contain more than four teams",
+            "assignment exceeds the persisted maximum team count",
           );
         }
       } else if (input.role === "worker") {
@@ -1006,10 +1035,13 @@ export class RunStore {
             assignment.role === "worker" &&
             assignment.parent_assignment_id === parent.assignment_id,
         ).length;
-        if (workerCount >= 5) {
+        if (
+          workerCount >=
+          persisted.run.project_config.organization.max_workers_per_team
+        ) {
           throw new ArkTeamError(
             "INVALID_INPUT",
-            "a PL cannot own more than five worker assignments",
+            "assignment exceeds the persisted maximum worker count",
           );
         }
         if (
