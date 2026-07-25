@@ -395,3 +395,8 @@ a controller restart on the same thread without carrying the lost approval into
 the new turn. The next runtime slices are still required to add explicit
 external-provider and non-Git adapters. The current control plane does not
 claim those remaining guarantees.
+
+The active Git linked-worktree/Sol → Terra → Luna orchestration goal is
+implemented end to end and globally installable. Deterministic tests exercise
+the complete hierarchy, approval and retry stops, guarded local and remote
+handoffs, cleanup, and restart recovery without spending live model usage.

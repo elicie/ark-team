@@ -58,4 +58,26 @@
 
 # Evidence Matrix
 
-To be completed after final installation and verification.
+| Requirement | Implementation evidence | Verification evidence |
+|---|---|---|
+| `REQ-1501` | `.agents/plugins/marketplace.json` publishes the single existing `./plugins/ark-team` package with complete policy and category metadata | Marketplace registration resolved `ark-team-marketplace`; plugin validator passed |
+| `REQ-1502` | Git marketplace `elicie/ark-team@main` is registered globally and plugin manifest version is `0.1.1` | `codex plugin list --available --json` reports `ark-team@ark-team-marketplace` installed and enabled from `https://github.com/elicie/ark-team.git` |
+| `REQ-1503` | `verify-installed-plugin.mjs` checks manifest, skill, MCP config, bundle, launches the cached server, and compares the exact sorted tool surface | `INSTALLED_PLUGIN_VERIFIED`, cache `/home/elicie/.codex/plugins/cache/ark-team-marketplace/ark-team/0.1.1`, 19 tools |
+| `REQ-1504` | Plugin package contains no copied target-project TOML; runtime resolves configuration from each requested project at run creation | `TEST-1401`–`TEST-1406`; installed cache inspection |
+| `REQ-1505` | Root scripts cover deterministic unit/E2E, bundles, CLI, MCP, protocol, models, validators, audit, and installed-cache verification | Final validation below |
+| `REQ-1506` | README and skill references document explicit invocation, global marketplace install, project snapshots, approval/recovery rules, and exclusions | Skill and plugin validators passed |
+
+Final validation on 2026-07-24 UTC:
+
+- `npm test`: 72 unit tests, 1 built-CLI test, and 5 MCP tests passed;
+  TypeScript typecheck and all three bundles succeeded.
+- `npm run verify:app-server-schema`: `APP_SERVER_SCHEMA_COMPATIBLE`,
+  Codex CLI `0.145.0`, 15 files and 61 protocol tokens checked.
+- `npm run verify:codex-models`: `gpt-5.6-sol`,
+  `gpt-5.6-terra`, and `gpt-5.6-luna` with `xhigh` verified.
+- Skill quick validation, plugin validation, marketplace JSON validation,
+  `git diff --check`, and dependency audit with zero vulnerabilities passed.
+- Global Git marketplace registration, plugin `0.1.1` installation, enabled
+  status, detached cache contents, and all 19 installed MCP tools passed.
+- No Docker or infrastructure action, development port, paid model call,
+  deployment, remote merge, or test-fixture push/PR mutation was performed.
