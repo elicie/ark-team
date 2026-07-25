@@ -136,6 +136,7 @@ The current bundled control-plane slice exposes these MCP tools:
 - `ark_team_assignment_list`
 - `ark_team_assignment_status`
 - `ark_team_assignment_decide`
+- `ark_team_assignment_recover`
 - `ark_team_assignment_retry_decide`
 - `ark_team_assignment_cancel`
 
@@ -196,7 +197,12 @@ Retain every assignment ID. Read `ark_team_assignment_status` or
 `ark_team_assignment_list` for stored reports and usage. When the state is
 `waiting_user`, distinguish its request type. For `pending_approval`, call
 `ark_team_assignment_decide` only with the exact opaque approval ID and the
-user's explicit decision. For `pending_retry`, report the reason,
+user's explicit decision while its original app-server session is live. If a
+controller restart orphaned that session, use
+`ark_team_assignment_recover` with the exact old ID and the user's explicit
+`resume_safely` or `cancel_run`. Recovery resumes the same thread in a new turn
+without applying the old approval; any still-needed dangerous action must
+surface a fresh approval. For `pending_retry`, report the reason,
 `session_attempt_count`, and `correction_count`, then call
 `ark_team_assignment_retry_decide` with its opaque ID and explicit
 `retry_once` or `cancel_run` choice. Then call `ark_team_advance` to continue
@@ -219,8 +225,10 @@ After PM acceptance, the coordinator removes only clean registered worktrees
 whose branches remain contained by the accepted integration. It preserves all
 local branches, records each cleanup, safely resumes partial cleanup, and marks
 the run completed only after the integration worktree is also removed.
-Pending approvals remain persisted but cannot yet be reattached after an MCP
-process restart.
+Pending approvals remain persisted across an MCP process restart. Their dead
+wire requests cannot be reattached or answered. Explicit safe recovery instead
+clears the orphaned request atomically and resumes its persisted thread in a
+new turn, or cancels the run while preserving artifacts.
 
 An abnormally failed internal assignment receives at most two automatic fresh
 sessions. A structurally valid but blocked, mismatched, uncommitted when
@@ -270,11 +278,12 @@ auto-approve, reuse an approval ID, or create a replacement session to bypass a
 pending request.
 
 On completion the gateway returns only role metadata, session and turn IDs,
-the final report, and usage. Pending approvals are process-local and are not
-recoverable after controller restart. The gateway remains the session
-primitive. The MCP control plane invokes the PM, materializes its validated
-plan, persists and routes child updates, and resumes each PL with its validated
-worker reports.
+the final report, and usage. A live approval channel is process-local and
+cannot survive controller restart. The gateway remains the session primitive;
+the MCP control plane can explicitly resume the persisted thread in a new safe
+turn without applying the lost approval. It invokes the PM, materializes its
+validated plan, persists and routes child updates, and resumes each PL with its
+validated worker reports.
 
 ### Native fallback
 

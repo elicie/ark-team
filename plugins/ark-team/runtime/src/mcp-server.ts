@@ -26,7 +26,7 @@ import {
 } from "./integration-coordinator.js";
 
 const SERVER_INSTRUCTIONS =
-  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, execute dependency-ready teams, and continue through guarded integration, PM review, and worktree cleanup. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list and the integration record with ark_team_status. Keep every returned assignment_id. For waiting_user, distinguish pending_approval, pending_retry, and remote_action. Deliver agent approvals only through ark_team_assignment_decide, exhausted-retry choices only through ark_team_assignment_retry_decide, and the exact persisted push/PR request only through ark_team_remote_decide. Never approve a remote action without the user's explicit choice. Then call ark_team_advance to continue the hierarchy. Use assignment status/list for stored reports, counters, and usage. Run pause/cancel stops active managed assignments.";
+  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, execute dependency-ready teams, and continue through guarded integration, PM review, and worktree cleanup. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list and the integration record with ark_team_status. Keep every returned assignment_id. For waiting_user, distinguish pending_approval, pending_retry, and remote_action. Deliver live agent approvals only through ark_team_assignment_decide, exhausted-retry choices only through ark_team_assignment_retry_decide, and the exact persisted push/PR request only through ark_team_remote_decide. If a persisted agent approval lost its live session after controller restart, use ark_team_assignment_recover with resume_safely or cancel_run; recovery never carries the old approval into the new turn. Never approve a remote action without the user's explicit choice. Then call ark_team_advance to continue the hierarchy. Use assignment status/list for stored reports, counters, and usage. Run pause/cancel stops active managed assignments.";
 
 export interface ArkTeamExecutionController {
   execute(input: ExecuteArkTeamInput): Promise<ExecuteArkTeamResult>;
@@ -443,6 +443,36 @@ export function createArkTeamMcpServer(
     async ({ run_id, assignment_id, reason }) =>
       handleTool(async () => ({
         assignment: await scheduler.cancel(run_id, assignment_id, reason),
+      })),
+  );
+
+  server.registerTool(
+    "ark_team_assignment_recover",
+    {
+      title: "Recover orphaned assignment approval",
+      description:
+        "Safely resume the same persisted thread without applying its lost approval, or cancel the run while preserving artifacts.",
+      inputSchema: {
+        run_id: z.string().min(1),
+        assignment_id: z.string().regex(ASSIGNMENT_ID_PATTERN),
+        approval_id: z.string().uuid(),
+        decision: z.enum(["resume_safely", "cancel_run"]),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ run_id, assignment_id, approval_id, decision }) =>
+      handleTool(async () => ({
+        assignment: await scheduler.recoverApproval(
+          run_id,
+          assignment_id,
+          approval_id,
+          decision,
+        ),
       })),
   );
 

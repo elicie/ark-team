@@ -167,6 +167,127 @@ test("TEST-507 exposes the persistent assignment approval flow through MCP", asy
   }
 });
 
+test("TEST-1306 exposes safe orphaned-approval recovery through MCP", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "ark-team-recovery-mcp-"));
+  const repository = path.join(root, "repository");
+  const worktree = path.join(root, "worktree");
+  const stateRoot = path.join(root, "state");
+  const firstStore = new RunStore({
+    root_path: stateRoot,
+    assignment_suffix: () => "000000000013",
+  });
+  const firstScheduler = new ManagedAssignmentScheduler(firstStore, {
+    session_factory: () => new McpScriptedSession(),
+  });
+  const recoverySession = new RecoverySession();
+  const reopenedStore = new RunStore({ root_path: stateRoot });
+  const restartedScheduler = new ManagedAssignmentScheduler(reopenedStore, {
+    session_factory: () => recoverySession,
+  });
+  const server = createArkTeamMcpServer(reopenedStore, restartedScheduler);
+  const client = new Client(
+    { name: "ark-team-recovery-test", version: "0.1.0" },
+    { capabilities: {} },
+  );
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+  try {
+    await execFileAsync("git", ["init", "-b", "main", repository]);
+    await execFileAsync("git", [
+      "-C",
+      repository,
+      "config",
+      "user.name",
+      "Ark Team Test",
+    ]);
+    await execFileAsync("git", [
+      "-C",
+      repository,
+      "config",
+      "user.email",
+      "ark-team-test@example.invalid",
+    ]);
+    await execFileAsync("git", [
+      "-C",
+      repository,
+      "commit",
+      "--allow-empty",
+      "-m",
+      "test baseline",
+    ]);
+    await execFileAsync("git", [
+      "-C",
+      repository,
+      "worktree",
+      "add",
+      "-b",
+      "test/mcp-recovery",
+      worktree,
+    ]);
+    const run = await firstStore.createRun({
+      objective: "Recover an orphaned approval through MCP",
+      project_path: repository,
+    });
+    const waiting = await firstScheduler.start({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Continue after a controller restart",
+      working_directory: worktree,
+    });
+
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const recovered = await client.callTool({
+      name: "ark_team_assignment_recover",
+      arguments: {
+        run_id: run.run_id,
+        assignment_id: waiting.assignment_id,
+        approval_id: approvalId,
+        decision: "resume_safely",
+      },
+    });
+    const payload = recovered.structuredContent as
+      | {
+          ok?: boolean;
+          assignment?: {
+            state?: string;
+            session_id?: string;
+            final_report?: string;
+          };
+        }
+      | undefined;
+    assert.equal(payload?.ok, true);
+    assert.equal(payload?.assignment?.state, "completed");
+    assert.equal(payload?.assignment?.session_id, "mcp-session");
+    assert.equal(payload?.assignment?.final_report, "MCP_RECOVERED_REPORT");
+    assert.equal(recoverySession.requests.length, 1);
+    assert.equal(
+      recoverySession.requests[0]?.resume_session_id,
+      "mcp-session",
+    );
+    assert.match(
+      recoverySession.requests[0]?.assignment ?? "",
+      /was NOT applied/i,
+    );
+
+    const replayed = await client.callTool({
+      name: "ark_team_assignment_recover",
+      arguments: {
+        run_id: run.run_id,
+        assignment_id: waiting.assignment_id,
+        approval_id: approvalId,
+        decision: "resume_safely",
+      },
+    });
+    assert.equal(replayed.isError, true);
+  } finally {
+    await client.close();
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("TEST-1007 exposes one exhausted-retry decision through MCP", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "ark-team-retry-mcp-"));
   const repository = path.join(root, "repository");
@@ -368,6 +489,42 @@ class RetrySession implements ApprovalSessionHandle {
     _decision: ApprovalDecision,
   ): Promise<ApprovalSessionUpdate> {
     throw new Error("No approval was expected");
+  }
+
+  async close(): Promise<void> {}
+}
+
+class RecoverySession implements ApprovalSessionHandle {
+  readonly requests: ApprovalSessionRequest[] = [];
+
+  async start(request: ApprovalSessionRequest): Promise<ApprovalSessionUpdate> {
+    this.requests.push(request);
+    return {
+      status: "completed",
+      session_id: request.resume_session_id ?? "wrong-session",
+      turn_id: "mcp-recovery-turn",
+      role: "pl",
+      agent_name: "ark_pl",
+      model: "gpt-5.6-terra",
+      model_reasoning_effort: "xhigh",
+      sandbox_mode: "workspace-write",
+      approval_policy: "on-request",
+      final_report: "MCP_RECOVERED_REPORT",
+      usage: {
+        input_tokens: 30,
+        cached_input_tokens: 6,
+        cache_write_input_tokens: 0,
+        output_tokens: 9,
+        reasoning_output_tokens: 3,
+      },
+    };
+  }
+
+  async decide(
+    _approvalId: string,
+    _decision: ApprovalDecision,
+  ): Promise<ApprovalSessionUpdate> {
+    throw new Error("Recovery must not resolve the old approval");
   }
 
   async close(): Promise<void> {}

@@ -36,6 +36,7 @@ export interface ManagedAssignmentSchedulerOptions {
 }
 
 export type RetryDecision = "retry_once" | "cancel_run";
+export type ApprovalRecoveryDecision = "resume_safely" | "cancel_run";
 
 interface LiveAssignment {
   run_id: string;
@@ -239,6 +240,74 @@ export class ManagedAssignmentScheduler {
     }
   }
 
+  async recoverApproval(
+    runId: string,
+    assignmentId: string,
+    approvalId: string,
+    decision: ApprovalRecoveryDecision,
+  ): Promise<AssignmentRecord> {
+    if (decision !== "resume_safely" && decision !== "cancel_run") {
+      throw new ArkTeamError("INVALID_INPUT", "invalid recovery decision");
+    }
+    const current = await this.store.getAssignment(runId, assignmentId);
+    if (
+      current.state !== "waiting_user" ||
+      current.pending_approval?.approval_id !== approvalId
+    ) {
+      throw new ArkTeamError(
+        "INVALID_INPUT",
+        "approval_id is unknown or already resolved",
+      );
+    }
+    if (this.liveAssignments.has(assignmentId)) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "live approvals must use the ordinary assignment decision operation",
+      );
+    }
+    if (decision === "cancel_run") {
+      await this.store.cancelOrphanedApproval(
+        runId,
+        assignmentId,
+        approvalId,
+      );
+      await this.stopRun(
+        runId,
+        "cancelled",
+        "User cancelled the run during approval recovery",
+      );
+      await this.store.cancelRun(
+        runId,
+        "User cancelled the run during approval recovery",
+      );
+      return this.store.getAssignment(runId, assignmentId);
+    }
+
+    if (current.session_id === null) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "orphaned approval has no resumable managed thread",
+      );
+    }
+    const workingDirectory = await assertManagedWorkspace(
+      sessionRole(current.role),
+      current.working_directory,
+    );
+    const recovered = await this.store.recoverOrphanedApproval({
+      run_id: runId,
+      assignment_id: assignmentId,
+      approval_id: approvalId,
+      assignment: buildApprovalRecoveryAssignment(current),
+    });
+    return this.launch(
+      {
+        ...recovered,
+        working_directory: workingDirectory,
+      },
+      current.session_id,
+    );
+  }
+
   async get(runId: string, assignmentId: string): Promise<AssignmentRecord> {
     return this.store.getAssignment(runId, assignmentId);
   }
@@ -378,6 +447,23 @@ function isApprovalDecision(value: string): value is ApprovalDecision {
     value === "decline" ||
     value === "cancel"
   );
+}
+
+function buildApprovalRecoveryAssignment(
+  assignment: AssignmentRecord,
+): string {
+  return [
+    "Controller-restart recovery turn.",
+    `Run: ${assignment.run_id}`,
+    `Assignment: ${assignment.assignment_id}`,
+    `Role: ${assignment.role}`,
+    `Previous request kind: ${assignment.pending_approval?.kind ?? "unknown"}`,
+    "The previous app-server approval channel was lost. Its approval was NOT applied, declined, or transferred to this turn.",
+    "Re-inspect the current worktree and continue the bounded assignment safely.",
+    "If the dangerous action is still necessary, surface a fresh approval request and wait for a new user decision.",
+    "Do not infer approval from this recovery turn or reuse the previous request.",
+    `Original bounded assignment:\n${assignment.assignment}`,
+  ].join("\n");
 }
 
 function sessionRole(role: AssignmentRole): "pl" | "worker" {

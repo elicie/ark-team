@@ -142,6 +142,15 @@ Pass `retry_once` or `cancel_run` through
 infer approval from the original task, reset a retry counter, or silently
 substitute a new session.
 
+If the controller restarted and the persisted approval no longer has a live
+session, do not route the old ID through `ark_team_assignment_decide`. Ask the
+user to choose recovery, then call `ark_team_assignment_recover` with the exact
+run, assignment, and old approval IDs plus either `resume_safely` or
+`cancel_run`. Safe recovery starts a new turn on the same persisted thread and
+explicitly records that the old approval was not applied. If the dangerous
+action remains necessary, present only the fresh approval surfaced by that new
+turn. Cancellation preserves all local artifacts.
+
 For a pending integration `remote_action`, report its remote, repository,
 source branch, target branch, full commit, and request ID. Route only the
 user's explicit `approve_once` or `cancel_run` through

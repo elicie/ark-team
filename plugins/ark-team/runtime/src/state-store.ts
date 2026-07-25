@@ -106,6 +106,13 @@ export interface RetryAssignmentInput {
   retry_request_id?: string;
 }
 
+export interface RecoverAssignmentInput {
+  run_id: string;
+  assignment_id: string;
+  approval_id: string;
+  assignment: string;
+}
+
 export interface RequestAssignmentRetryInput {
   run_id: string;
   assignment_id: string;
@@ -1147,6 +1154,183 @@ export class RunStore {
   ): Promise<AssignmentRecord> {
     const persisted = await this.readPersistedRun(runId);
     return findAssignment(persisted, assignmentId);
+  }
+
+  async recoverOrphanedApproval(
+    input: RecoverAssignmentInput,
+  ): Promise<AssignmentRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(input.run_id);
+      const current = findAssignment(persisted, input.assignment_id);
+      if (
+        persisted.run.state !== "waiting_user" ||
+        current.state !== "waiting_user" ||
+        current.pending_approval?.approval_id !== input.approval_id ||
+        current.session_id === null ||
+        current.turn_id === null
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "safe recovery requires the current orphaned approval and resumable thread",
+        );
+      }
+      const assignmentText = input.assignment.trim();
+      if (!assignmentText) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "recovery assignment must not be empty",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const assignment: AssignmentRecord = {
+        ...current,
+        assignment: assignmentText,
+        state: "running",
+        turn_id: null,
+        pending_approval: null,
+        pending_retry: null,
+        final_report: null,
+        structured_report: null,
+        usage: null,
+        failure_message: null,
+        report_routed_at: null,
+        updated_at: timestamp,
+        revision: current.revision + 1,
+        turn_count: current.turn_count + 1,
+      };
+      const assignments = persisted.assignments.map((candidate) =>
+        candidate.assignment_id === assignment.assignment_id
+          ? assignment
+          : candidate,
+      );
+      const anotherWaiting = assignments.some(
+        (candidate) => candidate.state === "waiting_user",
+      );
+      const nextState = anotherWaiting
+        ? "waiting_user"
+        : persisted.run.resume_state ??
+          (assignment.role === "integration_pl" ? "integrating" : "executing");
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "assignment.recovering",
+        timestamp,
+        state: nextState,
+        assignment_id: assignment.assignment_id,
+        team_id: assignment.team_id,
+        agent_role: assignment.role,
+        approval_id: input.approval_id,
+        recovery_decision: "resume_safely",
+        message:
+          "Orphaned approval was not applied; the persisted thread is starting a new turn",
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        state: nextState,
+        resume_state:
+          nextState === "waiting_user" ? persisted.run.resume_state : null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration: persisted.integration,
+      });
+      return assignment;
+    });
+  }
+
+  async cancelOrphanedApproval(
+    runId: string,
+    assignmentId: string,
+    approvalId: string,
+  ): Promise<AssignmentRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = findAssignment(persisted, assignmentId);
+      if (
+        persisted.run.state !== "waiting_user" ||
+        current.state !== "waiting_user" ||
+        current.pending_approval?.approval_id !== approvalId
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "recovery cancellation requires the current orphaned approval",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const assignment: AssignmentRecord = {
+        ...current,
+        state: "cancelled",
+        pending_approval: null,
+        pending_retry: null,
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const assignments = persisted.assignments.map((candidate) =>
+        candidate.assignment_id === assignmentId ? assignment : candidate,
+      );
+      const nextState = assignments.some(
+        (candidate) => candidate.state === "waiting_user",
+      )
+        ? "waiting_user"
+        : persisted.run.resume_state ??
+          (assignment.role === "integration_pl" ? "integrating" : "executing");
+      const events: RunEvent[] = [
+        {
+          schema_version: 1,
+          sequence: persisted.run.event_count + 1,
+          event_id: randomUUID(),
+          event_type: "assignment.recovering",
+          timestamp,
+          state: nextState,
+          assignment_id: assignment.assignment_id,
+          team_id: assignment.team_id,
+          agent_role: assignment.role,
+          approval_id: approvalId,
+          recovery_decision: "cancel_run",
+          message: "Orphaned approval recovery cancelled the run",
+        },
+        {
+          schema_version: 1,
+          sequence: persisted.run.event_count + 2,
+          event_id: randomUUID(),
+          event_type: "assignment.cancelled",
+          timestamp,
+          state: nextState,
+          assignment_id: assignment.assignment_id,
+          team_id: assignment.team_id,
+          agent_role: assignment.role,
+          message: "Assignment cancelled during orphaned approval recovery",
+        },
+      ];
+      const run: RunRecord = {
+        ...persisted.run,
+        state: nextState,
+        resume_state:
+          nextState === "waiting_user" ? persisted.run.resume_state : null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + events.length,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, ...events],
+        assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration: persisted.integration,
+      });
+      return assignment;
+    });
   }
 
   async resumeAssignment(input: ResumeAssignmentInput): Promise<AssignmentRecord> {

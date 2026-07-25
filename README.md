@@ -83,6 +83,7 @@ It currently exposes:
 - `ark_team_assignment_list`
 - `ark_team_assignment_status`
 - `ark_team_assignment_decide`
+- `ark_team_assignment_recover`
 - `ark_team_assignment_retry_decide`
 - `ark_team_assignment_cancel`
 
@@ -155,10 +156,15 @@ owning PL assignment. Interim PL plans route to the controller, completed
 worker reports route to the owning PL, and the PL's same-session final report
 routes to PM.
 
-If the MCP process restarts while approval is pending, the record remains
-visible but its live app-server session is intentionally unavailable. Cancel
-the orphaned assignment or preserve it for later recovery tooling; never start
-a replacement session to bypass its unanswered approval.
+If the MCP process restarts while an approval is pending, the record remains
+visible but its old app-server request channel is gone. Use
+`ark_team_assignment_recover` with that exact run, assignment, and approval ID.
+`resume_safely` resumes the persisted Codex thread in a new turn that explicitly
+treats the old approval as not applied; if the action is still needed, the
+agent must surface a fresh approval ID. `cancel_run` stops the run while
+preserving worktrees, branches, commits, reports, and logs. Ordinary
+`ark_team_assignment_decide` remains valid only while the original live
+session exists, and stale or replayed recovery requests fail closed.
 
 Build and verify the bundled server from the repository root:
 
@@ -351,8 +357,8 @@ durable approval or retry-choice state. It also runs a distinct integration PL,
 checks Git ancestry and cleanliness, performs guarded local fast-forward, and
 resumes the PM for final acceptance. It now also gates an exact GitHub push/PR
 tuple behind one explicit approval and cleans verified linked worktrees while
-preserving branches. The next runtime slices are still required to add
-explicit external-provider and non-Git adapters, parse project runtime
-overrides, and safely recover assignment turns interrupted while waiting on a
-live app-server approval. The current control plane does not claim those
-remaining guarantees.
+preserving branches. Persisted approval waits can be explicitly recovered after
+a controller restart on the same thread without carrying the lost approval into
+the new turn. The next runtime slices are still required to add explicit
+external-provider and non-Git adapters and parse project runtime overrides. The
+current control plane does not claim those remaining guarantees.

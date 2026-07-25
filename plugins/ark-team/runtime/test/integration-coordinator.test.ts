@@ -761,6 +761,94 @@ test("TEST-1206 refuses dirty worktree cleanup without completing the run", asyn
   });
 });
 
+test("TEST-1305 resumes an orphaned integration PL and completes the hierarchy", async () => {
+  await withIntegratedTeams(async (fixture) => {
+    const lostHarness = new IntegrationHarness(fixture.teams);
+    const firstScheduler = new ManagedAssignmentScheduler(fixture.store, {
+      session_factory: () => new IntegrationSession(lostHarness),
+    });
+    const firstCoordinator = new IntegrationCoordinator(
+      fixture.store,
+      firstScheduler,
+      {
+        worktree_root: fixture.worktreeRoot,
+        materializer: new IntegrationMaterializer(fixture.store, {
+          worktree_root: fixture.worktreeRoot,
+        }),
+        pm_launcher: new FinalPmLauncher(
+          fixture.teams.map((team) => team.team_id),
+        ),
+      },
+    );
+    const waiting = await firstCoordinator.advance(fixture.runId);
+    const integrationAssignment = waiting.assignments.find(
+      (assignment) => assignment.role === "integration_pl",
+    );
+    assert.ok(integrationAssignment);
+    assert.equal(
+      integrationAssignment.pending_approval?.approval_id,
+      approvalId,
+    );
+    const assignmentCount = waiting.assignments.length;
+
+    const reopenedStore = new RunStore({
+      root_path: fixture.store.root_path,
+    });
+    const recoveryRequests: ApprovalSessionRequest[] = [];
+    const recoveredScheduler = new ManagedAssignmentScheduler(reopenedStore, {
+      session_factory: () =>
+        new FunctionSession(async (request) => {
+          recoveryRequests.push(request);
+          assert.equal(request.resume_session_id, "integration-session");
+          assert.match(request.assignment, /was NOT applied/i);
+          for (const team of fixture.teams) {
+            await execFileAsync("git", [
+              "-C",
+              request.working_directory,
+              "merge",
+              "--no-edit",
+              team.branch,
+            ]);
+          }
+          return completedIntegration(
+            fixture.teams.map((team) => team.team_id),
+            await git(request.working_directory, ["rev-parse", "HEAD"]),
+          );
+        }),
+    });
+    const recovered = await recoveredScheduler.recoverApproval(
+      fixture.runId,
+      integrationAssignment.assignment_id,
+      approvalId,
+      "resume_safely",
+    );
+    assert.equal(recovered.state, "completed");
+    assert.equal(recovered.session_id, "integration-session");
+
+    const pm = new FinalPmLauncher(
+      fixture.teams.map((team) => team.team_id),
+    );
+    const recoveredCoordinator = new IntegrationCoordinator(
+      reopenedStore,
+      recoveredScheduler,
+      {
+        worktree_root: fixture.worktreeRoot,
+        materializer: new IntegrationMaterializer(reopenedStore, {
+          worktree_root: fixture.worktreeRoot,
+        }),
+        pm_launcher: pm,
+      },
+    );
+    const completed = await recoveredCoordinator.advance(fixture.runId);
+    assert.equal(completed.run.state, "completed");
+    assert.equal(completed.integration?.state, "cleaned");
+    assert.equal(completed.assignments.length, assignmentCount);
+    assert.equal(recoveryRequests.length, 1);
+    assert.equal(pm.requests.length, 1);
+    assert.equal(pm.requests[0]?.resume_session_id, "pm-planning-session");
+  });
+});
+
 test("TEST-1105 retries one failed integration PL in a fresh Terra session", async () => {
   await withIntegratedTeams(async (fixture) => {
     let attempts = 0;

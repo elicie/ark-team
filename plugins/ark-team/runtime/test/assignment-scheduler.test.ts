@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -20,6 +20,7 @@ import { RunStore } from "../src/state-store.js";
 
 const execFileAsync = promisify(execFile);
 const APPROVAL_ID = "11111111-1111-4111-8111-111111111111";
+const RECOVERED_APPROVAL_ID = "22222222-2222-4222-8222-222222222222";
 const usage = {
   input_tokens: 100,
   cached_input_tokens: 20,
@@ -303,6 +304,261 @@ test("TEST-506 cancels assignments and stops active sessions on run pause", asyn
   });
 });
 
+test("TEST-1301 resumes an orphaned approval in the persisted thread without applying it", async () => {
+  await withSchedulerFixture(async ({ stateRoot, worktree }) => {
+    const store = deterministicStore(stateRoot);
+    const run = await store.createRun({
+      objective: "Recover one orphaned approval",
+      project_path: worktree,
+    });
+    const lostSession = new ScriptedSession([
+      waitingUpdate("pl", APPROVAL_ID),
+    ]);
+    const originalScheduler = new ManagedAssignmentScheduler(store, {
+      session_factory: () => lostSession,
+    });
+    const waiting = await originalScheduler.start({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Finish the bounded PL task",
+      working_directory: worktree,
+    });
+
+    const resumedSession = new ScriptedSession([
+      completedUpdate("pl", "RECOVERED_REPORT"),
+    ]);
+    const reopenedStore = new RunStore({ root_path: stateRoot });
+    const restartedScheduler = new ManagedAssignmentScheduler(reopenedStore, {
+      session_factory: () => resumedSession,
+    });
+    const completed = await restartedScheduler.recoverApproval(
+      run.run_id,
+      waiting.assignment_id,
+      APPROVAL_ID,
+      "resume_safely",
+    );
+
+    assert.equal(completed.state, "completed");
+    assert.equal(completed.session_id, "pl-session");
+    assert.equal(completed.turn_count, 2);
+    assert.equal(completed.final_report, "RECOVERED_REPORT");
+    assert.deepEqual(lostSession.decisions, []);
+    assert.equal(resumedSession.requests.length, 1);
+    assert.equal(resumedSession.requests[0]?.resume_session_id, "pl-session");
+    assert.equal(resumedSession.requests[0]?.role, "pl");
+    assert.equal(resumedSession.requests[0]?.working_directory, worktree);
+    assert.match(
+      resumedSession.requests[0]?.assignment ?? "",
+      /was NOT applied/i,
+    );
+    assert.match(
+      resumedSession.requests[0]?.assignment ?? "",
+      /fresh approval/i,
+    );
+
+    const logs = await reopenedStore.getLogs(run.run_id, { limit: 200 });
+    const recovery = logs.events.find(
+      (event) => event.event_type === "assignment.recovering",
+    );
+    assert.equal(recovery?.approval_id, APPROVAL_ID);
+    assert.equal(recovery?.recovery_decision, "resume_safely");
+    await assert.rejects(
+      restartedScheduler.recoverApproval(
+        run.run_id,
+        waiting.assignment_id,
+        APPROVAL_ID,
+        "resume_safely",
+      ),
+      (error: unknown) =>
+        error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+    );
+  });
+});
+
+test("TEST-1302 requires a fresh approval after safe recovery", async () => {
+  await withSchedulerFixture(async ({ stateRoot, worktree }) => {
+    const store = deterministicStore(stateRoot);
+    const run = await store.createRun({
+      objective: "Require a fresh approval after restart",
+      project_path: worktree,
+    });
+    const lostSession = new ScriptedSession([
+      waitingUpdate("pl", APPROVAL_ID),
+    ]);
+    const firstScheduler = new ManagedAssignmentScheduler(store, {
+      session_factory: () => lostSession,
+    });
+    const waiting = await firstScheduler.start({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Perform one guarded operation",
+      working_directory: worktree,
+    });
+    const resumedSession = new ScriptedSession([
+      waitingUpdate("pl", RECOVERED_APPROVAL_ID),
+      completedUpdate("pl", "FRESH_APPROVAL_RESOLVED"),
+    ]);
+    const restartedScheduler = new ManagedAssignmentScheduler(
+      new RunStore({ root_path: stateRoot }),
+      { session_factory: () => resumedSession },
+    );
+
+    const recoveredWaiting = await restartedScheduler.recoverApproval(
+      run.run_id,
+      waiting.assignment_id,
+      APPROVAL_ID,
+      "resume_safely",
+    );
+    assert.equal(recoveredWaiting.state, "waiting_user");
+    assert.equal(
+      recoveredWaiting.pending_approval?.approval_id,
+      RECOVERED_APPROVAL_ID,
+    );
+    assert.deepEqual(lostSession.decisions, []);
+    assert.deepEqual(resumedSession.decisions, []);
+    await assert.rejects(
+      restartedScheduler.decide(
+        run.run_id,
+        waiting.assignment_id,
+        APPROVAL_ID,
+        "decline",
+      ),
+      (error: unknown) =>
+        error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+    );
+
+    const completed = await restartedScheduler.decide(
+      run.run_id,
+      waiting.assignment_id,
+      RECOVERED_APPROVAL_ID,
+      "decline",
+    );
+    assert.equal(completed.state, "completed");
+    assert.deepEqual(resumedSession.decisions, [
+      {
+        approval_id: RECOVERED_APPROVAL_ID,
+        decision: "decline",
+      },
+    ]);
+  });
+});
+
+test("TEST-1303 refuses recovery while the original live session still exists", async () => {
+  await withSchedulerFixture(async ({ stateRoot, worktree }) => {
+    const store = deterministicStore(stateRoot);
+    const run = await store.createRun({
+      objective: "Reject unsafe live recovery",
+      project_path: worktree,
+    });
+    const session = new ScriptedSession([
+      waitingUpdate("pl", APPROVAL_ID),
+      completedUpdate("pl", "DONE"),
+    ]);
+    const scheduler = new ManagedAssignmentScheduler(store, {
+      session_factory: () => session,
+    });
+    const waiting = await scheduler.start({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Keep the live approval channel",
+      working_directory: worktree,
+    });
+    const before = await store.getAssignment(run.run_id, waiting.assignment_id);
+
+    await assert.rejects(
+      scheduler.recoverApproval(
+        run.run_id,
+        waiting.assignment_id,
+        APPROVAL_ID,
+        "resume_safely",
+      ),
+      (error: unknown) =>
+        error instanceof ArkTeamError &&
+        error.code === "INVALID_TRANSITION",
+    );
+    assert.deepEqual(
+      await store.getAssignment(run.run_id, waiting.assignment_id),
+      before,
+    );
+
+    const restartedScheduler = new ManagedAssignmentScheduler(
+      new RunStore({ root_path: stateRoot }),
+    );
+    await assert.rejects(
+      restartedScheduler.recoverApproval(
+        run.run_id,
+        waiting.assignment_id,
+        RECOVERED_APPROVAL_ID,
+        "resume_safely",
+      ),
+      (error: unknown) =>
+        error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+    );
+  });
+});
+
+test("TEST-1304 cancels orphan recovery without deleting worktree artifacts", async () => {
+  await withSchedulerFixture(async ({ stateRoot, repository, worktree }) => {
+    const store = deterministicStore(stateRoot);
+    const run = await store.createRun({
+      objective: "Cancel one orphaned approval",
+      project_path: worktree,
+    });
+    const firstScheduler = new ManagedAssignmentScheduler(store, {
+      session_factory: () =>
+        new ScriptedSession([waitingUpdate("pl", APPROVAL_ID)]),
+    });
+    const waiting = await firstScheduler.start({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Preserve this worktree on cancellation",
+      working_directory: worktree,
+    });
+    const reopenedStore = new RunStore({ root_path: stateRoot });
+    const restartedScheduler = new ManagedAssignmentScheduler(reopenedStore);
+
+    const cancelled = await restartedScheduler.recoverApproval(
+      run.run_id,
+      waiting.assignment_id,
+      APPROVAL_ID,
+      "cancel_run",
+    );
+    assert.equal(cancelled.state, "cancelled");
+    assert.equal((await reopenedStore.getRun(run.run_id)).state, "cancelled");
+    assert.equal((await stat(worktree)).isDirectory(), true);
+    assert.match(
+      (
+        await execFileAsync("git", [
+          "-C",
+          repository,
+          "rev-parse",
+          "refs/heads/test/scheduler",
+        ])
+      ).stdout.trim(),
+      /^[0-9a-f]{40,64}$/,
+    );
+    const recovery = (
+      await reopenedStore.getLogs(run.run_id, { limit: 200 })
+    ).events.find((event) => event.event_type === "assignment.recovering");
+    assert.equal(recovery?.approval_id, APPROVAL_ID);
+    assert.equal(recovery?.recovery_decision, "cancel_run");
+    await assert.rejects(
+      restartedScheduler.recoverApproval(
+        run.run_id,
+        waiting.assignment_id,
+        APPROVAL_ID,
+        "cancel_run",
+      ),
+      (error: unknown) =>
+        error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+    );
+  });
+});
+
 test("TEST-502 scheduler rejects a primary checkout before persistence", async () => {
   await withSchedulerFixture(async ({ stateRoot, repository }) => {
     const store = deterministicStore(stateRoot);
@@ -335,11 +591,13 @@ class ScriptedSession implements ApprovalSessionHandle {
     approval_id: string;
     decision: ApprovalDecision;
   }> = [];
+  readonly requests: ApprovalSessionRequest[] = [];
   close_count = 0;
 
   constructor(private readonly updates: ApprovalSessionUpdate[]) {}
 
-  async start(_request: ApprovalSessionRequest): Promise<ApprovalSessionUpdate> {
+  async start(request: ApprovalSessionRequest): Promise<ApprovalSessionUpdate> {
+    this.requests.push(request);
     return this.takeUpdate();
   }
 

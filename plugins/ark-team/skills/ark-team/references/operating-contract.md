@@ -177,6 +177,13 @@ the same turn only after the user selects one-time approval, session approval,
 decline, or cancel. Treat an expired, unknown, or already resolved approval ID
 as an error instead of replaying the decision.
 
+If a controller restart destroys the live approval channel, never treat the
+persisted ID as an approvable wire request. Recover only through the explicit
+orphan-recovery operation and the user's `resume_safely` or `cancel_run`
+choice. Safe recovery starts a new turn on the same thread, records that the
+old approval was not applied, and requires a fresh request and decision for any
+still-dangerous action. Cancellation preserves local artifacts.
+
 Treat retry exhaustion as a separate `waiting_user` decision, not a dangerous
 action approval. Show its counters and redacted failure reason, then accept
 only `retry_once` or `cancel_run` through the opaque retry request. Never route
