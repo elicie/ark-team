@@ -143,16 +143,49 @@ export class WorktreeManager {
       );
     }
     const repositoryRoot = await assertRepositoryRoot(projectPath);
-    try {
-      await git(repositoryRoot, [
-        "worktree",
-        "remove",
-        workspace.working_directory,
+    if (await pathExists(workspace.working_directory)) {
+      const status = await git(workspace.working_directory, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
       ]);
-    } catch (error) {
-      throw workspaceFailure(
-        `Unable to remove linked worktree ${workspace.working_directory}`,
-        error,
+      if (
+        status.stdout.trim() ||
+        (await currentBranch(workspace.working_directory)) !== workspace.branch
+      ) {
+        throw new ArkTeamError(
+          "UNSAFE_AGENT_WORKSPACE",
+          `refusing to remove dirty or moved worktree ${workspace.team_id}`,
+        );
+      }
+      try {
+        await git(repositoryRoot, [
+          "worktree",
+          "remove",
+          workspace.working_directory,
+        ]);
+      } catch (error) {
+        throw workspaceFailure(
+          `Unable to remove linked worktree ${workspace.working_directory}`,
+          error,
+        );
+      }
+    } else if (
+      await worktreeRegistered(repositoryRoot, workspace.working_directory)
+    ) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        `missing worktree remains registered: ${workspace.working_directory}`,
+      );
+    }
+    const registeredPath = await worktreeForBranch(
+      repositoryRoot,
+      workspace.branch,
+    );
+    if (registeredPath !== null) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        `worktree branch remains registered at ${registeredPath}`,
       );
     }
     if (!(await branchExists(repositoryRoot, workspace.branch))) {
@@ -428,6 +461,126 @@ export class IntegrationWorktreeManager {
       workspace.working_directory,
     ]);
   }
+
+  async cleanupCompleted(
+    projectPath: string,
+    integration: IntegrationRecord,
+  ): Promise<void> {
+    const repositoryRoot = await assertRepositoryRoot(projectPath);
+    const expectedPath = path.join(
+      await realpath(this.root_path),
+      integration.run_id,
+      "integration",
+    );
+    if (
+      integration.state !== "cleaning" ||
+      integration.integration_commit_sha === null ||
+      path.normalize(integration.working_directory) !== expectedPath
+    ) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "integration cleanup requires one registered PM-accepted worktree",
+      );
+    }
+    if (await pathExists(integration.working_directory)) {
+      const status = await git(integration.working_directory, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      const head = (
+        await git(integration.working_directory, ["rev-parse", "HEAD"])
+      ).stdout.trim();
+      if (
+        status.stdout.trim() ||
+        (await currentBranch(integration.working_directory)) !==
+          integration.branch ||
+        head !== integration.integration_commit_sha
+      ) {
+        throw new ArkTeamError(
+          "UNSAFE_AGENT_WORKSPACE",
+          "refusing to remove dirty or changed integration worktree",
+        );
+      }
+      try {
+        await git(repositoryRoot, [
+          "worktree",
+          "remove",
+          integration.working_directory,
+        ]);
+      } catch (error) {
+        throw workspaceFailure(
+          `Unable to remove integration worktree ${integration.working_directory}`,
+          error,
+        );
+      }
+    } else if (
+      await worktreeRegistered(repositoryRoot, integration.working_directory)
+    ) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        `missing integration worktree remains registered: ${integration.working_directory}`,
+      );
+    }
+    const registeredPath = await worktreeForBranch(
+      repositoryRoot,
+      integration.branch,
+    );
+    if (registeredPath !== null) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        `integration branch remains registered at ${registeredPath}`,
+      );
+    }
+    const preservedHead = (
+      await git(repositoryRoot, [
+        "rev-parse",
+        `refs/heads/${integration.branch}`,
+      ])
+    ).stdout.trim();
+    if (preservedHead !== integration.integration_commit_sha) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        "integration branch was not preserved at the verified commit",
+      );
+    }
+  }
+
+  async verifyTeamBranchContained(
+    projectPath: string,
+    integration: IntegrationRecord,
+    team: TeamRecord,
+  ): Promise<void> {
+    const repositoryRoot = await assertRepositoryRoot(projectPath);
+    if (
+      integration.state !== "cleaning" ||
+      integration.integration_commit_sha === null ||
+      !integration.team_ids.includes(team.team_id) ||
+      (team.state !== "integrated" && team.state !== "cleaned")
+    ) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "team cleanup requires one accepted integration",
+      );
+    }
+    const teamTip = (
+      await git(repositoryRoot, ["rev-parse", `refs/heads/${team.branch}`])
+    ).stdout.trim();
+    try {
+      await git(repositoryRoot, [
+        "merge-base",
+        "--is-ancestor",
+        teamTip,
+        integration.integration_commit_sha,
+      ]);
+    } catch (error) {
+      throw new ArkTeamError(
+        "UNSAFE_AGENT_WORKSPACE",
+        `team branch ${team.team_id} is not contained by the accepted integration`,
+        { cause: error },
+      );
+    }
+  }
 }
 
 export function resolveWorktreeRoot(
@@ -549,6 +702,45 @@ async function branchExists(projectPath: string, branch: string): Promise<boolea
     }
     throw workspaceFailure(`Unable to inspect branch ${branch}`, error);
   }
+}
+
+async function worktreeRegistered(
+  repositoryRoot: string,
+  workingDirectory: string,
+): Promise<boolean> {
+  const output = (
+    await git(repositoryRoot, ["worktree", "list", "--porcelain"])
+  ).stdout;
+  const normalized = path.normalize(workingDirectory);
+  return output
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("worktree "))
+    .some(
+      (line) => path.normalize(line.slice("worktree ".length)) === normalized,
+    );
+}
+
+async function worktreeForBranch(
+  repositoryRoot: string,
+  branch: string,
+): Promise<string | null> {
+  const output = (
+    await git(repositoryRoot, ["worktree", "list", "--porcelain"])
+  ).stdout;
+  let workingDirectory: string | null = null;
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith("worktree ")) {
+      workingDirectory = path.normalize(line.slice("worktree ".length));
+    } else if (
+      line === `branch refs/heads/${branch}` &&
+      workingDirectory !== null
+    ) {
+      return workingDirectory;
+    } else if (!line && workingDirectory !== null) {
+      workingDirectory = null;
+    }
+  }
+  return null;
 }
 
 async function pathExists(candidate: string): Promise<boolean> {

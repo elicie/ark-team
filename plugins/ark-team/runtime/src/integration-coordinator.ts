@@ -16,11 +16,16 @@ import type {
   IntegrationReport,
   PmReport,
 } from "./role-contracts.js";
+import {
+  RemoteActionCoordinator,
+  type RemoteActionDecision,
+} from "./remote-action-coordinator.js";
 import { RunStore } from "./state-store.js";
 import {
   TeamCoordinator,
   type TeamCoordinatorResult,
 } from "./team-coordinator.js";
+import { WorktreeCleanupCoordinator } from "./worktree-cleanup.js";
 
 export interface PmReviewLauncher {
   run(request: ManagedSessionRequest): Promise<ManagedSessionResult>;
@@ -32,6 +37,9 @@ export interface IntegrationCoordinatorOptions {
   internal_agent_retries?: number;
   correction_rounds?: number;
   codex_path?: string;
+  worktree_root?: string;
+  remote_actions?: RemoteActionCoordinator;
+  cleanup?: WorktreeCleanupCoordinator;
 }
 
 export interface RunCoordinatorResult extends TeamCoordinatorResult {
@@ -45,6 +53,8 @@ export class IntegrationCoordinator {
   private readonly pmLauncher: PmReviewLauncher;
   private readonly internalAgentRetries: number;
   private readonly correctionRounds: number;
+  private readonly remoteActions: RemoteActionCoordinator;
+  private readonly cleanup: WorktreeCleanupCoordinator;
   private operationQueue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -53,7 +63,12 @@ export class IntegrationCoordinator {
     options: IntegrationCoordinatorOptions = {},
   ) {
     this.materializer =
-      options.materializer ?? new IntegrationMaterializer(store);
+      options.materializer ??
+      new IntegrationMaterializer(store, {
+        ...(options.worktree_root === undefined
+          ? {}
+          : { worktree_root: options.worktree_root }),
+      });
     this.pmLauncher =
       options.pm_launcher ??
       new ManagedCodexSessionLauncher({
@@ -72,6 +87,15 @@ export class IntegrationCoordinator {
       2,
       "correction_rounds",
     );
+    this.remoteActions =
+      options.remote_actions ?? new RemoteActionCoordinator(store);
+    this.cleanup =
+      options.cleanup ??
+      new WorktreeCleanupCoordinator(store, {
+        ...(options.worktree_root === undefined
+          ? {}
+          : { worktree_root: options.worktree_root }),
+      });
   }
 
   async advance(runId: string): Promise<RunCoordinatorResult> {
@@ -91,6 +115,7 @@ export class IntegrationCoordinator {
         if (
           context.run.state !== "integrating" &&
           context.run.state !== "verifying" &&
+          context.run.state !== "cleaning" &&
           context.run.state !== "waiting_user"
         ) {
           throw new ArkTeamError(
@@ -99,12 +124,34 @@ export class IntegrationCoordinator {
           );
         }
 
+        if (context.run.state === "cleaning") {
+          await this.cleanup.advance(runId);
+          progressed = true;
+          continue;
+        }
         if (context.integration === null) {
           await this.materializer.prepare(runId);
           progressed = true;
           continue;
         }
         const integration = context.integration;
+
+        if (
+          integration.state === "awaiting_remote" &&
+          integration.remote_action?.status === "cancelled"
+        ) {
+          await this.remoteActions.prepare(runId);
+          progressed = true;
+          break;
+        }
+        if (integration.state === "remote_executing") {
+          const remote = await this.remoteActions.advance(runId);
+          progressed = true;
+          if (remote.state === "awaiting_remote") {
+            break;
+          }
+          continue;
+        }
 
         const assignments = (
           await this.store.listAssignments(runId)
@@ -210,7 +257,7 @@ export class IntegrationCoordinator {
         const refreshed = await this.store.getRunContext(runId);
         if (refreshed.integration?.state === "verified") {
           if (refreshed.integration.strategy === "pull_request") {
-            await this.store.recordAwaitingRemote(runId);
+            await this.remoteActions.prepare(runId);
             progressed = true;
             break;
           }
@@ -218,7 +265,10 @@ export class IntegrationCoordinator {
           progressed = true;
           continue;
         }
-        if (refreshed.integration?.state === "local_merged") {
+        if (
+          refreshed.integration?.state === "local_merged" ||
+          refreshed.integration?.state === "remote_completed"
+        ) {
           await this.completePmReview(
             refreshed.run,
             refreshed.integration,
@@ -233,6 +283,17 @@ export class IntegrationCoordinator {
       }
       return this.snapshot(runId, progressed);
     });
+  }
+
+  async decideRemote(
+    runId: string,
+    requestId: string,
+    decision: RemoteActionDecision,
+  ): Promise<RunCoordinatorResult> {
+    await this.remoteActions.decide(runId, requestId, decision);
+    return decision === "approve_once"
+      ? this.advance(runId)
+      : this.snapshot(runId, true);
   }
 
   private async correctOrWait(
@@ -355,7 +416,8 @@ export class IntegrationCoordinator {
         (assignment) => assignment.pending_retry !== null,
       ).length,
       remote_action_required:
-        context.integration?.state === "awaiting_remote",
+        context.integration?.state === "awaiting_remote" &&
+        context.integration.remote_action?.status === "pending",
     };
   }
 
@@ -387,7 +449,8 @@ export class ArkTeamRunCoordinator {
       before.run.state === "completed" ||
       before.integration !== null ||
       before.run.state === "integrating" ||
-      before.run.state === "verifying"
+      before.run.state === "verifying" ||
+      before.run.state === "cleaning"
     ) {
       return this.integrationCoordinator.advance(runId);
     }
@@ -405,6 +468,18 @@ export class ArkTeamRunCoordinator {
       pm_report: before.pm_session?.final_report ?? null,
       remote_action_required: false,
     };
+  }
+
+  decideRemote(
+    runId: string,
+    requestId: string,
+    decision: RemoteActionDecision,
+  ): Promise<RunCoordinatorResult> {
+    return this.integrationCoordinator.decideRemote(
+      runId,
+      requestId,
+      decision,
+    );
   }
 }
 

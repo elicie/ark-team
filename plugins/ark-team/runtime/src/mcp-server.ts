@@ -8,7 +8,8 @@ import {
   runStateSchema,
 } from "./domain.js";
 import { ManagedAssignmentScheduler } from "./assignment-scheduler.js";
-import { normalizeError } from "./errors.js";
+import { ArkTeamError, normalizeError } from "./errors.js";
+import type { RunCoordinatorResult } from "./integration-coordinator.js";
 import {
   ArkTeamOrchestrator,
   type ExecuteArkTeamInput,
@@ -25,10 +26,18 @@ import {
 } from "./integration-coordinator.js";
 
 const SERVER_INSTRUCTIONS =
-  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, execute dependency-ready teams, and continue through guarded local integration and PM review in one call. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list and the integration record with ark_team_status. Keep every returned assignment_id. For waiting_user, distinguish pending_approval, pending_retry, and a verified pull-request handoff. Deliver approvals only through ark_team_assignment_decide. Deliver exhausted-retry choices only through ark_team_assignment_retry_decide. Never push or create a PR without the later remote-action approval flow. Then call ark_team_advance to continue the hierarchy. Use assignment status/list for stored reports, counters, and usage. Run pause/cancel stops active managed assignments.";
+  "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, execute dependency-ready teams, and continue through guarded integration, PM review, and worktree cleanup. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list and the integration record with ark_team_status. Keep every returned assignment_id. For waiting_user, distinguish pending_approval, pending_retry, and remote_action. Deliver agent approvals only through ark_team_assignment_decide, exhausted-retry choices only through ark_team_assignment_retry_decide, and the exact persisted push/PR request only through ark_team_remote_decide. Never approve a remote action without the user's explicit choice. Then call ark_team_advance to continue the hierarchy. Use assignment status/list for stored reports, counters, and usage. Run pause/cancel stops active managed assignments.";
 
 export interface ArkTeamExecutionController {
   execute(input: ExecuteArkTeamInput): Promise<ExecuteArkTeamResult>;
+}
+
+interface RemoteDecisionCoordinator {
+  decideRemote(
+    runId: string,
+    requestId: string,
+    decision: "approve_once" | "cancel_run",
+  ): Promise<RunCoordinatorResult>;
 }
 
 export function createArkTeamMcpServer(
@@ -82,7 +91,7 @@ export function createArkTeamMcpServer(
     {
       title: "Execute Ark Team PM planning",
       description:
-        "Create a run, invoke the Sol/xhigh read-only PM, materialize linked team worktrees, and advance bounded PL/worker execution.",
+        "Create a run and advance managed PM, teams, integration, guarded remote handoff, final review, and cleanup until blocked or complete.",
       inputSchema: {
         objective: z.string().min(1).max(20_000),
         project_path: z.string().min(1),
@@ -105,7 +114,7 @@ export function createArkTeamMcpServer(
     {
       title: "Advance Ark Team hierarchy",
       description:
-        "Continue dependency-ready teams, guarded integration, and PM review until completed, blocked, or waiting.",
+        "Continue dependency-ready teams, guarded integration, approved remote work, PM review, and cleanup until completed, blocked, or waiting.",
       inputSchema: {
         run_id: z.string().min(1),
       },
@@ -120,6 +129,42 @@ export function createArkTeamMcpServer(
       handleTool(async () => ({
         ...(await coordinator.advance(run_id)),
       })),
+  );
+
+  server.registerTool(
+    "ark_team_remote_decide",
+    {
+      title: "Decide one Ark Team remote action",
+      description:
+        "Approve one exact persisted integration push/PR tuple or cancel the run while preserving local artifacts.",
+      inputSchema: {
+        run_id: z.string().min(1),
+        request_id: z.string().uuid(),
+        decision: z.enum(["approve_once", "cancel_run"]),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ run_id, request_id, decision }) =>
+      handleTool(async () => {
+        if (!supportsRemoteDecision(coordinator)) {
+          throw new ArkTeamError(
+            "REMOTE_ACTION_UNAVAILABLE",
+            "configured coordinator does not support remote actions",
+          );
+        }
+        return {
+          ...(await coordinator.decideRemote(
+            run_id,
+            request_id,
+            decision,
+          )),
+        };
+      }),
   );
 
   server.registerTool(
@@ -441,6 +486,15 @@ export function createArkTeamMcpServer(
   registerTransitionTool(server, store, scheduler, "cancel");
 
   return server;
+}
+
+function supportsRemoteDecision(
+  coordinator: TeamExecutionCoordinator,
+): coordinator is TeamExecutionCoordinator & RemoteDecisionCoordinator {
+  return (
+    "decideRemote" in coordinator &&
+    typeof coordinator.decideRemote === "function"
+  );
 }
 
 function registerTransitionTool(

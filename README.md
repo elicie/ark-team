@@ -56,6 +56,8 @@ working in this repository. Project-scoped custom-agent definitions live under
   requires an authenticated `codex` executable on `PATH`.
 - The approval-gated writer backend uses `codex app-server` over local stdio
   and requires a compatible generated stable protocol schema.
+- Pull-request mode supports `github.com` remotes and requires an authenticated
+  GitHub CLI (`gh`) on `PATH`; set `ARK_TEAM_GH_PATH` to override its path.
 - The MCP control plane persists run and assignment state and can schedule
   a managed PM → PL → worker hierarchy, materialize the PM plan into linked
   team worktrees, and resume each PL with its workers' validated reports.
@@ -75,6 +77,7 @@ It currently exposes:
 - `ark_team_resume`
 - `ark_team_cancel`
 - `ark_team_plan_apply`
+- `ark_team_remote_decide`
 - `ark_team_team_list`
 - `ark_team_assignment_start`
 - `ark_team_assignment_list`
@@ -116,9 +119,22 @@ every team branch tip.
 For `local_merge`, the runtime fast-forwards the original branch only when its
 branch, HEAD, and cleanliness still match the recorded start boundary. It then
 resumes the original Sol/xhigh read-only PM session for a strict final
-`pm_report` and completes the run. For `pull_request`, it keeps the verified
-integration local and returns `remote_action_required`; no push or PR occurs
-without the later guarded remote flow.
+`pm_report`. For `pull_request`, it first verifies the local GitHub remote and
+CLI authentication read-only, then returns `remote_action_required` with one
+opaque request containing the exact remote, branch, target, and commit tuple.
+Only `ark_team_remote_decide` with the current request ID and the user's
+explicit `approve_once` may push that commit and create or adopt its PR.
+`cancel_run` preserves every local artifact; explicitly resuming that run
+creates a fresh request rather than reusing the cancelled approval. Approved
+execution is idempotent across restarts and receives at most three attempts
+before a fresh approval is required.
+
+After either local fast-forward or an approved PR succeeds, the original PM
+session performs final read-only acceptance. The runtime then removes only
+clean registered team and integration worktrees whose branches are contained
+by the accepted integration. Every local team and integration branch is
+preserved and checked; the run becomes `completed` only after cleanup. Partial
+cleanup is idempotent when resumed.
 
 Internal PL/worker session failures receive at most two automatic fresh-session
 retries. Valid but deficient plans and reports receive at most two
@@ -333,8 +349,10 @@ dependencies, routes stored worker reports into same-session PL continuations,
 applies bounded internal failure retries and report corrections, and stops with
 durable approval or retry-choice state. It also runs a distinct integration PL,
 checks Git ancestry and cleanliness, performs guarded local fast-forward, and
-resumes the PM for final acceptance. The next runtime slices are still required
-to approve and execute remote push/PR work, clean verified worktrees while
-preserving branches, add explicit external-provider and non-Git adapters, and
-reattach interrupted live sessions. The current control plane does not claim
-those remaining guarantees.
+resumes the PM for final acceptance. It now also gates an exact GitHub push/PR
+tuple behind one explicit approval and cleans verified linked worktrees while
+preserving branches. The next runtime slices are still required to add
+explicit external-provider and non-Git adapters, parse project runtime
+overrides, and safely recover assignment turns interrupted while waiting on a
+live app-server approval. The current control plane does not claim those
+remaining guarantees.

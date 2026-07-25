@@ -103,8 +103,14 @@ Apply these rules:
 - Require user approval before push, pull-request creation, remote merge, deployment, or another external side effect.
 - Stop before integration when the target branch is dirty, changed since run start, or has unresolved conflicts.
 - For `pull_request`, stop after verified local integration with
-  `remote_action_required`; do not push or create the PR until the remote
-  approval operation is available and the user explicitly approves it.
+  `remote_action_required`. Show the exact persisted remote-action tuple and
+  request ID. Call `ark_team_remote_decide` with `approve_once` only after the
+  user explicitly approves that request, or with `cancel_run` to preserve all
+  local artifacts. Never reuse a stale request ID.
+- After successful local merge or approved PR creation and PM acceptance, let
+  the guarded runtime remove verified clean worktrees. Require the runtime to
+  preserve every local team and integration branch; do not report completion
+  while cleanup is partial or refused.
 
 ## Verify and retry
 
@@ -135,6 +141,13 @@ Pass `retry_once` or `cancel_run` through
 `ark_team_advance` to continue scheduling from the persisted hierarchy. Never
 infer approval from the original task, reset a retry counter, or silently
 substitute a new session.
+
+For a pending integration `remote_action`, report its remote, repository,
+source branch, target branch, full commit, and request ID. Route only the
+user's explicit `approve_once` or `cancel_run` through
+`ark_team_remote_decide`. One approval covers retries of that exact idempotent
+tuple only; after three failures the runtime issues a fresh request that
+requires a new decision.
 
 When the user changes requirements, pause only affected teams, update their contracts, and allow unaffected work to continue.
 

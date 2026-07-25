@@ -25,6 +25,7 @@ import {
   persistedRunSchema,
   type PersistedRun,
   type PmSessionRecord,
+  type RemoteActionRecord,
   type RunEvent,
   type RunListResult,
   type RunLogsResult,
@@ -158,6 +159,18 @@ export interface CompletePmReviewInput {
   usage: PmSessionRecord["usage"];
 }
 
+export interface RequestRemoteActionInput {
+  run_id: string;
+  remote_name: string;
+  repository: string;
+}
+
+export interface CompleteRemoteActionInput {
+  run_id: string;
+  request_id: string;
+  pull_request_url: string;
+}
+
 export interface PmPlanEvidence {
   session_id: string;
   agent_name: "ark_pm";
@@ -187,6 +200,7 @@ const ACTIVE_STATES = new Set<RunState>([
   "executing",
   "integrating",
   "verifying",
+  "cleaning",
   "waiting_user",
 ]);
 
@@ -720,6 +734,9 @@ export class RunStore {
         updated_at: timestamp,
         verified_at: null,
         merged_at: null,
+        remote_action: null,
+        cleanup_error: null,
+        cleaned_at: null,
         revision: 1,
       };
       const event: RunEvent = {
@@ -1883,24 +1900,67 @@ export class RunStore {
     });
   }
 
-  async recordAwaitingRemote(runId: string): Promise<IntegrationRecord> {
+  async requestRemoteAction(
+    input: RequestRemoteActionInput,
+  ): Promise<IntegrationRecord> {
     return this.withMutation(async () => {
-      const persisted = await this.readPersistedRun(runId);
+      const persisted = await this.readPersistedRun(input.run_id);
       const current = persisted.integration;
       if (
+        persisted.run.state === "waiting_user" &&
+        current?.state === "awaiting_remote" &&
+        current.remote_action?.status === "pending"
+      ) {
+        return current;
+      }
+      if (
         persisted.run.state !== "verifying" ||
-        current?.state !== "verified" ||
-        current.strategy !== "pull_request"
+        (current?.state !== "verified" &&
+          !(
+            current?.state === "awaiting_remote" &&
+            current.remote_action?.status === "cancelled"
+          )) ||
+        current.strategy !== "pull_request" ||
+        current.integration_commit_sha === null
       ) {
         throw new ArkTeamError(
           "INVALID_TRANSITION",
           "Remote handoff requires a verified pull-request integration",
         );
       }
+      const remoteName = input.remote_name.trim();
+      const repository = input.repository.trim();
+      if (
+        !/^[A-Za-z0-9._-]{1,100}$/.test(remoteName) ||
+        !/^[^\s/]+\/[^\s/]+$/.test(repository)
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "remote action requires a safe remote name and owner/repository",
+        );
+      }
       const timestamp = this.now().toISOString();
+      const remoteAction: RemoteActionRecord = {
+        schema_version: 1,
+        request_id: randomUUID(),
+        action: "push_and_create_pull_request",
+        remote_name: remoteName,
+        repository,
+        branch: current.branch,
+        target_branch: current.target_branch,
+        commit_sha: current.integration_commit_sha,
+        status: "pending",
+        attempt_count: 0,
+        requested_at: timestamp,
+        approved_at: null,
+        completed_at: null,
+        pull_request_url: null,
+        last_error: null,
+      };
       const integration: IntegrationRecord = {
         ...current,
         state: "awaiting_remote",
+        remote_action: remoteAction,
         updated_at: timestamp,
         revision: current.revision + 1,
       };
@@ -1911,12 +1971,370 @@ export class RunStore {
         event_type: "integration.awaiting_remote",
         timestamp,
         state: "waiting_user",
+        remote_request_id: remoteAction.request_id,
         message: "Verified integration is waiting for remote-action approval",
       };
       const run: RunRecord = {
         ...persisted.run,
         state: "waiting_user",
         resume_state: "verifying",
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return integration;
+    });
+  }
+
+  async approveRemoteAction(
+    runId: string,
+    requestId: string,
+  ): Promise<IntegrationRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = persisted.integration;
+      const remote = current?.remote_action;
+      if (
+        persisted.run.state !== "waiting_user" ||
+        current?.state !== "awaiting_remote" ||
+        remote?.status !== "pending" ||
+        remote.request_id !== requestId
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "remote request ID is unknown or already resolved",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const integration: IntegrationRecord = {
+        ...current,
+        state: "remote_executing",
+        remote_action: {
+          ...remote,
+          status: "approved",
+          approved_at: timestamp,
+          last_error: null,
+        },
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "integration.remote_approved",
+        timestamp,
+        state: "verifying",
+        remote_request_id: requestId,
+        remote_decision: "approve_once",
+        message: "One exact push and pull-request action approved",
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        state: "verifying",
+        resume_state: null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return integration;
+    });
+  }
+
+  async cancelRemoteAction(
+    runId: string,
+    requestId: string,
+  ): Promise<IntegrationRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = persisted.integration;
+      const remote = current?.remote_action;
+      if (
+        persisted.run.state !== "waiting_user" ||
+        current?.state !== "awaiting_remote" ||
+        remote?.status !== "pending" ||
+        remote.request_id !== requestId
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "remote request ID is unknown or already resolved",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const integration: IntegrationRecord = {
+        ...current,
+        remote_action: {
+          ...remote,
+          status: "cancelled",
+          completed_at: timestamp,
+          last_error: "User cancelled the remote action",
+        },
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const events: RunEvent[] = [
+        {
+          schema_version: 1,
+          sequence: persisted.run.event_count + 1,
+          event_id: randomUUID(),
+          event_type: "integration.remote_cancelled",
+          timestamp,
+          state: "cancelled",
+          remote_request_id: requestId,
+          remote_decision: "cancel_run",
+          message: "User cancelled the remote action; local artifacts preserved",
+        },
+        {
+          schema_version: 1,
+          sequence: persisted.run.event_count + 2,
+          event_id: randomUUID(),
+          event_type: "run.cancelled",
+          timestamp,
+          state: "cancelled",
+          message: "Ark Team run cancelled before remote mutation",
+        },
+      ];
+      const run: RunRecord = {
+        ...persisted.run,
+        state: "cancelled",
+        resume_state: "verifying",
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + events.length,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, ...events],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return integration;
+    });
+  }
+
+  async beginRemoteAttempt(
+    runId: string,
+    requestId: string,
+  ): Promise<IntegrationRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = persisted.integration;
+      const remote = current?.remote_action;
+      if (
+        persisted.run.state !== "verifying" ||
+        current?.state !== "remote_executing" ||
+        (remote?.status !== "approved" && remote?.status !== "executing") ||
+        remote.request_id !== requestId ||
+        remote.attempt_count >= 3
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "remote execution is not approved for another attempt",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const integration: IntegrationRecord = {
+        ...current,
+        remote_action: {
+          ...remote,
+          status: "executing",
+          attempt_count: remote.attempt_count + 1,
+          last_error: null,
+        },
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "integration.remote_attempt",
+        timestamp,
+        state: "verifying",
+        remote_request_id: requestId,
+        message: `Remote action attempt ${integration.remote_action?.attempt_count ?? 0} started`,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return integration;
+    });
+  }
+
+  async failRemoteAttempt(
+    runId: string,
+    requestId: string,
+    rawError: string,
+  ): Promise<IntegrationRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = persisted.integration;
+      const remote = current?.remote_action;
+      if (
+        persisted.run.state !== "verifying" ||
+        current?.state !== "remote_executing" ||
+        remote?.status !== "executing" ||
+        remote.request_id !== requestId
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "remote attempt failure does not match the active request",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const message =
+        rawError.trim().slice(0, 1000) || "Remote action failed";
+      const exhausted = remote.attempt_count >= 3;
+      const nextRemote: RemoteActionRecord = exhausted
+        ? {
+            ...remote,
+            request_id: randomUUID(),
+            status: "pending",
+            attempt_count: 0,
+            requested_at: timestamp,
+            approved_at: null,
+            completed_at: null,
+            pull_request_url: null,
+            last_error: message,
+          }
+        : {
+            ...remote,
+            status: "approved",
+            last_error: message,
+          };
+      const integration: IntegrationRecord = {
+        ...current,
+        state: exhausted ? "awaiting_remote" : "remote_executing",
+        remote_action: nextRemote,
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "integration.remote_failed",
+        timestamp,
+        state: exhausted ? "waiting_user" : "verifying",
+        remote_request_id: nextRemote.request_id,
+        message: exhausted
+          ? `Remote action exhausted three attempts; fresh approval required: ${message}`
+          : `Remote action attempt failed and remains approved for retry: ${message}`,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        state: exhausted ? "waiting_user" : "verifying",
+        resume_state: exhausted ? "verifying" : null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return integration;
+    });
+  }
+
+  async completeRemoteAction(
+    input: CompleteRemoteActionInput,
+  ): Promise<IntegrationRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(input.run_id);
+      const current = persisted.integration;
+      const remote = current?.remote_action;
+      let pullRequestUrl: URL;
+      try {
+        pullRequestUrl = new URL(input.pull_request_url);
+      } catch (error) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "remote result requires a valid pull-request URL",
+          { cause: error },
+        );
+      }
+      if (
+        pullRequestUrl.protocol !== "https:" ||
+        pullRequestUrl.hostname.toLowerCase() !== "github.com" ||
+        persisted.run.state !== "verifying" ||
+        current?.state !== "remote_executing" ||
+        remote?.status !== "executing" ||
+        remote.request_id !== input.request_id ||
+        !pullRequestMatchesRepository(
+          pullRequestUrl,
+          remote.repository,
+        )
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "remote completion does not match the executing approved request",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const integration: IntegrationRecord = {
+        ...current,
+        state: "remote_completed",
+        remote_action: {
+          ...remote,
+          status: "completed",
+          completed_at: timestamp,
+          pull_request_url: pullRequestUrl.toString(),
+          last_error: null,
+        },
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "integration.remote_completed",
+        timestamp,
+        state: "verifying",
+        remote_request_id: input.request_id,
+        message: `Pull request created or adopted: ${pullRequestUrl.toString()}`,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
         updated_at: timestamp,
         revision: persisted.run.revision + 1,
         event_count: persisted.run.event_count + 1,
@@ -1942,7 +2360,8 @@ export class RunStore {
       const expectedTeamIds = persisted.teams.map((team) => team.team_id);
       if (
         persisted.run.state !== "verifying" ||
-        integration?.state !== "local_merged" ||
+        (integration?.state !== "local_merged" &&
+          integration?.state !== "remote_completed") ||
         pmSession === null ||
         pmSession.session_id !== input.session_id ||
         input.report.status !== "completed" ||
@@ -1956,7 +2375,7 @@ export class RunStore {
       ) {
         throw new ArkTeamError(
           "AGENT_SESSION_PROTOCOL_ERROR",
-          "PM final report does not accept the verified local integration",
+          "PM final report does not accept the verified integration",
         );
       }
       const timestamp = this.now().toISOString();
@@ -1967,6 +2386,13 @@ export class RunStore {
         final_usage: input.usage,
         completed_at: timestamp,
       };
+      const cleaningIntegration: IntegrationRecord = {
+        ...integration,
+        state: "cleaning",
+        cleanup_error: null,
+        updated_at: timestamp,
+        revision: integration.revision + 1,
+      };
       const events: RunEvent[] = [
         {
           schema_version: 1,
@@ -1974,7 +2400,7 @@ export class RunStore {
           event_id: randomUUID(),
           event_type: "pm.completed",
           timestamp,
-          state: "completed",
+          state: "cleaning",
           agent_role: "pm",
           usage: input.usage,
           message: "PM accepted the integrated result",
@@ -1983,15 +2409,15 @@ export class RunStore {
           schema_version: 1,
           sequence: persisted.run.event_count + 2,
           event_id: randomUUID(),
-          event_type: "run.completed",
+          event_type: "integration.cleanup_started",
           timestamp,
-          state: "completed",
-          message: "Ark Team run completed",
+          state: "cleaning",
+          message: "Verified worktree cleanup started",
         },
       ];
       const run: RunRecord = {
         ...persisted.run,
-        state: "completed",
+        state: "cleaning",
         resume_state: null,
         updated_at: timestamp,
         revision: persisted.run.revision + 1,
@@ -2009,6 +2435,184 @@ export class RunStore {
         })),
         plan: persisted.plan,
         pm_session: completedPm,
+        integration: cleaningIntegration,
+      });
+      return run;
+    });
+  }
+
+  async recordTeamCleaned(
+    runId: string,
+    teamId: string,
+  ): Promise<TeamRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const integration = persisted.integration;
+      const current = persisted.teams.find((team) => team.team_id === teamId);
+      if (
+        persisted.run.state !== "cleaning" ||
+        integration?.state !== "cleaning" ||
+        current === undefined ||
+        (current.state !== "integrated" && current.state !== "cleaned")
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "team cleanup does not match a PM-accepted integration",
+        );
+      }
+      if (current.state === "cleaned") {
+        return current;
+      }
+      const timestamp = this.now().toISOString();
+      const team: TeamRecord = {
+        ...current,
+        state: "cleaned",
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const teams = persisted.teams.map((candidate) =>
+        candidate.team_id === teamId ? team : candidate,
+      );
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "team.cleaned",
+        timestamp,
+        state: "cleaning",
+        team_id: teamId,
+        message: `Removed verified team worktree and preserved ${team.branch}`,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return team;
+    });
+  }
+
+  async recordCleanupFailure(
+    runId: string,
+    rawError: string,
+  ): Promise<IntegrationRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = persisted.integration;
+      if (
+        persisted.run.state !== "cleaning" ||
+        current?.state !== "cleaning"
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "cleanup failure does not match an active cleanup phase",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const message =
+        rawError.trim().slice(0, 1000) || "Verified worktree cleanup failed";
+      const integration: IntegrationRecord = {
+        ...current,
+        cleanup_error: message,
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "integration.cleanup_failed",
+        timestamp,
+        state: "cleaning",
+        message,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration,
+      });
+      return integration;
+    });
+  }
+
+  async completeCleanup(runId: string): Promise<RunRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = persisted.integration;
+      if (
+        persisted.run.state !== "cleaning" ||
+        current?.state !== "cleaning" ||
+        persisted.teams.some((team) => team.state !== "cleaned")
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "cleanup completion requires every registered team worktree",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const integration: IntegrationRecord = {
+        ...current,
+        state: "cleaned",
+        cleanup_error: null,
+        cleaned_at: timestamp,
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const events: RunEvent[] = [
+        {
+          schema_version: 1,
+          sequence: persisted.run.event_count + 1,
+          event_id: randomUUID(),
+          event_type: "integration.cleaned",
+          timestamp,
+          state: "cleaning",
+          message: `Removed integration worktree and preserved ${integration.branch}`,
+        },
+        {
+          schema_version: 1,
+          sequence: persisted.run.event_count + 2,
+          event_id: randomUUID(),
+          event_type: "run.completed",
+          timestamp,
+          state: "completed",
+          message: "Ark Team run completed after verified cleanup",
+        },
+      ];
+      const run: RunRecord = {
+        ...persisted.run,
+        state: "completed",
+        resume_state: null,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + events.length,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, ...events],
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
         integration,
       });
       return run;
@@ -2430,12 +3034,35 @@ function invalidTransition(operation: string, state: RunState): ArkTeamError {
 }
 
 function assertRunAcceptsAssignments(state: RunState): void {
-  if (state === "paused" || state === "cancelled" || state === "completed" || state === "failed") {
+  if (
+    state === "cleaning" ||
+    state === "paused" ||
+    state === "cancelled" ||
+    state === "completed" ||
+    state === "failed"
+  ) {
     throw new ArkTeamError(
       "INVALID_TRANSITION",
       `Cannot start an assignment while the run is ${state}`,
     );
   }
+}
+
+function pullRequestMatchesRepository(
+  url: URL,
+  repository: string,
+): boolean {
+  const [owner, name] = repository.split("/");
+  const parts = url.pathname.split("/").filter(Boolean);
+  return (
+    owner !== undefined &&
+    name !== undefined &&
+    parts.length === 4 &&
+    parts[0]?.toLowerCase() === owner.toLowerCase() &&
+    parts[1]?.toLowerCase() === name.toLowerCase() &&
+    parts[2] === "pull" &&
+    /^[1-9]\d*$/.test(parts[3] ?? "")
+  );
 }
 
 function findAssignment(

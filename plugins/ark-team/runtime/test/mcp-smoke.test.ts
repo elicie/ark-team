@@ -109,6 +109,7 @@ test("TEST-006 exposes lifecycle tools and persists a run through MCP", async ()
       "ark_team_logs",
       "ark_team_pause",
       "ark_team_plan_apply",
+      "ark_team_remote_decide",
       "ark_team_resume",
       "ark_team_start",
       "ark_team_status",

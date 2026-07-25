@@ -145,6 +145,32 @@ test("TEST-702 rejects unsafe repositories, roots, paths, and branches", async (
       ),
       workspaceFailure,
     );
+
+    const movedRun = await fixture.store.createRun({
+      objective: "Reject moved registered worktree cleanup",
+      project_path: fixture.project,
+    });
+    const manager = new WorktreeManager({ root_path: fixture.worktrees });
+    const [movedWorkspace] = await manager.prepare(
+      movedRun,
+      planFor("team-f"),
+    );
+    assert.notEqual(movedWorkspace, undefined);
+    const movedPath = path.join(
+      fixture.worktrees,
+      movedRun.run_id,
+      "team-f-moved",
+    );
+    await git(fixture.project, [
+      "worktree",
+      "move",
+      movedWorkspace?.working_directory ?? "",
+      movedPath,
+    ]);
+    await assert.rejects(
+      manager.cleanup(fixture.project, movedWorkspace!),
+      unsafeWorkspace,
+    );
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

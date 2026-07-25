@@ -25,7 +25,7 @@ import {
 import type { PmPlan } from "../src/role-contracts.js";
 import { RunStore } from "../src/state-store.js";
 
-test("TEST-805 exposes automatic PM planning and materialization through MCP", async () => {
+test("TEST-805 and TEST-1207 expose PM planning and remote decisions through MCP", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "ark-team-orchestrator-mcp-"));
   const project = path.join(root, "project");
   await mkdir(project);
@@ -104,6 +104,26 @@ test("TEST-805 exposes automatic PM planning and materialization through MCP", a
     assert.equal(advancedPayload?.progressed, false);
     assert.equal(advancedPayload?.waiting_approvals, 0);
     assert.equal(advancedPayload?.waiting_retries, 0);
+
+    const remoteDecision = await client.callTool({
+      name: "ark_team_remote_decide",
+      arguments: {
+        run_id: (
+          executed.structuredContent as
+            | { run?: { run_id?: string } }
+            | undefined
+        )?.run?.run_id,
+        request_id: "55555555-5555-4555-8555-555555555555",
+        decision: "approve_once",
+      },
+    });
+    assert.equal(remoteDecision.isError, undefined);
+    assert.deepEqual(coordinator.remoteDecisions, [
+      {
+        requestId: "55555555-5555-4555-8555-555555555555",
+        decision: "approve_once",
+      },
+    ]);
   } finally {
     await client.close();
     await server.close();
@@ -140,6 +160,11 @@ class FakePmLauncher implements ManagedPmLauncher {
 }
 
 class SnapshotCoordinator implements TeamExecutionCoordinator {
+  readonly remoteDecisions: Array<{
+    requestId: string;
+    decision: "approve_once" | "cancel_run";
+  }> = [];
+
   constructor(private readonly store: RunStore) {}
 
   async advance(runId: string) {
@@ -150,6 +175,20 @@ class SnapshotCoordinator implements TeamExecutionCoordinator {
       progressed: false,
       waiting_approvals: 0,
       waiting_retries: 0,
+    };
+  }
+
+  async decideRemote(
+    runId: string,
+    requestId: string,
+    decision: "approve_once" | "cancel_run",
+  ) {
+    this.remoteDecisions.push({ requestId, decision });
+    return {
+      ...(await this.advance(runId)),
+      integration: null,
+      pm_report: null,
+      remote_action_required: false,
     };
   }
 }

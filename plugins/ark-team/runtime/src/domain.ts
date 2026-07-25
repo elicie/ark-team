@@ -17,6 +17,7 @@ export const runStateSchema = z.enum([
   "executing",
   "integrating",
   "verifying",
+  "cleaning",
   "waiting_user",
   "paused",
   "completed",
@@ -330,27 +331,113 @@ export const integrationStateSchema = z.enum([
   "verified",
   "local_merged",
   "awaiting_remote",
+  "remote_executing",
+  "remote_completed",
+  "cleaning",
+  "cleaned",
   "failed",
 ]);
 
-export const integrationRecordSchema = z.object({
+export const remoteActionRecordSchema = z.object({
   schema_version: z.literal(1),
-  run_id: z.string().regex(RUN_ID_PATTERN),
-  strategy: z.enum(["local_merge", "pull_request"]),
-  team_ids: z.array(z.string().regex(TEAM_ID_PATTERN)).min(1).max(4),
-  working_directory: z.string().min(1),
+  request_id: z.string().uuid(),
+  action: z.literal("push_and_create_pull_request"),
+  remote_name: z.string().min(1).max(100),
+  repository: z.string().min(3).max(300),
   branch: z.string().min(1),
   target_branch: z.string().min(1),
-  base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),
-  state: integrationStateSchema,
-  assignment_id: z.string().regex(ASSIGNMENT_ID_PATTERN).nullable(),
-  integration_commit_sha: z.string().regex(/^[0-9a-f]{40,64}$/).nullable(),
-  created_at: z.string().min(1),
-  updated_at: z.string().min(1),
-  verified_at: z.string().min(1).nullable(),
-  merged_at: z.string().min(1).nullable(),
-  revision: z.number().int().positive(),
+  commit_sha: z.string().regex(/^[0-9a-f]{40,64}$/),
+  status: z.enum([
+    "pending",
+    "approved",
+    "executing",
+    "completed",
+    "cancelled",
+  ]),
+  attempt_count: z.number().int().min(0).max(3),
+  requested_at: z.string().min(1),
+  approved_at: z.string().min(1).nullable(),
+  completed_at: z.string().min(1).nullable(),
+  pull_request_url: z.string().url().nullable(),
+  last_error: z.string().min(1).max(1000).nullable(),
 });
+
+export type RemoteActionRecord = z.infer<typeof remoteActionRecordSchema>;
+
+export const integrationRecordSchema = z
+  .object({
+    schema_version: z.literal(1),
+    run_id: z.string().regex(RUN_ID_PATTERN),
+    strategy: z.enum(["local_merge", "pull_request"]),
+    team_ids: z.array(z.string().regex(TEAM_ID_PATTERN)).min(1).max(4),
+    working_directory: z.string().min(1),
+    branch: z.string().min(1),
+    target_branch: z.string().min(1),
+    base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),
+    state: integrationStateSchema,
+    assignment_id: z.string().regex(ASSIGNMENT_ID_PATTERN).nullable(),
+    integration_commit_sha: z.string().regex(/^[0-9a-f]{40,64}$/).nullable(),
+    created_at: z.string().min(1),
+    updated_at: z.string().min(1),
+    verified_at: z.string().min(1).nullable(),
+    merged_at: z.string().min(1).nullable(),
+    remote_action: remoteActionRecordSchema.nullable().default(null),
+    cleanup_error: z.string().min(1).max(1000).nullable().default(null),
+    cleaned_at: z.string().min(1).nullable().default(null),
+    revision: z.number().int().positive(),
+  })
+  .superRefine((integration, context) => {
+    if (
+      integration.strategy === "local_merge" &&
+      integration.remote_action !== null
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "local integration cannot retain a remote action",
+      });
+    }
+    const remoteStatus = integration.remote_action?.status ?? null;
+    if (
+      (integration.state === "awaiting_remote" &&
+        remoteStatus !== "pending" &&
+        remoteStatus !== "cancelled") ||
+      (integration.state === "remote_executing" &&
+        remoteStatus !== "approved" &&
+        remoteStatus !== "executing") ||
+      (integration.state === "remote_completed" &&
+        remoteStatus !== "completed")
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "remote integration state does not match its action record",
+      });
+    }
+    if (
+      integration.cleaned_at !== null &&
+      integration.state !== "cleaned"
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "only a cleaned integration may have cleaned_at",
+      });
+    }
+    if (integration.state === "cleaned" && integration.cleaned_at === null) {
+      context.addIssue({
+        code: "custom",
+        message: "cleaned integration requires cleaned_at",
+      });
+    }
+    if (
+      integration.strategy === "pull_request" &&
+      (integration.state === "cleaning" || integration.state === "cleaned") &&
+      remoteStatus !== "completed"
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "pull-request cleanup requires a completed remote action",
+      });
+    }
+  });
 
 export type IntegrationRecord = z.infer<typeof integrationRecordSchema>;
 
@@ -407,6 +494,14 @@ export const runEventSchema = z.object({
     "integration.verified",
     "integration.local_merged",
     "integration.awaiting_remote",
+    "integration.remote_approved",
+    "integration.remote_cancelled",
+    "integration.remote_attempt",
+    "integration.remote_failed",
+    "integration.remote_completed",
+    "integration.cleanup_started",
+    "integration.cleanup_failed",
+    "integration.cleaned",
     "pm.completed",
     "run.completed",
     "assignment.started",
@@ -433,6 +528,8 @@ export const runEventSchema = z.object({
   retry_request_id: z.string().uuid().optional(),
   retry_kind: retryRequestKindSchema.optional(),
   retry_decision: z.enum(["retry_once", "cancel_run"]).optional(),
+  remote_request_id: z.string().uuid().optional(),
+  remote_decision: z.enum(["approve_once", "cancel_run"]).optional(),
   session_attempt_count: z.number().int().positive().optional(),
   correction_count: z.number().int().nonnegative().optional(),
   report_target: reportTargetSchema.optional(),

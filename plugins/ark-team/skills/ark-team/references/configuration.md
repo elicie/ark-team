@@ -130,6 +130,7 @@ The current bundled control-plane slice exposes these MCP tools:
 - `ark_team_resume`
 - `ark_team_cancel`
 - `ark_team_plan_apply`
+- `ark_team_remote_decide`
 - `ark_team_team_list`
 - `ark_team_assignment_start`
 - `ark_team_assignment_list`
@@ -152,8 +153,14 @@ clean reported commit, and applies the plan strategy. A clean `local_merge`
 uses fast-forward only when the original branch and HEAD remain unchanged,
 then the original Sol PM session resumes for strict `pm_report`. A
 `pull_request` strategy stops at verified local state with
-`remote_action_required`; this slice never pushes or creates a PR. The run
-lifecycle tools persist and control orchestration records.
+`remote_action_required` after read-only validation of a supported
+`github.com` remote and authenticated GitHub CLI. The runtime persists the
+exact remote/branch/target/commit tuple and pushes or creates/adopts the PR
+only after `ark_team_remote_decide` receives the current request ID and
+explicit `approve_once`. `cancel_run` preserves local artifacts. The run
+lifecycle tools persist and control orchestration records. Resuming a
+remote-cancelled run performs read-only inspection again and creates a fresh
+request ID.
 `ark_team_plan_apply` accepts one strict `pm_plan`, requires a clean Git
 repository root, creates up to four linked team worktrees and preserved local
 branches, and atomically records their base commit and contracts.
@@ -180,6 +187,11 @@ outside the project checkout. Plan application rejects dirty repositories,
 non-Git projects, nested project paths, existing target paths, and existing
 team branches.
 
+Pull-request mode currently accepts only `github.com` remotes and uses the
+authenticated GitHub CLI on `PATH`. Set `ARK_TEAM_GH_PATH` to an alternate
+executable path. Remote inspection is read-only and occurs before the runtime
+creates an approval request.
+
 Retain every assignment ID. Read `ark_team_assignment_status` or
 `ark_team_assignment_list` for stored reports and usage. When the state is
 `waiting_user`, distinguish its request type. For `pending_approval`, call
@@ -189,6 +201,11 @@ user's explicit decision. For `pending_retry`, report the reason,
 `ark_team_assignment_retry_decide` with its opaque ID and explicit
 `retry_once` or `cancel_run` choice. Then call `ark_team_advance` to continue
 dependency-ready work and same-thread PL reporting.
+For a pending integration `remote_action`, report its repository, remote,
+source branch, target branch, commit, and opaque request ID. Use
+`ark_team_remote_decide` only with the user's explicit `approve_once` or
+`cancel_run`. Approved execution receives three idempotent attempts for the
+same tuple; exhaustion creates a fresh request and requires a new decision.
 
 The scheduler records interim PL worker plans for the controller, worker
 reports for the owning PL, and final PL reports for PM. A team is completed
@@ -198,7 +215,10 @@ cross-team verification, local fast-forward, and PM final review are handled by
 the managed integration coordinator. The original checkout must still be
 clean, attached to its recorded branch, and at the common base commit. Team
 worktrees must be clean and every team branch must descend from that base.
-Integration and team worktrees remain until the later cleanup stage.
+After PM acceptance, the coordinator removes only clean registered worktrees
+whose branches remain contained by the accepted integration. It preserves all
+local branches, records each cleanup, safely resumes partial cleanup, and marks
+the run completed only after the integration worktree is also removed.
 Pending approvals remain persisted but cannot yet be reattached after an MCP
 process restart.
 
