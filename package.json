@@ -17,6 +17,7 @@
     "verify:app-server-schema": "node plugins/ark-team/runtime/scripts/verify-app-server-schema.mjs",
     "verify:approval-gateway": "tsx plugins/ark-team/runtime/scripts/probe-approval-gateway.ts",
     "verify:managed-sessions": "tsx plugins/ark-team/runtime/scripts/probe-managed-sessions.ts",
+    "verify:installed-plugin": "node plugins/ark-team/runtime/scripts/verify-installed-plugin.mjs",
     "validate": "npm test"
   },
   "dependencies": {
