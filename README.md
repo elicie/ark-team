@@ -290,6 +290,28 @@ The skill intentionally does not trigger for ordinary single-agent requests.
 Start a new Codex conversation after adding or changing project custom-agent
 files so the process reloads their definitions.
 
+## Install globally from this repository
+
+This repository is also a Codex plugin marketplace. Install the source once,
+then install the plugin:
+
+```sh
+codex plugin marketplace add elicie/ark-team --ref main
+codex plugin add ark-team@ark-team-marketplace
+```
+
+Confirm the globally installed and enabled plugin:
+
+```sh
+codex plugin list --available --json
+```
+
+After publishing an update, refresh the marketplace and reinstall or update
+the plugin using the Codex plugin commands shown by the current CLI. Start a
+new Codex session so it reloads the skill and MCP server. Global installation
+provides the runtime and `$ark-team`; each target project continues to control
+its own safe overrides through `.codex/team-orchestrator.toml`.
+
 ## Reference from another repository
 
 Create a project-scoped symbolic link to the canonical skill:

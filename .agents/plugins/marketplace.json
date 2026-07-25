@@ -1,0 +1,20 @@
+{
+  "name": "ark-team-marketplace",
+  "interface": {
+    "displayName": "Ark Team"
+  },
+  "plugins": [
+    {
+      "name": "ark-team",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ark-team"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
