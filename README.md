@@ -159,7 +159,8 @@ Managed assignment records live in the same atomic run record. Each record
 retains its team and parent PL, linked worktree, state, session and turn IDs,
 task key and output contract, one pending approval or retry request, routed
 structured report, attempt/correction/turn counts, and token usage. Logs record
-observable state changes and usage, not raw model reasoning or event history.
+observable state changes, approval source (`user` or `routine_policy`), and
+usage, not raw model reasoning or event history.
 
 The scheduler enforces one PL per team, at most four teams per run, and at most
 five workers per PL. Workers use the same team worktree and identify their
@@ -258,11 +259,17 @@ either:
   or
 - `completed`, with the final role report and token usage.
 
-Call `decide()` with `approve_once`, `approve_session`, `decline`, or `cancel`
-only after obtaining the required user decision. The object continues waiting
-on the same thread and turn. It rejects PM sessions and writer directories that
-are not linked Git worktree roots. It does not persist a pending approval after
-the controller process exits.
+The low-level session never auto-approves a request. The persistent assignment
+scheduler may issue `approve_once` only for an exact command in the registered
+assignment worktree: `npm ci`, bounded npm test commands, staging recorded
+team-owned paths, a local commit with an inert message, or an integration merge
+of a recorded team branch. At most four individually valid routine commands
+may be joined with exact ` && ` separators. Push, reset, clean, deploy,
+permission, file-change, every other shell composition, and every non-matching
+request still require an explicit user decision through `decide()`. The object
+continues waiting on the same thread and turn. It rejects PM sessions and writer
+directories that are not linked Git worktree roots. It does not persist a
+pending approval after the controller process exits.
 
 Check protocol compatibility without consuming model usage:
 

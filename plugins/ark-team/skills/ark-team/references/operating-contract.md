@@ -171,11 +171,23 @@ Allow without additional approval:
 
 Follow any stricter repository, system, or user instruction.
 
-For an interactive managed writer session, treat every surfaced approval as a
-single unresolved `waiting_user` state. Do not answer it automatically. Resume
-the same turn only after the user selects one-time approval, session approval,
-decline, or cancel. Treat an expired, unknown, or already resolved approval ID
-as an error instead of replaying the decision.
+For an interactive managed writer session, the controller may automatically
+deliver one-time approval only for a command it independently validates as a
+routine operation in the exact registered worktree: lockfile-pinned `npm ci`,
+bounded local test scripts, `git add` limited to recorded team-owned paths,
+an inert-message local `git commit`, or an integration-PL merge of an exact
+recorded team branch. Up to four commands may be joined by exact ` && `
+separators only when every component independently passes those checks.
+Persist the request and its `routine_policy` decision before delivery. Never
+grant session-wide approval through this policy.
+
+Treat every other surfaced approval as one unresolved `waiting_user` state.
+Resume the same turn only after the user selects one-time approval, session
+approval, decline, or cancel. Push, reset, clean, broad staging, arbitrary
+or partially validated shell composition, wrong-worktree commands, file
+changes, and permission
+expansion must never match the routine policy. Treat an expired, unknown, or
+already resolved approval ID as an error instead of replaying the decision.
 
 If a controller restart destroys the live approval channel, never treat the
 persisted ID as an approvable wire request. Recover only through the explicit

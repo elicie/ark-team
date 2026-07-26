@@ -93,9 +93,116 @@ test("TEST-503 persists start, approval wait, decision, and completion", async (
     const completedEvent = logs.events.find(
       (event) => event.event_type === "assignment.completed",
     );
+    const approvalEvent = logs.events.find(
+      (event) => event.event_type === "assignment.approval_resolved",
+    );
+    assert.equal(approvalEvent?.approval_source, "user");
     assert.deepEqual(completedEvent?.usage, usage);
     assert.equal("final_report" in (completedEvent ?? {}), false);
     assert.equal("private_reasoning" in (completedEvent ?? {}), false);
+  });
+});
+
+test("TEST-1603 and TEST-1605 auto-resolve routine tests once and audit policy origin", async () => {
+  await withSchedulerFixture(async ({ stateRoot, worktree }) => {
+    const store = deterministicStore(stateRoot);
+    const run = await store.createRun({
+      objective: "Run routine verification without interrupting the user",
+      project_path: worktree,
+    });
+    let persistedBeforeDelivery = false;
+    const session = new ScriptedSession(
+      [
+        routineWaitingUpdate("pl", APPROVAL_ID, "npm test", worktree),
+        completedUpdate("pl", "ROUTINE_TEST_COMPLETE"),
+      ],
+      async () => {
+        const assignments = (await store.listAssignments(run.run_id)).assignments;
+        assert.equal(
+          assignments[0]?.pending_approval?.resolution?.source,
+          "routine_policy",
+        );
+        const logs = await store.getLogs(run.run_id, { limit: 200 });
+        assert.equal(
+          logs.events.at(-1)?.event_type,
+          "assignment.approval_resolved",
+        );
+        persistedBeforeDelivery = true;
+      },
+    );
+    const scheduler = new ManagedAssignmentScheduler(store, {
+      session_factory: () => session,
+    });
+
+    const completed = await scheduler.start({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Verify the bounded team result",
+      working_directory: worktree,
+    });
+    assert.equal(completed.state, "completed");
+    assert.equal(completed.final_report, "ROUTINE_TEST_COMPLETE");
+    assert.equal(persistedBeforeDelivery, true);
+    assert.equal(scheduler.hasLiveSession(completed.assignment_id), false);
+    assert.deepEqual(session.decisions, [
+      {
+        approval_id: APPROVAL_ID,
+        decision: "approve_once",
+      },
+    ]);
+
+    const reopened = new RunStore({ root_path: stateRoot });
+    const logs = await reopened.getLogs(run.run_id, { limit: 200 });
+    const approval = logs.events.find(
+      (event) => event.event_type === "assignment.approval_resolved",
+    );
+    assert.equal(approval?.approval_id, APPROVAL_ID);
+    assert.equal(approval?.approval_decision, "approve_once");
+    assert.equal(approval?.approval_source, "routine_policy");
+    assert.equal("private_reasoning" in (approval ?? {}), false);
+  });
+});
+
+test("TEST-1606 converges an expired live approval to a retryable session failure", async () => {
+  await withSchedulerFixture(async ({ stateRoot, worktree }) => {
+    const store = deterministicStore(stateRoot);
+    const run = await store.createRun({
+      objective: "Expire one persisted live approval",
+      project_path: worktree,
+    });
+    const scheduler = new ManagedAssignmentScheduler(store, {
+      session_factory: () => new ExpiredApprovalSession(),
+    });
+    const waiting = await scheduler.start({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Wait until this approval expires",
+      working_directory: worktree,
+    });
+
+    await assert.rejects(
+      scheduler.decide(
+        run.run_id,
+        waiting.assignment_id,
+        APPROVAL_ID,
+        "approve_once",
+      ),
+      (error: unknown) =>
+        error instanceof ArkTeamError &&
+        error.code === "AGENT_SESSION_FAILED",
+    );
+    const failed = await store.getAssignment(
+      run.run_id,
+      waiting.assignment_id,
+    );
+    assert.equal(failed.state, "failed");
+    assert.equal(failed.pending_approval, null);
+    assert.match(
+      failed.failure_message ?? "",
+      /rejected its persisted pending request/i,
+    );
   });
 });
 
@@ -594,7 +701,10 @@ class ScriptedSession implements ApprovalSessionHandle {
   readonly requests: ApprovalSessionRequest[] = [];
   close_count = 0;
 
-  constructor(private readonly updates: ApprovalSessionUpdate[]) {}
+  constructor(
+    private readonly updates: ApprovalSessionUpdate[],
+    private readonly beforeDecision?: () => Promise<void>,
+  ) {}
 
   async start(request: ApprovalSessionRequest): Promise<ApprovalSessionUpdate> {
     this.requests.push(request);
@@ -605,6 +715,7 @@ class ScriptedSession implements ApprovalSessionHandle {
     approvalId: string,
     decision: ApprovalDecision,
   ): Promise<ApprovalSessionUpdate> {
+    await this.beforeDecision?.();
     this.decisions.push({ approval_id: approvalId, decision });
     return this.takeUpdate();
   }
@@ -645,6 +756,21 @@ class BlockingSession implements ApprovalSessionHandle {
   }
 }
 
+class ExpiredApprovalSession implements ApprovalSessionHandle {
+  async start(_request: ApprovalSessionRequest): Promise<ApprovalSessionUpdate> {
+    return waitingUpdate("pl", APPROVAL_ID);
+  }
+
+  async decide(
+    _approvalId: string,
+    _decision: ApprovalDecision,
+  ): Promise<ApprovalSessionUpdate> {
+    throw new ArkTeamError("INVALID_INPUT", "no approval is currently pending");
+  }
+
+  async close(): Promise<void> {}
+}
+
 function waitingUpdate(
   role: "pl" | "worker",
   approvalId: string,
@@ -659,6 +785,27 @@ function waitingUpdate(
       kind: "command",
       reason: "dangerous command",
       command: "touch outside",
+    },
+  };
+}
+
+function routineWaitingUpdate(
+  role: "pl" | "worker",
+  approvalId: string,
+  command: string,
+  cwd: string,
+): ApprovalSessionUpdate {
+  return {
+    status: "waiting_user",
+    session_id: `${role}-session`,
+    turn_id: `${role}-turn`,
+    role,
+    approval: {
+      approval_id: approvalId,
+      kind: "command",
+      reason: "routine command",
+      command: `/usr/bin/zsh -lc '${command}'`,
+      cwd,
     },
   };
 }

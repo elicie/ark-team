@@ -103,6 +103,16 @@ interface UpdateWaiter {
 
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const INTERRUPT_GRACE_MS = 2000;
+const MAX_PRE_TURN_MESSAGES = 100;
+const TURN_SCOPED_METHODS = new Set([
+  "item/commandExecution/requestApproval",
+  "item/fileChange/requestApproval",
+  "item/permissions/requestApproval",
+  "item/completed",
+  "thread/tokenUsage/updated",
+  "turn/completed",
+  "model/rerouted",
+]);
 
 const threadStartResponseSchema = z.object({
   thread: z.object({
@@ -110,6 +120,7 @@ const threadStartResponseSchema = z.object({
   }),
   model: z.string().min(1),
   cwd: z.string().min(1),
+  runtimeWorkspaceRoots: z.array(z.string()).optional(),
   approvalPolicy: z.literal("on-request"),
   approvalsReviewer: z.literal("user"),
   sandbox: z.object({
@@ -237,6 +248,7 @@ export class AppServerApprovalSession {
   private pendingApproval: WireApproval | null = null;
   private finalReport = "";
   private usage: Usage | null = null;
+  private preTurnMessages: AppServerMessage[] = [];
   private updateQueue: ApprovalSessionUpdate[] = [];
   private updateWaiters: UpdateWaiter[] = [];
   private failure: ArkTeamError | null = null;
@@ -355,7 +367,11 @@ export class AppServerApprovalSession {
           `app-server selected a different working directory: ${threadResponse.cwd}`,
         );
       }
-      if (!threadResponse.sandbox.writableRoots.includes(workingDirectory)) {
+      const writableRoots = [
+        ...threadResponse.sandbox.writableRoots,
+        ...(threadResponse.runtimeWorkspaceRoots ?? []),
+      ];
+      if (!writableRoots.includes(workingDirectory)) {
         throw new ArkTeamError(
           "AGENT_SESSION_PROTOCOL_ERROR",
           "app-server workspace-write sandbox does not include the assigned worktree",
@@ -400,6 +416,7 @@ export class AppServerApprovalSession {
         }),
       );
       this.turnId = turnResponse.turn.id;
+      this.flushPreTurnMessages(resumeSessionId !== undefined);
     } catch (error) {
       await this.closeAfterFailure("Unable to start approval-gated Codex session", error);
     }
@@ -459,6 +476,16 @@ export class AppServerApprovalSession {
       return;
     }
     try {
+      if (this.turnId === null && TURN_SCOPED_METHODS.has(message.method)) {
+        if (this.preTurnMessages.length >= MAX_PRE_TURN_MESSAGES) {
+          throw new ArkTeamError(
+            "AGENT_SESSION_PROTOCOL_ERROR",
+            "app-server emitted too many turn messages before turn/start completed",
+          );
+        }
+        this.preTurnMessages.push(message);
+        return;
+      }
       if (
         message.method === "item/commandExecution/requestApproval" ||
         message.method === "item/fileChange/requestApproval" ||
@@ -495,6 +522,20 @@ export class AppServerApprovalSession {
     } catch (error) {
       this.fail("Invalid app-server protocol message", error);
       void this.cleanup();
+    }
+  }
+
+  private flushPreTurnMessages(resuming: boolean): void {
+    const activeTurnId = this.requireTurnId();
+    for (const message of this.preTurnMessages.splice(0)) {
+      const turnId = messageTurnId(message);
+      if (resuming && turnId !== null && turnId !== activeTurnId) {
+        continue;
+      }
+      this.handleMessage(message);
+      if (this.terminal) {
+        return;
+      }
     }
   }
 
@@ -787,6 +828,33 @@ export class AppServerApprovalSession {
     }
     return this.role;
   }
+}
+
+function messageTurnId(message: AppServerMessage): string | null {
+  if (
+    typeof message.params !== "object" ||
+    message.params === null ||
+    Array.isArray(message.params)
+  ) {
+    return null;
+  }
+  if (
+    "turnId" in message.params &&
+    typeof message.params.turnId === "string"
+  ) {
+    return message.params.turnId;
+  }
+  if (
+    "turn" in message.params &&
+    typeof message.params.turn === "object" &&
+    message.params.turn !== null &&
+    !Array.isArray(message.params.turn) &&
+    "id" in message.params.turn &&
+    typeof message.params.turn.id === "string"
+  ) {
+    return message.params.turn.id;
+  }
+  return null;
 }
 
 function approvalResponse(pending: WireApproval, decision: ApprovalDecision): unknown {

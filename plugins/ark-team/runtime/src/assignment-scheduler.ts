@@ -20,6 +20,7 @@ import {
   type RetryAssignmentInput,
   RunStore,
 } from "./state-store.js";
+import { isRoutineCommandApproval } from "./routine-approval.js";
 
 export interface ApprovalSessionHandle {
   start(request: ApprovalSessionRequest): Promise<ApprovalSessionUpdate>;
@@ -214,28 +215,37 @@ export class ManagedAssignmentScheduler {
       );
     }
 
+    await this.store.recordAssignmentApprovalResolution(
+      runId,
+      assignmentId,
+      {
+        approval_id: approvalId,
+        decision,
+        source: "user",
+      },
+    );
     try {
       const update = await live.session.decide(approvalId, decision);
-      const persisted = await this.store.recordAssignmentUpdate(
-        runId,
-        assignmentId,
+      const persisted = await this.persistAndResolveRoutineApprovals(
+        assignment,
+        live.session,
         update,
-        {
-          approval_id: approvalId,
-          decision,
-        },
       );
       if (persisted.state !== "waiting_user") {
         this.liveAssignments.delete(assignmentId);
       }
       return persisted;
     } catch (error) {
-      if (error instanceof ArkTeamError && error.code === "INVALID_INPUT") {
-        throw error;
-      }
       this.liveAssignments.delete(assignmentId);
-      await this.recordSessionFailure(assignment, error);
-      throw normalizeSessionFailure(error);
+      const normalized =
+        error instanceof ArkTeamError && error.code === "INVALID_INPUT"
+          ? sessionFailure(
+              "Live approval session rejected its persisted pending request",
+              error,
+            )
+          : normalizeSessionFailure(error);
+      await this.recordSessionFailure(assignment, normalized);
+      throw normalized;
     }
   }
 
@@ -406,9 +416,9 @@ export class ManagedAssignmentScheduler {
           ? {}
           : { output_contract: assignment.output_contract }),
       });
-      const persisted = await this.store.recordAssignmentUpdate(
-        assignment.run_id,
-        assignment.assignment_id,
+      const persisted = await this.persistAndResolveRoutineApprovals(
+        assignment,
+        session,
         update,
       );
       if (persisted.state !== "waiting_user") {
@@ -420,6 +430,52 @@ export class ManagedAssignmentScheduler {
       await this.recordSessionFailure(assignment, error);
       throw normalizeSessionFailure(error);
     }
+  }
+
+  private async persistAndResolveRoutineApprovals(
+    assignment: AssignmentRecord,
+    session: ApprovalSessionHandle,
+    firstUpdate: ApprovalSessionUpdate,
+  ): Promise<AssignmentRecord> {
+    let update = firstUpdate;
+    let persisted = await this.store.recordAssignmentUpdate(
+      assignment.run_id,
+      assignment.assignment_id,
+      update,
+    );
+    while (
+      update.status === "waiting_user" &&
+      persisted.state === "waiting_user" &&
+      persisted.pending_approval !== null
+    ) {
+      const teams = (await this.store.listTeams(assignment.run_id)).teams;
+      if (
+        !isRoutineCommandApproval({
+          assignment: persisted,
+          approval: persisted.pending_approval,
+          teams,
+        })
+      ) {
+        break;
+      }
+      const approvalId = persisted.pending_approval.approval_id;
+      await this.store.recordAssignmentApprovalResolution(
+        assignment.run_id,
+        assignment.assignment_id,
+        {
+          approval_id: approvalId,
+          decision: "approve_once",
+          source: "routine_policy",
+        },
+      );
+      update = await session.decide(approvalId, "approve_once");
+      persisted = await this.store.recordAssignmentUpdate(
+        assignment.run_id,
+        assignment.assignment_id,
+        update,
+      );
+    }
+    return persisted;
   }
 
   private async recordSessionFailure(

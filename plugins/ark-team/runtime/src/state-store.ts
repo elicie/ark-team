@@ -138,6 +138,7 @@ export interface ListAssignmentsInput {
 export interface ResolvedApproval {
   approval_id: string;
   decision: ApprovalDecision;
+  source: "user" | "routine_policy";
 }
 
 export interface MaterializePlanInput {
@@ -1789,11 +1790,84 @@ export class RunStore {
     };
   }
 
+  async recordAssignmentApprovalResolution(
+    runId: string,
+    assignmentId: string,
+    resolution: ResolvedApproval,
+  ): Promise<AssignmentRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const current = findAssignment(persisted, assignmentId);
+      if (
+        persisted.run.state !== "waiting_user" ||
+        current.state !== "waiting_user" ||
+        current.pending_approval?.approval_id !== resolution.approval_id ||
+        current.pending_approval.resolution !== null
+      ) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "approval_id is unknown or already resolved",
+        );
+      }
+
+      const timestamp = this.now().toISOString();
+      const assignment: AssignmentRecord = {
+        ...current,
+        pending_approval: {
+          ...current.pending_approval,
+          resolution: {
+            decision: resolution.decision,
+            source: resolution.source,
+            recorded_at: timestamp,
+          },
+        },
+        updated_at: timestamp,
+        revision: current.revision + 1,
+      };
+      const assignments = persisted.assignments.map((candidate) =>
+        candidate.assignment_id === assignmentId ? assignment : candidate,
+      );
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "assignment.approval_resolved",
+        timestamp,
+        state: "waiting_user",
+        assignment_id: assignment.assignment_id,
+        team_id: assignment.team_id,
+        agent_role: assignment.role,
+        approval_id: resolution.approval_id,
+        approval_decision: resolution.decision,
+        approval_source: resolution.source,
+        message:
+          resolution.source === "routine_policy"
+            ? "Routine assignment approval recorded before delivery"
+            : "User assignment approval decision recorded before delivery",
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        run,
+        events: [...persisted.events, event],
+        assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration: persisted.integration,
+      });
+      return assignment;
+    });
+  }
+
   async recordAssignmentUpdate(
     runId: string,
     assignmentId: string,
     update: ApprovalSessionUpdate,
-    resolvedApproval?: ResolvedApproval,
   ): Promise<AssignmentRecord> {
     return this.withMutation(async () => {
       const persisted = await this.readPersistedRun(runId);
@@ -1823,17 +1897,11 @@ export class RunStore {
           "session update does not match the persisted assignment session and turn",
         );
       }
-      if (resolvedApproval) {
-        if (
-          current.pending_approval?.approval_id !==
-          resolvedApproval.approval_id
-        ) {
-          throw new ArkTeamError(
-            "INVALID_INPUT",
-            "approval_id is unknown or already resolved",
-          );
-        }
-      } else if (current.state === "waiting_user") {
+      if (
+        current.state === "waiting_user" &&
+        (current.pending_approval === null ||
+          current.pending_approval.resolution === null)
+      ) {
         throw new ArkTeamError(
           "INVALID_INPUT",
           "a waiting assignment requires its current approval decision",
@@ -1852,7 +1920,10 @@ export class RunStore {
               state: "waiting_user",
               session_id: update.session_id,
               turn_id: update.turn_id,
-              pending_approval: update.approval,
+              pending_approval: {
+                ...update.approval,
+                resolution: null,
+              },
               pending_retry: null,
               updated_at: timestamp,
               revision: current.revision + 1,
@@ -1877,22 +1948,6 @@ export class RunStore {
       );
 
       const events: RunEvent[] = [];
-      if (resolvedApproval) {
-        events.push({
-          schema_version: 1,
-          sequence: 0,
-          event_id: randomUUID(),
-          event_type: "assignment.approval_resolved",
-          timestamp,
-          state: persisted.run.state,
-          assignment_id: assignment.assignment_id,
-          team_id: assignment.team_id,
-          agent_role: assignment.role,
-          approval_id: resolvedApproval.approval_id,
-          approval_decision: resolvedApproval.decision,
-          message: "Assignment approval decision delivered",
-        });
-      }
       if (update.status === "waiting_user") {
         events.push({
           schema_version: 1,

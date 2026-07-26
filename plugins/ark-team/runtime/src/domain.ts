@@ -78,6 +78,19 @@ export const pendingApprovalSchema = z.object({
   cwd: z.string().optional(),
   grant_root: z.string().optional(),
   requested_permissions: z.unknown().optional(),
+  resolution: z
+    .object({
+      decision: z.enum([
+        "approve_once",
+        "approve_session",
+        "decline",
+        "cancel",
+      ]),
+      source: z.enum(["user", "routine_policy"]),
+      recorded_at: z.string().min(1),
+    })
+    .nullable()
+    .default(null),
 });
 
 export const retryRequestKindSchema = z.enum([
@@ -544,6 +557,7 @@ export const runEventSchema = z.object({
   approval_decision: z
     .enum(["approve_once", "approve_session", "decline", "cancel"])
     .optional(),
+  approval_source: z.enum(["user", "routine_policy"]).optional(),
   usage: usageSchema.optional(),
 });
 

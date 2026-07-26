@@ -51,6 +51,7 @@ const requiredTokens = {
     "sandbox:",
     "reasoningEffort:",
   ],
+  "v2/TurnEnvironmentParams.ts": ["runtimeWorkspaceRoots?:"],
   "v2/TurnStartParams.ts": [
     "threadId:",
     "input:",

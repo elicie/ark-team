@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import type {
   IntegrationRecord,
   PmSessionRecord,
@@ -189,7 +191,10 @@ export function buildPmPlanningAssignment(
   const verificationCommands = resolveVerificationCommands(
     config,
     run.project_path,
-  );
+  ).map((command) => ({
+    argv: command.argv,
+    cwd: path.relative(run.project_path, command.cwd) || ".",
+  }));
   return [
     `Run ID: ${run.run_id}`,
     `User objective: ${run.objective}`,
@@ -197,7 +202,8 @@ export function buildPmPlanningAssignment(
     `Choose one to ${countWord(config.organization.max_teams)} teams dynamically.`,
     `Give each team ${countWord(config.organization.min_workers_per_team)} to ${countWord(config.organization.max_workers_per_team)} workers based on scope.`,
     "Define bounded missions, owned paths, dependencies, acceptance criteria, and verification.",
-    `Project verification commands (literal argv, no shell): ${JSON.stringify(verificationCommands)}`,
+    `Project verification commands (literal argv, no shell; cwd is relative to each assigned managed worktree): ${JSON.stringify(verificationCommands)}`,
+    "Keep verification cwd values relative in the plan. Every PL, worker, and integration PL must run them inside its assigned linked worktree, never in the original checkout.",
     "Choose local_merge when local Git integration is appropriate, pull_request only when a supported remote workflow is warranted, or no_git for a non-Git source.",
     "Do not edit files, create commits, merge, spawn agents, or perform external actions.",
   ].join("\n");

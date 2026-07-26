@@ -97,6 +97,27 @@ test("TEST-801 and TEST-802 execute the exact PM plan and persist usage only", a
   }
 });
 
+test("TEST-1607 keeps configured verification inside each managed worktree", () => {
+  const config = structuredClone(DEFAULT_PROJECT_CONFIG);
+  config.verification.commands = [
+    {
+      argv: ["npm", "test"],
+      cwd: ".",
+    },
+  ];
+  const assignment = buildPmPlanningAssignment(
+    {
+      run_id: "ark-20260726t000000z-abc123",
+      objective: "Verify one isolated implementation",
+      project_path: "/tmp/original-checkout",
+    },
+    config,
+  );
+  assert.match(assignment, /"argv":\["npm","test"\],"cwd":"\."/);
+  assert.match(assignment, /inside its assigned linked worktree/);
+  assert.equal(assignment.includes("/tmp/original-checkout"), false);
+});
+
 test("TEST-803 marks PM execution and protocol failures as durable run failures", async () => {
   const fixture = await createFixture("pm-failure");
   try {

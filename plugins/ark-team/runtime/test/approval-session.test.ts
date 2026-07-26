@@ -536,9 +536,84 @@ test("TEST-606 fails closed on writer resume mismatch and invalid structured out
   });
 });
 
+test("TEST-607 accepts current app-server runtime workspace roots and fails closed without either root source", async () => {
+  await withWorktree(async (workingDirectory) => {
+    const currentClient = new FakeAppServerClient({
+      writable_roots: [],
+      runtime_workspace_roots: [workingDirectory],
+    });
+    const completion = new AppServerApprovalSession({
+      client: currentClient,
+    }).start({
+      role: "worker",
+      assignment: "Use the current app-server workspace-root response.",
+      working_directory: workingDirectory,
+      output_contract: "worker_report",
+    });
+    await currentClient.waitForRequest("turn/start");
+    emitCompletion(currentClient, JSON.stringify(validWorkerReport()));
+    const update = await completion;
+    assert.equal(update.status, "completed");
+
+    const missingRootsClient = new FakeAppServerClient({
+      writable_roots: [],
+      runtime_workspace_roots: [],
+    });
+    await assertSessionFailure(
+      new AppServerApprovalSession({ client: missingRootsClient }).start({
+        role: "worker",
+        assignment: "Reject a response without an assigned writable root.",
+        working_directory: workingDirectory,
+        output_contract: "worker_report",
+      }),
+      "AGENT_SESSION_PROTOCOL_ERROR",
+    );
+  });
+});
+
+test("TEST-608 ignores replayed prior-turn usage during resume without weakening active-turn checks", async () => {
+  await withWorktree(async (workingDirectory) => {
+    const client = new FakeAppServerClient({
+      replayed_turn_id: "turn-previous",
+    });
+    const completion = new AppServerApprovalSession({ client }).start({
+      role: "worker",
+      assignment: "Resume after a replayed prior-turn usage notification.",
+      working_directory: workingDirectory,
+      resume_session_id: "thread-existing",
+      output_contract: "worker_report",
+    });
+    await client.waitForRequest("turn/start");
+    emitCompletion(client, JSON.stringify(validWorkerReport()), {
+      threadId: "thread-existing",
+    });
+    const update = await completion;
+    assert.equal(update.status, "completed");
+
+    const activeMismatchClient = new FakeAppServerClient();
+    const activeMismatch = new AppServerApprovalSession({
+      client: activeMismatchClient,
+    }).start({
+      role: "worker",
+      assignment: "Reject a mismatched event after turn/start.",
+      working_directory: workingDirectory,
+      output_contract: "worker_report",
+    });
+    await activeMismatchClient.waitForRequest("turn/start");
+    activeMismatchClient.emit(tokenUsage("thread-1", "turn-other"));
+    await assertSessionFailure(
+      activeMismatch,
+      "AGENT_SESSION_PROTOCOL_ERROR",
+    );
+  });
+});
+
 interface FakeAppServerOptions {
   resumed_thread_id?: string;
   network_access?: boolean;
+  writable_roots?: string[];
+  runtime_workspace_roots?: string[];
+  replayed_turn_id?: string;
 }
 
 class FakeAppServerClient implements AppServerProtocolClient {
@@ -579,6 +654,12 @@ class FakeAppServerClient implements AppServerProtocolClient {
         typeof params.threadId === "string"
           ? params.threadId
           : "thread-1";
+      if (
+        method === "thread/resume" &&
+        this.options.replayed_turn_id !== undefined
+      ) {
+        this.emit(tokenUsage(threadId, this.options.replayed_turn_id));
+      }
       return {
         thread: {
           id:
@@ -588,11 +669,16 @@ class FakeAppServerClient implements AppServerProtocolClient {
         },
         model,
         cwd,
+        ...(this.options.runtime_workspace_roots === undefined
+          ? {}
+          : {
+              runtimeWorkspaceRoots: this.options.runtime_workspace_roots,
+            }),
         approvalPolicy: "on-request",
         approvalsReviewer: "user",
         sandbox: {
           type: "workspaceWrite",
-          writableRoots: [cwd],
+          writableRoots: this.options.writable_roots ?? [cwd],
           readOnlyAccess: { type: "fullAccess" },
           networkAccess: this.options.network_access ?? false,
         },
@@ -777,37 +863,58 @@ function emitCompletion(
   });
 }
 
+function tokenUsage(threadId: string, turnId: string): AppServerMessage {
+  return {
+    method: "thread/tokenUsage/updated",
+    params: {
+      threadId,
+      turnId,
+      tokenUsage: {
+        last: {
+          inputTokens: 120,
+          cachedInputTokens: 20,
+          cacheWriteInputTokens: 0,
+          outputTokens: 12,
+          reasoningOutputTokens: 4,
+        },
+      },
+    },
+  };
+}
+
 function validPlReport() {
   return {
     kind: "pl_report",
     team_id: "team-a",
     status: "completed",
     summary: "The team mission is complete.",
-    worker_reports: [
-      {
-        kind: "worker_report",
-        team_id: "team-a",
-        worker_key: "worker-a",
-        status: "completed",
-        summary: "The bounded worker task is complete.",
-        changed_files: ["src/feature.ts"],
-        commit_sha: "abcdef1",
-        verification: [
-          {
-            name: "focused tests",
-            status: "passed",
-            evidence: "The focused test passed.",
-          },
-        ],
-        blockers: [],
-      },
-    ],
+    worker_reports: [validWorkerReport()],
     integration_commit_sha: "abcdef2",
     verification: [
       {
         name: "team tests",
         status: "passed",
         evidence: "All team tests passed.",
+      },
+    ],
+    blockers: [],
+  };
+}
+
+function validWorkerReport() {
+  return {
+    kind: "worker_report",
+    team_id: "team-a",
+    worker_key: "worker-a",
+    status: "completed",
+    summary: "The bounded worker task is complete.",
+    changed_files: ["src/feature.ts"],
+    commit_sha: "abcdef1",
+    verification: [
+      {
+        name: "focused tests",
+        status: "passed",
+        evidence: "The focused test passed.",
       },
     ],
     blockers: [],

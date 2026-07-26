@@ -137,10 +137,17 @@ reason and counters, and wait for the user to choose `retry_once` or
 
 Continue ordinary in-scope work without approval. Pause for the dangerous actions listed in the operating contract.
 
-When a managed PL or worker returns `waiting_user`, inspect whether it carries
-`pending_approval` or `pending_retry` and present the corresponding redacted
-request to the user. Pass `approve_once`, `approve_session`, `decline`, or
-`cancel` through `ark_team_assignment_decide` only for `pending_approval`.
+The managed scheduler resolves only exact-worktree routine test, owned-path
+staging, local commit, and recorded-branch integration requests with one-time
+approval and records `routine_policy` in the event log. A bounded exact ` && `
+chain is eligible only when every component independently qualifies. The
+policy never applies to remote, destructive, partially validated shell,
+permission, or file-change requests.
+
+When a managed PL or worker still returns `waiting_user`, inspect whether it
+carries `pending_approval` or `pending_retry` and present the corresponding
+redacted request to the user. Pass `approve_once`, `approve_session`, `decline`,
+or `cancel` through `ark_team_assignment_decide` only for `pending_approval`.
 Pass `retry_once` or `cancel_run` through
 `ark_team_assignment_retry_decide` only for `pending_retry`. Then call
 `ark_team_advance` to continue scheduling from the persisted hierarchy. Never

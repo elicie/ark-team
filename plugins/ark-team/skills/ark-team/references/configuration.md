@@ -208,7 +208,8 @@ creates an approval request.
 
 Retain every assignment ID. Read `ark_team_assignment_status` or
 `ark_team_assignment_list` for stored reports and usage. When the state is
-`waiting_user`, distinguish its request type. For `pending_approval`, call
+`waiting_user`, the controller has already rejected the bounded
+routine-command policy; distinguish its request type. For `pending_approval`, call
 `ark_team_assignment_decide` only with the exact opaque approval ID and the
 user's explicit decision while its original app-server session is live. If a
 controller restart orphaned that session, use
@@ -283,12 +284,19 @@ For managed PL and worker assignments that may need approval, use the bundled
 the returned model, `xhigh` effort, `workspace-write` sandbox,
 `on-request` policy, and user reviewer before beginning the turn.
 
-The gateway returns `waiting_user` for command, file-change, and permission
-requests without answering them. Present the redacted request to the user, then
-call `decide()` with `approve_once`, `approve_session`, `decline`, or `cancel`.
-Continue using the returned update from that same object and turn. Never
-auto-approve, reuse an approval ID, or create a replacement session to bypass a
-pending request.
+The low-level gateway returns `waiting_user` for command, file-change, and
+permission requests without answering them. The persistent scheduler may
+deliver `approve_once` automatically only when its exact-worktree routine
+classifier accepts `npm ci`, a bounded local test, team-owned staging, a local
+commit, or an integration merge of a recorded team branch. It persists the
+request and `routine_policy` decision before continuing the same turn. An exact
+` && ` chain is eligible only when it has at most four components and every
+component independently passes the same classifier.
+
+Present every remaining redacted request to the user, then call `decide()` with
+`approve_once`, `approve_session`, `decline`, or `cancel`. Never reuse an
+approval ID, auto-approve a permission/file-change/remote/destructive request,
+or create a replacement session to bypass a pending request.
 
 On completion the gateway returns only role metadata, session and turn IDs,
 the final report, and usage. A live approval channel is process-local and
