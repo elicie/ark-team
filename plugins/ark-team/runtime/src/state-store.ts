@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import {
   access,
+  link,
   mkdir,
   readFile,
   readdir,
@@ -52,10 +53,26 @@ import {
 } from "./role-contracts.js";
 import {
   DEFAULT_PROJECT_CONFIG,
+  projectConfigSha256,
   projectConfigSchema,
   type ProjectConfig,
 } from "./project-config.js";
 import { assertRunId, createRunId } from "./run-id.js";
+import {
+  APPROVED_VERIFICATION_PACKAGE,
+  appendVerificationLinkedRecord,
+  assertVerificationPackageBytes,
+  assertVerificationPackageFingerprint,
+  assertVerificationSourceIdentity,
+  buildVerificationRunSnapshot,
+  captureVerificationSource,
+  sha256CanonicalJson,
+  type VerificationLinkedRecord,
+  type VerificationRollbackRecord,
+  type VerificationSourceIdentity,
+  verificationRollbackRecordSchema,
+  verificationRunSnapshotSha256,
+} from "./verification-contract.js";
 import type { PreparedTeamWorkspace } from "./worktree-manager.js";
 
 export interface RunStoreOptions {
@@ -63,6 +80,12 @@ export interface RunStoreOptions {
   now?: () => Date;
   suffix?: () => string;
   assignment_suffix?: () => string;
+  verification_source_loader?: (
+    projectPath: string,
+  ) => Promise<VerificationSourceIdentity>;
+  verification_package_loader?: (
+    projectPath: string,
+  ) => Promise<string | Uint8Array>;
 }
 
 export interface CreateRunInput {
@@ -70,6 +93,15 @@ export interface CreateRunInput {
   project_path: string;
   project_config?: ProjectConfig;
   project_config_source?: string | null;
+}
+
+export interface RecordVerificationSnapshotInput {
+  package_fingerprint: string;
+  server_port: number;
+}
+
+export interface RecordVerificationRollbackInput {
+  reason: string;
 }
 
 export interface ListRunsInput {
@@ -249,6 +281,12 @@ export class RunStore {
   private readonly now: () => Date;
   private readonly suffix: () => string;
   private readonly assignmentSuffix: () => string;
+  private readonly verificationSourceLoader: (
+    projectPath: string,
+  ) => Promise<VerificationSourceIdentity>;
+  private readonly verificationPackageLoader: (
+    projectPath: string,
+  ) => Promise<string | Uint8Array>;
   private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(options: RunStoreOptions = {}) {
@@ -257,6 +295,13 @@ export class RunStore {
     this.suffix = options.suffix ?? (() => randomBytes(3).toString("hex"));
     this.assignmentSuffix =
       options.assignment_suffix ?? (() => randomBytes(6).toString("hex"));
+    this.verificationSourceLoader =
+      options.verification_source_loader ??
+      ((projectPath) => captureVerificationSource(projectPath, this.now));
+    this.verificationPackageLoader =
+      options.verification_package_loader ??
+      ((projectPath) =>
+        readFile(path.join(projectPath, "docs", "slices", "SLICE-017.md")));
   }
 
   async createRun(input: CreateRunInput): Promise<RunRecord> {
@@ -286,6 +331,19 @@ export class RunStore {
         input.project_config ?? DEFAULT_PROJECT_CONFIG,
       );
       if (!parsedConfig.success) {
+        if (
+          parsedConfig.error.issues.some(
+            (issue) =>
+              issue.path[0] === "verification" &&
+              issue.path[1] === "coordinator",
+          )
+        ) {
+          throw new ArkTeamError(
+            "CONFIG_INVALID",
+            "verification coordinator configuration does not match the approved schema",
+            { cause: parsedConfig.error },
+          );
+        }
         throw new ArkTeamError(
           "INVALID_PROJECT_CONFIG",
           "project configuration does not match the safe schema",
@@ -320,6 +378,10 @@ export class RunStore {
         project_config: parsedConfig.data,
         project_config_source:
           configSource === null ? null : path.normalize(configSource),
+        project_config_sha256: projectConfigSha256(parsedConfig.data),
+        verification_snapshot: null,
+        verification_snapshot_sha256: null,
+        verification_records: [],
       };
       const event: RunEvent = {
         schema_version: 1,
@@ -348,6 +410,276 @@ export class RunStore {
 
       return run;
     });
+  }
+
+  async recordVerificationSnapshot(
+    runId: string,
+    input: RecordVerificationSnapshotInput,
+  ): Promise<RunRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      await this.assertApprovedVerificationPackage(
+        persisted.run.project_path,
+      );
+      assertVerificationPackageFingerprint(input.package_fingerprint);
+      if (persisted.run.verification_snapshot !== null) {
+        if (
+          persisted.run.verification_snapshot.server.port !== input.server_port
+        ) {
+          throw new ArkTeamError(
+            "SCENARIO_SNAPSHOT_MISMATCH",
+            "verification snapshot already records a different server port",
+          );
+        }
+        const currentSource = await this.verificationSourceLoader(
+          persisted.run.project_path,
+        );
+        assertVerificationSourceIdentity(
+          currentSource,
+          persisted.run.verification_snapshot.source,
+        );
+        return persisted.run;
+      }
+      if (!(await this.verificationStartsEnabled())) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification contract rollback disables new starts",
+        );
+      }
+
+      const coordinator =
+        persisted.run.project_config.verification.coordinator;
+      if (coordinator === null) {
+        throw new ArkTeamError(
+          "CONFIG_INVALID",
+          "verification coordinator configuration is required for a new snapshot",
+        );
+      }
+      if (!coordinator.enabled) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification coordinator is not enabled for this run",
+        );
+      }
+
+      const source = await this.verificationSourceLoader(
+        persisted.run.project_path,
+      );
+      const timestamp = this.now().toISOString();
+      const snapshot = buildVerificationRunSnapshot({
+        run_id: persisted.run.run_id,
+        project_path: persisted.run.project_path,
+        artifact_root: path.join(
+          this.runDirectory(persisted.run.run_id),
+          "verification",
+        ),
+        server_port: input.server_port,
+        created_at_utc: timestamp,
+        package_fingerprint: input.package_fingerprint,
+        source,
+        config: coordinator,
+      });
+      const snapshotSha256 = verificationRunSnapshotSha256(snapshot);
+      const commonRecord = {
+        schema_version: 1 as const,
+        run_id: snapshot.run_id,
+        case_id: snapshot.case_id,
+        snapshot_id: snapshot.snapshot_id,
+        timestamp_utc: timestamp,
+        source_fingerprint: snapshot.source_fingerprint,
+        package_fingerprint: snapshot.package.package_fingerprint,
+        required: true,
+        adapter: null,
+        artifact_references: [],
+      };
+      const sourcePayload = {
+        kind: "source" as const,
+        source_sha256: snapshot.source_fingerprint,
+      };
+      const sourceRecord: VerificationLinkedRecord = {
+        ...commonRecord,
+        record_id: `${snapshot.run_id}-source`,
+        record_type: "source",
+        stage: "configured",
+        previous_record_sha256: null,
+        payload_sha256: sha256CanonicalJson(sourcePayload),
+        payload: sourcePayload,
+      };
+      let verificationRecords = appendVerificationLinkedRecord(
+        [],
+        sourceRecord,
+      );
+      const configPayload = {
+        kind: "config" as const,
+        config_sha256: snapshot.resolved_config_sha256,
+      };
+      const configRecord: VerificationLinkedRecord = {
+        ...commonRecord,
+        record_id: `${snapshot.run_id}-config`,
+        record_type: "config",
+        stage: "configured",
+        previous_record_sha256: sha256CanonicalJson(sourceRecord),
+        payload_sha256: sha256CanonicalJson(configPayload),
+        payload: configPayload,
+      };
+      verificationRecords = appendVerificationLinkedRecord(
+        verificationRecords,
+        configRecord,
+      );
+      const snapshotPayload = {
+        kind: "snapshot" as const,
+        snapshot_sha256: snapshotSha256,
+      };
+      const snapshotRecord: VerificationLinkedRecord = {
+        ...commonRecord,
+        record_id: `${snapshot.run_id}-snapshot`,
+        record_type: "snapshot",
+        stage: "snapshotted",
+        previous_record_sha256: sha256CanonicalJson(configRecord),
+        payload_sha256: sha256CanonicalJson(snapshotPayload),
+        payload: snapshotPayload,
+      };
+      verificationRecords = appendVerificationLinkedRecord(
+        verificationRecords,
+        snapshotRecord,
+      );
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        verification_snapshot: snapshot,
+        verification_snapshot_sha256: snapshotSha256,
+        verification_records: [...verificationRecords],
+      };
+      await this.writePersistedRun({
+        run,
+        events: persisted.events,
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration: persisted.integration,
+      });
+      return run;
+    });
+  }
+
+  async appendVerificationRecord(
+    runId: string,
+    input: VerificationLinkedRecord,
+  ): Promise<RunRecord> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const snapshot = persisted.run.verification_snapshot;
+      if (snapshot === null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification evidence requires an immutable run snapshot",
+        );
+      }
+      await this.assertApprovedVerificationPackage(
+        persisted.run.project_path,
+      );
+      const currentSource = await this.verificationSourceLoader(
+        persisted.run.project_path,
+      );
+      assertVerificationSourceIdentity(currentSource, snapshot.source);
+      if (
+        input.run_id !== persisted.run.run_id ||
+        input.case_id !== snapshot.case_id ||
+        input.snapshot_id !== snapshot.snapshot_id ||
+        input.source_fingerprint !== snapshot.source_fingerprint ||
+        input.package_fingerprint !== snapshot.package.package_fingerprint
+      ) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "verification evidence does not link to the immutable run snapshot",
+        );
+      }
+      const verificationRecords = appendVerificationLinkedRecord(
+        persisted.run.verification_records,
+        input,
+      );
+      const timestamp = this.now().toISOString();
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        verification_records: [...verificationRecords],
+      };
+      await this.writePersistedRun({
+        run,
+        events: persisted.events,
+        assignments: persisted.assignments,
+        teams: persisted.teams,
+        plan: persisted.plan,
+        pm_session: persisted.pm_session,
+        integration: persisted.integration,
+      });
+      return run;
+    });
+  }
+
+  async recordVerificationRollback(
+    input: RecordVerificationRollbackInput,
+  ): Promise<VerificationRollbackRecord> {
+    return this.withMutation(async () => {
+      await this.ensureRoot();
+      const existing = await this.readVerificationRollback();
+      if (existing !== null) {
+        return existing;
+      }
+      const parsed = verificationRollbackRecordSchema.safeParse({
+        schema_version: 1,
+        contract_id: "verification_contract_v1",
+        package_fingerprint:
+          APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+        new_starts_enabled: false,
+        preserves_existing_records: true,
+        reason: input.reason.trim(),
+        recorded_at_utc: this.now().toISOString(),
+      });
+      if (!parsed.success) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "verification rollback record is invalid",
+          { cause: parsed.error },
+        );
+      }
+      const finalPath = this.verificationRollbackPath();
+      const temporaryPath = path.join(
+        this.root_path,
+        `.verification-rollback-${process.pid}-${randomBytes(6).toString("hex")}.tmp`,
+      );
+      try {
+        await writeFile(
+          temporaryPath,
+          `${JSON.stringify(parsed.data, null, 2)}\n`,
+          { encoding: "utf8", flag: "wx", mode: 0o600 },
+        );
+        await link(temporaryPath, finalPath);
+        await rm(temporaryPath, { force: true });
+      } catch (error) {
+        await rm(temporaryPath, { force: true });
+        if (isNodeError(error, "EEXIST")) {
+          const concurrent = await this.readVerificationRollback();
+          if (concurrent !== null) {
+            return concurrent;
+          }
+        }
+        throw new ArkTeamError(
+          "STATE_ROOT_UNAVAILABLE",
+          "unable to persist verification rollback",
+          { cause: error },
+        );
+      }
+      return parsed.data;
+    });
+  }
+
+  async getVerificationRollback(): Promise<VerificationRollbackRecord | null> {
+    await this.ensureRoot();
+    return this.readVerificationRollback();
   }
 
   async getRun(runId: string): Promise<RunRecord> {
@@ -3158,6 +3490,68 @@ export class RunStore {
         { cause: error },
       );
     }
+  }
+
+  private async verificationStartsEnabled(): Promise<boolean> {
+    return (await this.readVerificationRollback()) === null;
+  }
+
+  private async assertApprovedVerificationPackage(
+    projectPath: string,
+  ): Promise<void> {
+    let packageBytes: string | Uint8Array;
+    try {
+      packageBytes = await this.verificationPackageLoader(projectPath);
+    } catch (error) {
+      throw new ArkTeamError(
+        "PACKAGE_FINGERPRINT_MISMATCH",
+        "unable to read the approved verification package bytes",
+        { cause: error },
+      );
+    }
+    assertVerificationPackageBytes(packageBytes);
+  }
+
+  private async readVerificationRollback(): Promise<VerificationRollbackRecord | null> {
+    let raw: string;
+    try {
+      raw = await readFile(this.verificationRollbackPath(), "utf8");
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        return null;
+      }
+      throw new ArkTeamError(
+        "STATE_ROOT_UNAVAILABLE",
+        "unable to read verification rollback state",
+        { cause: error },
+      );
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(raw) as unknown;
+    } catch (error) {
+      throw new ArkTeamError(
+        "CORRUPT_STATE",
+        "persisted verification rollback is not valid JSON",
+        { cause: error },
+      );
+    }
+    const parsed = verificationRollbackRecordSchema.safeParse(value);
+    if (!parsed.success) {
+      throw new ArkTeamError(
+        "CORRUPT_STATE",
+        "persisted verification rollback is invalid",
+        { cause: parsed.error },
+      );
+    }
+    return parsed.data;
+  }
+
+  private verificationRollbackPath(): string {
+    return path.join(
+      this.root_path,
+      "verification-contract-v1.rollback.json",
+    );
   }
 
   private async reserveRunDirectory(now: Date): Promise<string> {
