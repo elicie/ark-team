@@ -63,8 +63,8 @@ document claims future runtime verification was executed.
 - A **PASS** is a complete result, not a partial result. Missing capability,
   missing artifact, source drift, unresolved approval, or an unrun required
   check cannot be represented as PASS.
-- Required desktop viewport literals are `1440x900` (primary) and `1280x720`
-  (secondary). The device scale factor is `1`; locale is `en-US`; timezone is
+- Required viewport literals are exactly `375x812`, `768x1024`, and
+  `1440x900`. The device scale factor is `1`; locale is `en-US`; timezone is
   `UTC`; color scheme is `light`; and reduced motion is `no-preference`.
 - The bootstrap server defaults to port `10001`. If it is occupied, the
   implementation selects the next available port at or above `10001` and
@@ -320,8 +320,8 @@ scenario fields defined here.
 - Preconditions: the browser case is ready and the screenshot capability is
   available.
 - Trigger: the declared readiness condition is satisfied.
-- Observable result: a PNG is captured at exactly `1440x900` and, when the
-  secondary viewport is required by the scenario, exactly `1280x720`; the
+- Observable result: PNGs are captured at exactly `375x812`, `768x1024`, and
+  `1440x900`; the
   capture uses DPR `1`, full declared page bounds, no browser chrome, and no
   post-capture resizing. The artifact path, dimensions, byte size, SHA-256,
   source fingerprint, and snapshot ID are persisted.
@@ -474,8 +474,8 @@ scenario fields defined here.
   the registered local server on `dev` and port `10001` or the recorded next
   port; (5) probe `GET /` at the recorded local origin and require HTTP `200`;
   (6) create a fresh browser context, navigate to the same origin, and require
-  the declared readiness condition; (7) capture the primary `1440x900`
-  screenshot and required secondary `1280x720` screenshot; (8) run image review;
+  the declared readiness condition; (7) capture required `375x812`, `768x1024`,
+  and `1440x900` screenshots; (8) run image review;
   (9) compare with the approved baseline; and (10) persist one terminal
   outcome and handoff report. Any failed precondition stops at its stage with
   the corresponding closed outcome.
@@ -571,8 +571,8 @@ exact expected response and redacted observed response.
 
 ### AC-1710 — Browser execution is reproducible
 
-The browser uses the snapshotted Chromium context and exact `1440x900` and
-`1280x720` viewport literals where required, navigates only to the local origin,
+The browser uses the snapshotted Chromium context and exact `375x812`,
+`768x1024`, and `1440x900` viewport literals, navigates only to the local origin,
 executes declared actions in order, and records readiness, console, page-error,
 and navigation evidence.
 
@@ -712,7 +712,7 @@ of an undeclared action. Expected: `AC-1710`.
 
 ### TEST-1711 — Screenshot dimensions and byte integrity
 
-Capture the bootstrap page at `1440x900` and `1280x720` with DPR `1`; inspect
+Capture the bootstrap page at `375x812`, `768x1024`, and `1440x900` with DPR `1`; inspect
 PNG dimensions, byte size, hash, and path; attempt resize and wrong viewport.
 Expected: `AC-1711`.
 
@@ -865,8 +865,7 @@ server_host=dev
 server_bind=0.0.0.0
 server_port=<10001 or recorded next available port>
 api_origin=http://dev:<server_port>
-primary_viewport=1440x900
-secondary_viewport=1280x720
+viewports=375x812,768x1024,1440x900
 device_scale_factor=1
 locale=en-US
 timezone=UTC
@@ -971,8 +970,8 @@ credentials, unrestricted command output, or unbounded response bodies.
 
 `BOOTSTRAP-1701` is the sole smoke scenario in this handoff. Its fixed inputs
 are the source/package identity above, `GET /` with expected HTTP `200`, local
-origin `http://dev:<recorded-port>`, primary viewport `1440x900`, secondary
-viewport `1280x720`, DPR `1`, UTC/en-US/light/no-preference browser context,
+origin `http://dev:<recorded-port>`, viewports `375x812`, `768x1024`, and
+`1440x900`, DPR `1`, UTC/en-US/light/no-preference browser context,
 registered artifact root, approved immutable baseline, and the required
 capability set. The scenario's output is one persisted terminal outcome and a
 report that links every check and artifact. It has no external dependency and
@@ -1034,3 +1033,237 @@ Slice result:
 - Recommended next action: owning PL independently review this file, then
   authorize the ordered implementation slices only if the package remains
   `SPEC_APPROVED` and the source fingerprint is unchanged.
+## PL correction addendum — controlling contract v1.1
+
+This addendum controls wherever earlier prose conflicts. It is part of this
+single-file package; status remains SPEC_APPROVED.
+
+### Corrected source and evidence coverage
+
+- SOURCE_KIND: GIT_REPOSITORY.
+- SOURCE_ID: GIT-COMMIT:50531832a57e3fd0dae093b7ad0b51197e668045.
+- SOURCE_BRANCH_AT_CAPTURE: main is descriptive only.
+- WORKTREE_STATE_AT_CAPTURE: clean.
+- SOURCE_DRIFT_POLICY: FAIL_AND_REFREEZE; a changed commit, package
+  fingerprint, configuration snapshot, baseline identity, or integrated commit
+  yields error before a dependent check until an explicit spec delta is
+  approved.
+- REFERENCE_BOUNDARY: NONE; authority date is 2026-07-26 UTC; authority is the
+  explicit user assignment, captured source, and existing Closed Contract
+  conventions; package version is verification-spec-v1.1.
+
+| Surface | Class | Channel | Coverage | Bounded evidence/use |
+| --- | --- | --- | --- | --- |
+| User statements | USER_REQUIREMENT | USER_STATEMENT | EXPLORED | Normative assignment, not runtime proof. |
+| Existing slices / SLICE-016 | FACT | DOCUMENT | EXPLORED | Closed Contract, ID, traceability conventions. |
+| Controller/integration flow | FACT | SOURCE | EXPLORED | Integrated result precedes original PM final review. |
+| Project config and run persistence | FACT | SOURCE | EXPLORED | Existing TOML loader and persisted resolved config. |
+| Role/approval contracts | FACT | SOURCE | EXPLORED | Sol/Terra/Luna and sandbox/approval safeguards. |
+| App-server 0.145 / localImage | FACT | DOCUMENT | PARTIAL | Protocol target; no live image signal observed here. |
+| Dependency metadata | FACT | SOURCE | EXPLORED | No global or target browser dependency assumed. |
+| Capability-gated design | DECISION | USER_STATEMENT | EXPLORED | Explicit future adapter choice. |
+| Routes/actions/selectors/baselines | UNKNOWN | UNVERIFIED | OUT_OF_SCOPE | Required validated future config, never inferred. |
+| Runtime checks | FACT | UNVERIFIED | OUT_OF_SCOPE | Browser/API/screenshot/comparison tests are not run. |
+
+The only non-blocking assumption is a future strict extension of the existing
+project-config schema. Failure to add it returns SPEC_DELTA_REQUIRED; no
+approved slice depends on an unknown product route, selector, or baseline.
+
+### Corrected architecture, outcomes, and PM gate
+
+Controller.VerificationCoordinator runs after the integrated result and before
+the original Sol/xhigh read-only PM final review. It is not a fifth team; it
+does not change the Sol/Terra/Luna hierarchy or weaken sandbox/approval
+contracts. Team and integration smoke checks MAY remain but cannot replace or
+falsely satisfy coordinator verification.
+
+Only the coordinator persists state. Exact check outcomes are passed, failed,
+unavailable, skipped, and error. passed means every assertion and required
+evidence exists; failed means assertion or comparison failure; unavailable means
+a missing required capability; skipped means missing optional prerequisite; error
+means malformed configuration, stale/missing/duplicate artifact, unsafe path,
+timeout exhaustion, or incomplete required evidence. Each result stores ID,
+required flag, attempts, UTC times, adapter/version, sanitized reason, manifest
+keys, and hashes.
+
+    integrated -> configured -> capabilities -> ready -> executing -> collecting -> deciding
+    deciding -> passed | failed | unavailable | skipped | error
+    passed for all required checks -> pm_review_pending -> original PM review
+    all other terminal results -> recorded_nonpass (no PM success gate)
+
+API/browser/readiness have two total attempts; screenshot, comparison, semantic
+review, artifact write, and cleanup have one. Server/API timeout is 30,000 ms,
+browser is 60,000 ms, case total is 120,000 ms, cleanup waits 10,000 ms only
+for registered run-started processes. Retry never alters snapshot, baseline,
+required flag, or input.
+
+### Corrected project configuration and snapshot schema
+
+The future extension lives under the existing project configuration mechanism,
+.codex/team-orchestrator.toml, as [verification.coordinator]. The current strict
+schema rejects it until IS-1701 deliberately extends that schema. The future
+implementation strictly validates, resolves without secrets, and persists the
+entire resolved object and SHA-256 snapshot hash in the existing run record
+before it starts a server, API probe, or browser. Later advance/restart uses
+only that persisted snapshot.
+
+| Required field | Closed validation |
+| --- | --- |
+| schema_version | Exact integer 1. |
+| enabled and required_capabilities | Explicit boolean and 1–6 unique names from curl, browser, screenshot, comparison, semantic_review. |
+| server_argv / lifecycle | 1–32 literal nonempty argv strings, no shell; bind 0.0.0.0; readiness path/status/timeout explicit. |
+| api_probes | 1–50 unique IDs, relative / paths without .., literal method, expected 100–599 status/content type, body digest policy, required flag. |
+| browser_adapter / cases | Fixed allowlisted adapter name; 1–50 unique case IDs, local path, ready selector, 0–50 ordered actions, required flag. |
+| viewports | Exactly and only 375x812, 768x1024, 1440x900 in that order. |
+| baseline_root / identities | Canonical project-relative path and explicit expected identity/environment tuple. |
+| comparison policy | Explicit pixel_diff_fraction_max=0.005, max_channel_delta=8, and explicit critical-region list. |
+| evidence policy | Explicit console/network count/byte limits, artifact retention, semantic-review required flag, and artifact limits. |
+| timeouts / attempts | Explicit: server/API 30000, browser 60000, case 120000 ms; API/browser two total, others one. |
+
+Unknown fields, blank values, secret-bearing values, unsupported adapters,
+duplicate IDs, absent required values, unbounded arrays, out-of-range values,
+or acceptance-relevant implicit defaults are error before execution.
+
+### Corrected API, browser, and server contract
+
+API verification capability-detects curl or an equivalently specified adapter.
+It uses literal argv and never shell interpretation. The only accepted origin is
+http://dev:<port> where port is 10001 or the next available integer at or above
+10001; method/path/query/body/allowlisted headers/status/content-type assertions
+all come from the snapshot. It rejects absolute URLs, redirects to a different
+origin, path traversal, proxy use, credentials, secret headers, and unrestricted
+request or response bodies. Evidence is method, relative path, status, content
+type, elapsed milliseconds, redacted headers, and a SHA-256 digest plus at most
+64 KiB sanitized body preview.
+
+Browser verification uses a driver abstraction with detect, navigate, interact,
+capture, and close. A supported driver performs real local navigation and
+declared interaction in a fresh context. The initial slice does not require a
+globally installed browser package and does not silently add a dependency to a
+target project. Driver detection records supported with version or a bounded
+unavailable diagnostic. Missing driver produces unavailable for a required case
+and skipped for optional; driver execution failure produces error.
+
+Development servers never use Docker, bind 0.0.0.0, use 10001 or next available
+port at or above it, accept dev, never use 3000, and advertise only
+http://dev:<port>. A readiness HTTP status check is bounded to 30,000 ms.
+Server argv is recorded literally. No push, pull request, deploy, remote merge,
+or other remote action is permitted.
+
+### Corrected screenshots, baselines, artifacts, and comparison
+
+After declared readiness and browser action, capture exactly three PNG actuals:
+
+    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/screenshots/<case-id>/375x812.actual.png
+    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/screenshots/<case-id>/768x1024.actual.png
+    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/screenshots/<case-id>/1440x900.actual.png
+    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/diffs/<case-id>/375x812.diff.png
+    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/diffs/<case-id>/768x1024.diff.png
+    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/diffs/<case-id>/1440x900.diff.png
+
+Each is DPR 1 PNG with no resize, crop, or post-processing and records actual
+dimensions, viewport, locale en-US, timezone UTC, color scheme light, reduced
+motion no-preference, adapter/browser version, URL, SHA-256, capture time, up
+to 100 console events/32 KiB, and up to 100 network events/32 KiB. Network
+evidence contains local method/path/status/duration only. Missing, mismatched,
+stale, or duplicate actual/baseline/diff artifact is error.
+
+A baseline MAY be in the canonical configured project baseline root. Creating
+or updating it requires exact explicit user approve_once approval for that
+operation and baseline identity; routine local approval cannot substitute. The
+manifest records approval ID, approver, UTC time, path, source/environment tuple,
+and SHA-256. All per-run actuals, diffs, logs, manifests, reviews, and reports
+stay under the exact Ark state-root/run-id directory above, never under the
+target project.
+
+Canonical artifact paths reject .., noncanonical root spellings, empty
+components, symlink traversal, and paths outside exactly two allowed roots: the
+per-run state directory and read-only approved baseline root. Only .png, .json,
+.jsonl, and .txt are allowed. Use exclusive temporary write then atomic rename
+after validating the parent. Limit 500 files, 50 MiB per file, 500 MiB total,
+64 KiB metadata per check, 100 console events, 100 network events, and 64 KiB
+API preview. SHA-256 every persisted file. Retain 30 days; delete only a
+registered canonical run directory after final report; never delete a baseline.
+Persist no private reasoning, credential, cookie, authorization/secret header,
+unrestricted console/network payload, or target-project run artifact.
+
+Deterministic comparison decodes equal-dimension PNGs to RGBA8 without resize,
+crop, alpha normalization, or color-space conversion. It computes per-channel
+absolute deltas in row-major order, pixel_diff_fraction = differing_pixels /
+total_pixels, and max_channel_delta = maximum channel delta. Its deterministic
+diff PNG has changed pixels opaque magenta and unchanged pixels transparent.
+Pass requires fraction <= 0.005, max delta <= 8, and no declared critical-region
+difference. Persist baseline/actual/diff SHA-256 values, dimensions, thresholds,
+metrics, and stable passed/failed. Semantic review is separate evidence and
+cannot override deterministic failed.
+
+### Corrected localImage semantic-review contract
+
+For semantic review, the exact current app-server turn input extension is one
+item shaped { "type": "localImage", "path": "<absolute-path>" }. Before it is
+constructed, canonicalize the path and require an existing regular, non-symlink
+PNG beneath this run's verification/screenshots root; allow at most three items
+per turn and at most 10 MiB per item. The adapter must observe and persist an
+explicit active-turn runtime capability signal advertising localImage; model name
+alone is not a signal. Missing signal yields unavailable when semantic review is
+required and skipped when optional. When signalled, persist only bounded
+observable findings {severity, category, viewport, description} (maximum 50 /
+16 KiB), input SHA-256, and capability version. Do not persist private reasoning.
+
+### Corrected slice closure, handoff, and package status
+
+The ordered implementation plan is independently implementable and verifiable:
+
+| Slice | Includes | Dependencies and affected contract | Completion and rollback |
+| --- | --- | --- | --- |
+| IS-1701 | REQ-1701..1705; AC/TEST-1701..1705 | Existing config loader, RunRecord, state store | Tests 1701..1705 pass; stop new config reads and retain snapshots. |
+| IS-1702 | REQ-1706..1708; AC/TEST-1706..1708 | IS-1701; Controller/integration/PM ordering, artifact root | Tests 1706..1708 pass; disable coordinator without changing existing flow. |
+| IS-1703 | REQ-1714; AC/TEST-1714 | IS-1701; artifact-store record | Test 1714 passes; stop new writes and retain registered evidence. |
+| IS-1704 | REQ-1709, REQ-1710; AC/TEST-1709,1710 | IS-1701..1703; local adapter/capability record | Tests 1709,1710 pass; report non-pass capability without install. |
+| IS-1705 | REQ-1711, REQ-1713; AC/TEST-1711,1713 | IS-1703,1704; baseline/comparison schema | Tests 1711,1713 pass; block capture and preserve evidence. |
+| IS-1706 | REQ-1712; AC/TEST-1712 | IS-1703,1705; app-server image adapter | Test 1712 passes; unavailable/skipped does not alter comparator. |
+| IS-1707 | REQ-1715..1720; AC/TEST-1715..1720 | IS-1701..1706; rollout and PM handoff | Tests 1715..1720 plus earlier tests pass; disable starts and preserve records. |
+
+This table controls inconsistent earlier slice prose; every row remains complete
+OBJ-17xx -> REQ-17xx -> AC-17xx -> TEST-17xx -> IS-170x -> SLICE-017 through
+the normative traceability table. The exact first approved implementation slice
+is IS-1701 — Configuration and immutable run snapshot.
+
+Post-implementation bootstrap requires deterministic tests and one real local
+scenario: bounded development-server startup; literal-argv API assertion; real
+browser navigation/action; all three screenshot sizes; actual/diff hashes;
+console/network evidence; capability-gated semantic review; original PM
+acceptance; and cleanup without Docker or remote action. It is future work and
+has not been run during this documentation-only package.
+
+### Handoff
+
+- Package identity/status: verification-spec-v1.1 / SPEC_APPROVED.
+- Ordered approved slices: IS-1701 through IS-1707.
+- Exact next action: implement IS-1701 only, then obtain TEST-1701 through
+  TEST-1705 implementation evidence before IS-1702.
+- Constraints: no Docker, no port 3000, no browser/dependency installation, no
+  push, pull request, deploy, remote merge, or other remote action.
+- Baseline expectation: exact explicit user approval naming baseline identity
+  before any create/update; per-run artifacts never enter the target project.
+- Warnings and prohibited assumptions: do not infer browser, curl, image
+  capability, route, selector, baseline, secret, or remote authority from model
+  or package presence.
+- Rollback: preserve snapshots, baselines, actuals, diffs, manifests, reviews,
+  and redacted logs; block new starts rather than performing destructive
+  migration or baseline deletion.
+
+If a future implementation finds missing capability, malformed configuration,
+unsafe path, contradiction, or unsupported dependency, it returns
+SPEC_DELTA_REQUIRED with affected REQ/AC/TEST/IS IDs, classification
+(omission, contradiction, unsafe_input, environment_mismatch, or unverifiable),
+bounded observable evidence, impact, proposed resolution, and runtime_status
+not_started. It does not guess or proceed.
+
+### Documentation-run status
+
+This package records static source/convention/content inspection only. Future
+TEST-1701 through TEST-1720 are NOT_RUN. Browser, API, screenshot, semantic
+review, deterministic comparison, and bootstrap verification are NOT_RUN.
+Product behavior, tests, builds, generators, Docker, development servers, live
+browser/API scenarios, and remote actions were not run for this specification.
