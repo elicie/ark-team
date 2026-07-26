@@ -1,18 +1,18 @@
 # Ark Team
 
-`ark-team` is a repository-scoped Codex skill and plugin source for explicit PM-led, multi-team work.
+`ark-team`은 PM이 명시적으로 주도하는 다중 팀 작업을 위한 저장소 범위의 Codex 스킬이자 플러그인 소스입니다.
 
-The skill implements the operating contract agreed for:
+이 스킬은 다음과 같이 합의된 운영 계약을 구현합니다.
 
-- a management-only PM;
-- dynamically created PL-led teams;
-- isolated Git worktrees;
-- staged local integration;
-- guarded remote actions;
-- observable status and reports; and
-- resumable failure and cancellation handling.
+- 관리만 담당하는 PM
+- 동적으로 생성되는 PL 주도 팀
+- 격리된 Git worktree
+- 단계적인 로컬 통합
+- 보호 절차가 적용된 원격 작업
+- 관찰 가능한 상태와 보고서
+- 재개 가능한 실패 및 취소 처리
 
-## Repository layout
+## 저장소 구조
 
 ```text
 .agents/skills/ark-team
@@ -38,34 +38,35 @@ plugins/ark-team/
     references/
 ```
 
-The plugin copy under `plugins/ark-team` is the canonical skill and runtime
-source. The `.agents/skills` link makes the same skill discoverable while
-working in this repository. Project-scoped custom-agent definitions live under
-`.codex/agents`.
+`plugins/ark-team` 아래의 플러그인 사본이 스킬과 런타임의 원본입니다.
+이 저장소에서 작업할 때는 `.agents/skills` 링크를 통해 같은 스킬을
+탐색할 수 있습니다. 프로젝트 범위의 커스텀 에이전트 정의는
+`.codex/agents` 아래에 있습니다.
 
-## Requirements
+## 요구 사항
 
-- Use a Codex release that supports skills and subagents.
-- Keep multi-agent support enabled.
-- Use Node.js 18 or later to run the bundled local MCP server.
-- Install Git with worktree support for isolated writing teams, or provide an equivalent managed-runtime isolation backend.
-- Expect native fallback to obey the host's concurrency limit.
-- Native custom agents pin PM to Sol/xhigh, PL to Terra/xhigh, and workers to
-  Luna/xhigh.
-- The managed session launcher uses the official TypeScript Codex SDK and
-  requires an authenticated `codex` executable on `PATH`.
-- The approval-gated writer backend uses `codex app-server` over local stdio
-  and requires a compatible generated stable protocol schema.
-- Pull-request mode supports `github.com` remotes and requires an authenticated
-  GitHub CLI (`gh`) on `PATH`; set `ARK_TEAM_GH_PATH` to override its path.
-- The MCP control plane persists run and assignment state and can schedule
-  a managed PM → PL → worker hierarchy, materialize the PM plan into linked
-  team worktrees, and resume each PL with its workers' validated reports.
+- 스킬과 서브에이전트를 지원하는 Codex 릴리스를 사용합니다.
+- 멀티 에이전트 지원을 활성화합니다.
+- 번들로 제공되는 로컬 MCP 서버를 실행하려면 Node.js 18 이상을 사용합니다.
+- 작성 팀을 격리하려면 worktree를 지원하는 Git을 설치하거나, 이에 준하는 관리형 런타임 격리 백엔드를 제공합니다.
+- 네이티브 폴백은 호스트의 동시 실행 제한을 따릅니다.
+- 네이티브 커스텀 에이전트는 PM을 Sol/xhigh, PL을 Terra/xhigh, worker를
+  Luna/xhigh로 고정합니다.
+- 관리형 세션 런처는 공식 TypeScript Codex SDK를 사용하며,
+  `PATH`에 인증된 `codex` 실행 파일이 있어야 합니다.
+- 승인 절차가 적용되는 작성자 백엔드는 로컬 stdio를 통해
+  `codex app-server`를 사용하며, 호환되는 자동 생성 stable protocol 스키마가 필요합니다.
+- Pull Request 모드는 `github.com` 원격 저장소를 지원하며, 인증된
+  GitHub CLI(`gh`)가 `PATH`에 있어야 합니다. 경로를 재정의하려면
+  `ARK_TEAM_GH_PATH`를 설정합니다.
+- MCP 제어 평면은 실행 및 할당 상태를 영속화하고, 관리형
+  PM → PL → worker 계층을 예약하며, PM 계획을 연결된 팀 worktree로
+  구체화하고, 검증된 worker 보고서를 사용해 각 PL을 재개할 수 있습니다.
 
-## Runtime control plane
+## 런타임 제어 평면
 
-The plugin bundles a local stdio MCP server and registers it through `.mcp.json`.
-It currently exposes:
+플러그인은 로컬 stdio MCP 서버를 포함하며 `.mcp.json`을 통해 등록합니다.
+현재 제공하는 도구는 다음과 같습니다.
 
 - `ark_team_start`
 - `ark_team_execute`
@@ -87,135 +88,137 @@ It currently exposes:
 - `ark_team_assignment_retry_decide`
 - `ark_team_assignment_cancel`
 
-Runs are stored as atomic JSON records under
-`~/.codex/team-orchestrator/runs` by default. Set the absolute
-`ARK_TEAM_STATE_ROOT` environment variable before starting Codex to use another
-location.
+실행 정보는 기본적으로 `~/.codex/team-orchestrator/runs` 아래에 원자적
+JSON 레코드로 저장됩니다. 다른 위치를 사용하려면 Codex를 시작하기 전에
+절대 경로인 `ARK_TEAM_STATE_ROOT` 환경 변수를 설정합니다.
 
-At run creation the runtime strictly loads
-`.codex/team-orchestrator.toml` from the selected project, applies documented
-defaults, and stores the complete resolved snapshot in the run. Project
-overrides can narrow team and worker counts, tune managed session, retry, and
-correction limits, set a safe integration branch prefix, and add literal
-verification commands. Fixed Sol/Terra/Luna `xhigh` roles, PM/writer
-permissions, remote approval, branch preservation, usage-only logging, and
-private-reasoning exclusion cannot be weakened. Unknown keys, credentials,
-unsafe paths, and invalid values fail before a run is created. Later edits to
-the TOML do not alter an existing run.
+런타임은 실행을 생성할 때 선택한 프로젝트의
+`.codex/team-orchestrator.toml`을 엄격하게 불러오고, 문서화된 기본값을
+적용한 뒤, 완전히 해석된 스냅샷을 실행 정보에 저장합니다. 프로젝트별
+재정의로 팀과 worker 수를 줄이거나, 관리형 세션·재시도·수정 제한을
+조정하거나, 안전한 통합 브랜치 접두사를 설정하거나, 리터럴 검증 명령을
+추가할 수 있습니다. 고정된 Sol/Terra/Luna `xhigh` 역할, PM/작성자 권한,
+원격 승인, 브랜치 보존, 사용량 전용 로깅, 비공개 추론 제외 정책은
+완화할 수 없습니다. 알 수 없는 키, 자격 증명, 안전하지 않은 경로,
+잘못된 값이 있으면 실행을 생성하기 전에 실패합니다. 이후 TOML을
+수정해도 기존 실행에는 영향을 주지 않습니다.
 
-`ark_team_plan_apply` accepts one validated `pm_plan`. For a clean Git
-repository root it creates one linked worktree and
-`ark-team/<run-id>/<team-id>` branch per team from the same base commit, then
-atomically stores the plan and team records. `ark_team_team_list` returns their
-mission, dependencies, branch, worktree, base commit, worker count, and state.
-Set `ARK_TEAM_WORKTREE_ROOT` to an absolute path or `~/...` to override the
-default `<state-root>/.worktrees` location. The resolved location must be
-outside the project checkout.
+`ark_team_plan_apply`는 검증된 `pm_plan` 하나를 받습니다. 깨끗한 Git
+저장소 루트에서 같은 기준 커밋으로부터 팀마다 하나의 연결된 worktree와
+`ark-team/<run-id>/<team-id>` 브랜치를 만든 다음, 계획과 팀 레코드를
+원자적으로 저장합니다. `ark_team_team_list`는 각 팀의 임무, 의존성,
+브랜치, worktree, 기준 커밋, worker 수, 상태를 반환합니다. 기본
+`<state-root>/.worktrees` 위치를 재정의하려면 `ARK_TEAM_WORKTREE_ROOT`를
+절대 경로나 `~/...`로 설정합니다. 해석된 위치는 프로젝트 checkout
+외부에 있어야 합니다.
 
-`ark_team_execute` combines run creation, a Sol/xhigh read-only PM turn, strict
-plan validation, PM session/usage persistence, and plan application. A PM
-failure leaves a durable failed run. A later worktree failure leaves the
-validated PM plan in a planning run so `ark_team_plan_apply` can retry it
-without consuming another PM turn.
+`ark_team_execute`는 실행 생성, Sol/xhigh 읽기 전용 PM 턴, 엄격한 계획
+검증, PM 세션/사용량 영속화, 계획 적용을 하나로 결합합니다. PM 실패는
+영속적인 실패 상태의 실행을 남깁니다. 이후 worktree 생성에 실패하면
+검증된 PM 계획이 계획 단계의 실행에 남으므로, PM 턴을 다시 소비하지
+않고 `ark_team_plan_apply`로 재시도할 수 있습니다.
 
-After plan materialization, the coordinator starts independent Terra PLs in
-parallel, validates their exact worker counts, runs dependency-ready Luna
-workers in waves, and resumes each original PL session with the consolidated
-worker reports. `ark_team_advance` continues that process after an approval
-decision. When all PL reports cover their workers with passing verification,
-the run enters `integrating`. The top-level coordinator then creates
-`orchestrator/<run-id>` in a separate linked worktree and assigns a Terra/xhigh
-integration PL. It independently verifies a clean reported commit containing
-every team branch tip.
+계획을 구체화한 뒤 코디네이터는 서로 독립적인 Terra PL을 병렬로
+시작하고, 정확한 worker 수를 검증하며, 의존성이 충족된 Luna worker를
+여러 차례에 걸쳐 실행한 다음, 취합된 worker 보고서를 전달해 각 원래
+PL 세션을 재개합니다. `ark_team_advance`는 승인 결정 후 이 과정을
+이어갑니다. 모든 PL 보고서가 각 worker를 포함하고 검증을 통과하면
+실행은 `integrating` 상태로 진입합니다. 이후 최상위 코디네이터는 별도의
+연결된 worktree에 `orchestrator/<run-id>`를 만들고 Terra/xhigh 통합 PL을
+배정합니다. 통합 PL은 모든 팀 브랜치 tip을 포함하는 깨끗한 보고 커밋을
+독립적으로 검증합니다.
 
-For `local_merge`, the runtime fast-forwards the original branch only when its
-branch, HEAD, and cleanliness still match the recorded start boundary. It then
-resumes the original Sol/xhigh read-only PM session for a strict final
-`pm_report`. For `pull_request`, it first verifies the local GitHub remote and
-CLI authentication read-only, then returns `remote_action_required` with one
-opaque request containing the exact remote, branch, target, and commit tuple.
-Only `ark_team_remote_decide` with the current request ID and the user's
-explicit `approve_once` may push that commit and create or adopt its PR.
-`cancel_run` preserves every local artifact; explicitly resuming that run
-creates a fresh request rather than reusing the cancelled approval. Approved
-execution is idempotent across restarts and receives at most three attempts
-before a fresh approval is required.
+`local_merge`의 경우, 런타임은 원래 브랜치와 HEAD 및 작업 디렉터리의
+청결 상태가 기록된 시작 경계와 여전히 일치할 때만 원래 브랜치를
+fast-forward합니다. 그런 다음 원래의 Sol/xhigh 읽기 전용 PM 세션을
+재개하여 엄격한 최종 `pm_report`를 받습니다. `pull_request`의 경우에는
+먼저 로컬 GitHub 원격 저장소와 CLI 인증을 읽기 전용으로 검증한 뒤,
+정확한 원격 저장소, 브랜치, 대상, 커밋 튜플을 담은 불투명 요청 하나와
+함께 `remote_action_required`를 반환합니다. 현재 요청 ID와 사용자의
+명시적인 `approve_once`를 받은 `ark_team_remote_decide`만 해당 커밋을
+push하고 PR을 생성하거나 기존 PR을 채택할 수 있습니다. `cancel_run`은
+모든 로컬 산출물을 보존합니다. 해당 실행을 명시적으로 재개하면 취소된
+승인을 재사용하지 않고 새 요청을 생성합니다. 승인된 실행은 재시작
+사이에서도 멱등성을 유지하며, 최대 세 번 시도한 뒤에는 새 승인이
+필요합니다.
 
-After either local fast-forward or an approved PR succeeds, the original PM
-session performs final read-only acceptance. The runtime then removes only
-clean registered team and integration worktrees whose branches are contained
-by the accepted integration. Every local team and integration branch is
-preserved and checked; the run becomes `completed` only after cleanup. Partial
-cleanup is idempotent when resumed.
+로컬 fast-forward 또는 승인된 PR이 성공하면 원래 PM 세션이 최종 읽기
+전용 인수 검사를 수행합니다. 이후 런타임은 승인된 통합에 브랜치가
+포함되어 있고 깨끗한 상태인, 등록된 팀 및 통합 worktree만 제거합니다.
+모든 로컬 팀 및 통합 브랜치는 보존되고 검사됩니다. 정리가 끝난
+뒤에만 실행 상태가 `completed`가 됩니다. 일부만 정리된 경우에도
+재개 작업은 멱등성을 유지합니다.
 
-Internal PL/worker session failures receive at most two automatic fresh-session
-retries. Valid but deficient plans and reports receive at most two
-same-session correction turns. Assignment records retain attempt and
-correction counters. Exhaustion creates a distinct opaque `pending_retry`;
-`ark_team_assignment_retry_decide` accepts only an explicit `retry_once` or
-`cancel_run` choice, and stale or replayed request IDs fail closed.
+내부 PL/worker 세션 실패는 최대 두 번까지 새로운 세션으로 자동
+재시도합니다. 유효하지만 미흡한 계획과 보고서는 같은 세션에서 최대
+두 번까지 수정을 요청합니다. 할당 레코드는 시도 및 수정 횟수를
+보관합니다. 제한을 모두 소진하면 별도의 불투명 `pending_retry`가
+생성됩니다. `ark_team_assignment_retry_decide`는 명시적인 `retry_once`
+또는 `cancel_run`만 받으며, 오래되었거나 재사용된 요청 ID는 안전하게
+거부합니다.
 
-Managed assignment records live in the same atomic run record. Each record
-retains its team and parent PL, linked worktree, state, session and turn IDs,
-task key and output contract, one pending approval or retry request, routed
-structured report, attempt/correction/turn counts, and token usage. Logs record
-observable state changes, approval source (`user` or `routine_policy`), and
-usage, not raw model reasoning or event history.
+관리형 할당 레코드는 동일한 원자적 실행 레코드에 저장됩니다. 각
+레코드는 팀과 상위 PL, 연결된 worktree, 상태, 세션 및 턴 ID, 작업 키와
+출력 계약, 대기 중인 승인 또는 재시도 요청 하나, 전달된 구조화 보고서,
+시도/수정/턴 횟수, 토큰 사용량을 보관합니다. 로그에는 원시 모델 추론이나
+이벤트 이력이 아니라 관찰 가능한 상태 변경, 승인 출처(`user` 또는
+`routine_policy`), 사용량이 기록됩니다.
 
-The scheduler enforces one PL per team, at most four teams per run, and at most
-five workers per PL. Workers use the same team worktree and identify their
-owning PL assignment. Interim PL plans route to the controller, completed
-worker reports route to the owning PL, and the PL's same-session final report
-routes to PM.
+스케줄러는 팀마다 PL 한 명, 실행마다 최대 4개 팀, PL마다 최대 5명의
+worker를 강제합니다. Worker는 동일한 팀 worktree를 사용하고 자신을
+담당하는 PL 할당을 식별합니다. 중간 PL 계획은 컨트롤러로 전달되고,
+완료된 worker 보고서는 담당 PL로 전달되며, 같은 PL 세션의 최종
+보고서는 PM으로 전달됩니다.
 
-If the MCP process restarts while an approval is pending, the record remains
-visible but its old app-server request channel is gone. Use
-`ark_team_assignment_recover` with that exact run, assignment, and approval ID.
-`resume_safely` resumes the persisted Codex thread in a new turn that explicitly
-treats the old approval as not applied; if the action is still needed, the
-agent must surface a fresh approval ID. `cancel_run` stops the run while
-preserving worktrees, branches, commits, reports, and logs. Ordinary
-`ark_team_assignment_decide` remains valid only while the original live
-session exists, and stale or replayed recovery requests fail closed.
+승인 대기 중 MCP 프로세스가 재시작되면 레코드는 계속 표시되지만 기존
+app-server 요청 채널은 사라집니다. 해당 실행, 할당, 승인 ID를 정확히
+지정해 `ark_team_assignment_recover`를 사용합니다. `resume_safely`는
+영속화된 Codex 스레드를 새 턴에서 재개하며, 이전 승인이 적용되지 않은
+것으로 명시적으로 처리합니다. 작업이 여전히 필요하다면 에이전트가
+새 승인 ID를 제시해야 합니다. `cancel_run`은 worktree, 브랜치, 커밋,
+보고서, 로그를 보존하면서 실행을 중단합니다. 일반적인
+`ark_team_assignment_decide`는 원래 라이브 세션이 존재하는 동안에만
+유효하며, 오래되었거나 재사용된 복구 요청은 안전하게 거부합니다.
 
-Build and verify the bundled server from the repository root:
+저장소 루트에서 번들 서버를 빌드하고 검증합니다.
 
 ```sh
 npm install
 npm test
 ```
 
-`npm test` type-checks the source, runs persistence, scheduler, and
-approval-gateway tests, builds the MCP server, managed-session CLI, and
-approval-session library, and exercises the CLI and MCP entry points.
+`npm test`는 소스의 타입을 검사하고, 영속성·스케줄러·승인 게이트웨이
+테스트를 실행하며, MCP 서버·관리형 세션 CLI·승인 세션 라이브러리를
+빌드하고, CLI와 MCP 진입점을 검사합니다.
 
-## Managed role sessions
+## 관리형 역할 세션
 
-The managed launcher starts every role as a separate Codex thread with explicit
-model, reasoning, sandbox, and approval configuration. It returns only the
-thread ID, final role report, configuration metadata, and token usage; raw
-reasoning and event items are not returned.
+관리형 런처는 명시적인 모델, 추론, 샌드박스, 승인 설정으로 각 역할을
+별도의 Codex 스레드에서 시작합니다. 스레드 ID, 최종 역할 보고서,
+구성 메타데이터, 토큰 사용량만 반환하며, 원시 추론과 이벤트 항목은
+반환하지 않습니다.
 
-Controller code can select a strict `output_contract` for machine-readable
-turns:
+컨트롤러 코드는 기계 판독이 필요한 턴에 엄격한 `output_contract`를
+선택할 수 있습니다.
 
-- `pm_plan` and `pm_report` for PM;
-- `pl_worker_plan`, `pl_report`, and `integration_report` for PL; and
-- `worker_report` for workers.
+- PM에는 `pm_plan`과 `pm_report`
+- PL에는 `pl_worker_plan`, `pl_report`, `integration_report`
+- worker에는 `worker_report`
 
-Structured calls pass the matching JSON Schema to Codex and return the parsed
-`structured_report` only after a second strict runtime validation. Plans reject
-unknown fields, more than four teams, more than five workers, duplicate IDs,
-unknown dependencies, and dependency cycles.
+구조화 호출은 일치하는 JSON Schema를 Codex에 전달하고, 두 번째 엄격한
+런타임 검증을 거친 뒤에만 파싱된 `structured_report`를 반환합니다.
+계획에 알 수 없는 필드나 4개를 초과하는 팀, 5명을 초과하는 worker,
+중복 ID, 알 수 없는 의존성, 의존성 순환이 있으면 거부됩니다.
 
-Pass the prior `session_id` as `resume_session_id` to continue a completed
-role thread. PM continuation uses the SDK's persisted thread; PL/worker
-continuation uses app-server `thread/resume`. Both paths reapply the exact
-managed role profile and reject a different thread ID. The writer path also
-rechecks the worktree cwd, workspace-write roots, disabled network, user
-approval routing, model, and xhigh effort before starting the new turn.
+완료된 역할 스레드를 이어가려면 이전 `session_id`를
+`resume_session_id`로 전달합니다. PM 이어가기는 SDK의 영속화된
+스레드를 사용하고, PL/worker 이어가기는 app-server의 `thread/resume`을
+사용합니다. 두 경로 모두 정확한 관리형 역할 프로필을 다시 적용하며,
+다른 스레드 ID는 거부합니다. 작성자 경로는 새 턴을 시작하기 전에
+worktree cwd, workspace-write 루트, 비활성화된 네트워크, 사용자 승인
+라우팅, 모델, xhigh effort도 다시 검사합니다.
 
-Run a read-only PM session:
+읽기 전용 PM 세션을 실행합니다.
 
 ```sh
 node plugins/ark-team/runtime/dist/session-cli.js \
@@ -224,9 +227,8 @@ node plugins/ark-team/runtime/dist/session-cli.js \
   --assignment "Inspect the project and return a bounded team plan."
 ```
 
-PL and worker sessions accept only the root of a linked Git worktree. The
-launcher refuses the primary checkout and directories without a valid `.git`
-pointer file:
+PL과 worker 세션은 연결된 Git worktree의 루트만 받습니다. 런처는 기본
+checkout과 유효한 `.git` 포인터 파일이 없는 디렉터리를 거부합니다.
 
 ```sh
 node plugins/ark-team/runtime/dist/session-cli.js \
@@ -235,93 +237,95 @@ node plugins/ark-team/runtime/dist/session-cli.js \
   --assignment-file /absolute/path/to/assignment.txt
 ```
 
-Use `ARK_TEAM_CODEX_PATH` when `codex` is installed at a non-default path. The
-optional live verification starts real Sol and Luna sessions in a disposable
-temporary repository and therefore consumes model usage:
+`codex`가 기본 경로가 아닌 곳에 설치되어 있다면
+`ARK_TEAM_CODEX_PATH`를 사용합니다. 선택적 라이브 검증은 폐기 가능한
+임시 저장소에서 실제 Sol 및 Luna 세션을 시작하므로 모델 사용량이
+발생합니다.
 
 ```sh
 npm run verify:managed-sessions
 ```
 
-The official TypeScript SDK backend still uses non-interactive `codex exec`. In
-the locally verified Codex release, a requested `on-request` writer policy
-appeared as `never` in that turn context because no interactive approval
-channel was available. Continue to use it for the read-only PM and for writer
-assignments that cannot require interactive approval.
+공식 TypeScript SDK 백엔드는 여전히 비대화형 `codex exec`를 사용합니다.
+로컬에서 검증한 Codex 릴리스에서는 대화형 승인 채널을 사용할 수 없어서
+요청한 작성자 `on-request` 정책이 해당 턴 컨텍스트에서 `never`로
+나타났습니다. 읽기 전용 PM과 대화형 승인이 필요 없는 작성자 할당에는
+계속 사용할 수 있습니다.
 
-For PL and worker assignments that may need approval, import
-`AppServerApprovalSession` from
-`plugins/ark-team/runtime/dist/approval-session.js`. It starts
-`codex app-server` over stdio, verifies the selected writer profile, and returns
-either:
+승인이 필요할 수 있는 PL 및 worker 할당에는
+`plugins/ark-team/runtime/dist/approval-session.js`에서
+`AppServerApprovalSession`을 가져와 사용합니다. 이 세션은 stdio를 통해
+`codex app-server`를 시작하고 선택한 작성자 프로필을 검증한 뒤, 다음
+중 하나를 반환합니다.
 
-- `waiting_user`, with one opaque command, file-change, or permission approval;
-  or
-- `completed`, with the final role report and token usage.
+- 하나의 불투명 명령, 파일 변경 또는 권한 승인과 함께 `waiting_user`
+- 최종 역할 보고서 및 토큰 사용량과 함께 `completed`
 
-The low-level session never auto-approves a request. The persistent assignment
-scheduler may issue `approve_once` only for an exact command in the registered
-assignment worktree: `npm ci`, bounded npm test commands, staging recorded
-team-owned paths, a local commit with an inert message, or an integration merge
-of a recorded team branch. At most four individually valid routine commands
-may be joined with exact ` && ` separators. Push, reset, clean, deploy,
-permission, file-change, every other shell composition, and every non-matching
-request still require an explicit user decision through `decide()`. The object
-continues waiting on the same thread and turn. It rejects PM sessions and writer
-directories that are not linked Git worktree roots. It does not persist a
-pending approval after the controller process exits.
+저수준 세션은 요청을 자동 승인하지 않습니다. 영속적인 할당 스케줄러는
+등록된 할당 worktree 안에서 실행되는 다음의 정확한 명령에만
+`approve_once`를 발행할 수 있습니다. `npm ci`, 범위가 제한된 npm test
+명령, 기록된 팀 소유 경로의 staging, 부작용이 없는 메시지를 사용한
+로컬 commit, 기록된 팀 브랜치의 통합 merge입니다. 개별적으로 유효한
+일상 명령은 최대 4개까지 정확한 ` && ` 구분자로 연결할 수 있습니다.
+Push, reset, clean, deploy, 권한, 파일 변경, 그 밖의 모든 셸 조합과
+일치하지 않는 모든 요청은 여전히 `decide()`를 통한 명시적인 사용자
+결정이 필요합니다. 객체는 같은 스레드와 턴에서 대기를 계속합니다.
+PM 세션 및 연결된 Git worktree 루트가 아닌 작성자 디렉터리는
+거부합니다. 컨트롤러 프로세스가 종료된 뒤에는 대기 중인 승인을
+영속화하지 않습니다.
 
-Check protocol compatibility without consuming model usage:
+모델 사용량 없이 프로토콜 호환성을 검사합니다.
 
 ```sh
 npm run verify:app-server-schema
 ```
 
-The optional live verification consumes Luna usage. It creates a disposable
-repository, surfaces and declines one outside-worktree command approval,
-confirms that the file was not created, and removes the fixture:
+선택적 라이브 검증에는 Luna 사용량이 발생합니다. 폐기 가능한 저장소를
+만들고, worktree 외부 명령 승인 하나를 제시한 뒤 거부하며, 파일이
+생성되지 않았는지 확인하고 fixture를 제거합니다.
 
 ```sh
 npm run verify:approval-gateway
 ```
 
-## Use in this repository
+## 이 저장소에서 사용하기
 
-Invoke the skill explicitly:
+스킬을 명시적으로 호출합니다.
 
 ```text
 $ark-team implement this feature
 ```
 
-The skill intentionally does not trigger for ordinary single-agent requests.
-Start a new Codex conversation after adding or changing project custom-agent
-files so the process reloads their definitions.
+이 스킬은 일반적인 단일 에이전트 요청에는 의도적으로 작동하지 않습니다.
+프로젝트 커스텀 에이전트 파일을 추가하거나 변경한 뒤에는 정의를 다시
+불러올 수 있도록 새 Codex 대화를 시작합니다.
 
-## Install globally from this repository
+## 이 저장소에서 전역 설치하기
 
-This repository is also a Codex plugin marketplace. Install the source once,
-then install the plugin:
+이 저장소는 Codex 플러그인 마켓플레이스이기도 합니다. 소스를 한 번
+설치한 다음 플러그인을 설치합니다.
 
 ```sh
 codex plugin marketplace add elicie/ark-team --ref main
 codex plugin add ark-team@ark-team-marketplace
 ```
 
-Confirm the globally installed and enabled plugin:
+전역으로 설치되고 활성화된 플러그인을 확인합니다.
 
 ```sh
 codex plugin list --available --json
 ```
 
-After publishing an update, refresh the marketplace and reinstall or update
-the plugin using the Codex plugin commands shown by the current CLI. Start a
-new Codex session so it reloads the skill and MCP server. Global installation
-provides the runtime and `$ark-team`; each target project continues to control
-its own safe overrides through `.codex/team-orchestrator.toml`.
+업데이트를 배포한 뒤에는 마켓플레이스를 새로 고치고, 현재 CLI가
+안내하는 Codex 플러그인 명령으로 플러그인을 다시 설치하거나
+업데이트합니다. 스킬과 MCP 서버를 다시 불러올 수 있도록 새 Codex
+세션을 시작합니다. 전역 설치는 런타임과 `$ark-team`을 제공하며, 각
+대상 프로젝트는 `.codex/team-orchestrator.toml`을 통해 자체적인 안전한
+재정의를 계속 관리합니다.
 
-## Reference from another repository
+## 다른 저장소에서 참조하기
 
-Create a project-scoped symbolic link to the canonical skill:
+원본 스킬을 가리키는 프로젝트 범위의 심볼릭 링크를 생성합니다.
 
 ```sh
 mkdir -p /absolute/path/to/other-project/.agents/skills
@@ -329,10 +333,11 @@ ln -s /absolute/path/to/arc/plugins/ark-team/skills/ark-team \
   /absolute/path/to/other-project/.agents/skills/ark-team
 ```
 
-Use an absolute path so the link remains unambiguous. Do not overwrite an existing `ark-team` directory or link.
+링크가 명확하도록 절대 경로를 사용합니다. 기존 `ark-team` 디렉터리나
+링크를 덮어쓰지 마십시오.
 
-Copy the project custom agents when the target repository should use the pinned
-native PM/PL/worker roles:
+대상 저장소에서 고정된 네이티브 PM/PL/worker 역할을 사용해야 한다면
+프로젝트 커스텀 에이전트를 복사합니다.
 
 ```sh
 mkdir -p /absolute/path/to/other-project/.codex/agents
@@ -340,7 +345,8 @@ cp .codex/agents/ark_*.toml \
   /absolute/path/to/other-project/.codex/agents/
 ```
 
-To make the skill available to all local projects, link it into the user skill directory instead:
+모든 로컬 프로젝트에서 스킬을 사용하려면 사용자 스킬 디렉터리에
+링크합니다.
 
 ```sh
 mkdir -p ~/.agents/skills
@@ -348,7 +354,7 @@ ln -s /absolute/path/to/arc/plugins/ark-team/skills/ark-team \
   ~/.agents/skills/ark-team
 ```
 
-When symbolic links are unavailable or undesirable, copy the skill instead:
+심볼릭 링크를 사용할 수 없거나 원하지 않는 경우에는 스킬을 복사합니다.
 
 ```sh
 cp -R /absolute/path/to/arc/plugins/ark-team/skills/ark-team \
@@ -366,44 +372,47 @@ Copy-Item C:\path\to\arc\.codex\agents\ark_*.toml `
   C:\path\to\other-project\.codex\agents
 ```
 
-Copied skills do not receive updates from this repository. Use a link or repeat the copy after source changes.
+복사한 스킬에는 이 저장소의 업데이트가 반영되지 않습니다. 링크를
+사용하거나 소스가 변경된 뒤 다시 복사하십시오.
 
-To create a separate customized skill rather than sharing this source, ask Codex:
+이 소스를 공유하는 대신 별도로 커스텀한 스킬을 만들려면 Codex에
+다음과 같이 요청합니다.
 
 ```text
 Use $skill-creator. Read /absolute/path/to/arc/plugins/ark-team/skills/ark-team/SKILL.md
 and its references, then create a project-specific variant without modifying the source.
 ```
 
-Before public distribution, publish a reviewed commit or tag and add an
-explicit license plus durable publisher metadata.
+공개 배포 전에는 검토된 커밋이나 태그를 배포하고, 명시적인 라이선스와
+지속적으로 유효한 배포자 메타데이터를 추가합니다.
 
-## Current implementation boundary
+## 현재 구현 범위
 
-This repository currently provides the validated skill contract, project
-defaults, plugin package, persistent run records, MCP lifecycle/status tools,
-project-scoped native custom agents, an official-SDK role launcher, a tested
-app-server approval gateway, and a persistent MCP scheduler for explicitly
-defined PL and worker assignments. Role sessions now expose strict planning and
-report JSON contracts and can continue completed PM, PL, and worker threads.
-The control plane can also materialize a validated PM plan into durable linked
-team worktrees and preserved local branches, and `ark_team_execute` now drives
-that PM-planning path from one MCP call.
+현재 이 저장소는 검증된 스킬 계약, 프로젝트 기본값, 플러그인 패키지,
+영속적인 실행 레코드, MCP 수명 주기/상태 도구, 프로젝트 범위 네이티브
+커스텀 에이전트, 공식 SDK 역할 런처, 테스트된 app-server 승인
+게이트웨이, 명시적으로 정의된 PL 및 worker 할당을 위한 영속적인 MCP
+스케줄러를 제공합니다. 이제 역할 세션은 엄격한 계획 및 보고서 JSON
+계약을 제공하며, 완료된 PM, PL, worker 스레드를 이어갈 수 있습니다.
+제어 평면은 검증된 PM 계획을 영속적인 연결 팀 worktree와 보존되는
+로컬 브랜치로 구체화할 수 있고, `ark_team_execute`는 한 번의 MCP
+호출로 해당 PM 계획 경로를 구동합니다.
 
-The runtime now dispatches independent teams and workers concurrently, gates
-dependencies, routes stored worker reports into same-session PL continuations,
-applies bounded internal failure retries and report corrections, and stops with
-durable approval or retry-choice state. It also runs a distinct integration PL,
-checks Git ancestry and cleanliness, performs guarded local fast-forward, and
-resumes the PM for final acceptance. It now also gates an exact GitHub push/PR
-tuple behind one explicit approval and cleans verified linked worktrees while
-preserving branches. Persisted approval waits can be explicitly recovered after
-a controller restart on the same thread without carrying the lost approval into
-the new turn. The next runtime slices are still required to add explicit
-external-provider and non-Git adapters. The current control plane does not
-claim those remaining guarantees.
+이제 런타임은 서로 독립적인 팀과 worker를 동시에 배정하고, 의존성을
+통제하며, 저장된 worker 보고서를 동일 세션의 PL 이어가기로 전달하고,
+범위가 제한된 내부 실패 재시도 및 보고서 수정을 적용하며, 영속적인
+승인 또는 재시도 선택 상태에서 중단합니다. 또한 별도의 통합 PL을
+실행하고, Git 계보와 청결 상태를 검사하며, 보호 절차가 적용된 로컬
+fast-forward를 수행한 뒤, 최종 인수를 위해 PM을 재개합니다. 이제
+정확한 GitHub push/PR 튜플도 한 번의 명시적인 승인으로 통제하며,
+브랜치를 보존한 채 검증된 연결 worktree를 정리합니다. 영속화된 승인
+대기는 컨트롤러가 재시작된 뒤 같은 스레드에서 명시적으로 복구할 수
+있으며, 사라진 승인을 새 턴으로 넘기지 않습니다. 명시적인 외부
+provider 및 Git 이외의 adapter를 추가하려면 다음 런타임 구현 단위가
+여전히 필요합니다. 현재 제어 평면은 아직 남아 있는 해당 보장을
+제공한다고 주장하지 않습니다.
 
-The active Git linked-worktree/Sol → Terra → Luna orchestration goal is
-implemented end to end and globally installable. Deterministic tests exercise
-the complete hierarchy, approval and retry stops, guarded local and remote
-handoffs, cleanup, and restart recovery without spending live model usage.
+활성화된 Git 연결 worktree/Sol → Terra → Luna 오케스트레이션 목표는
+처음부터 끝까지 구현되었으며 전역 설치할 수 있습니다. 결정론적
+테스트는 실제 모델 사용량을 소비하지 않고 전체 계층, 승인 및 재시도
+중단, 보호된 로컬 및 원격 인계, 정리, 재시작 복구를 검사합니다.
