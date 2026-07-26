@@ -1282,7 +1282,7 @@ async function withIntegratedTeams(
       plan: pmPlan,
       workspaces: prepared,
     });
-    for (const [index, workspace] of prepared.entries()) {
+    for (const workspace of prepared) {
       const teamId = workspace.team_id;
       const workerKey = `${teamId}-worker`;
       const plPlan = workerPlan(teamId, workerKey);
@@ -1314,7 +1314,7 @@ async function withIntegratedTeams(
         working_directory: workspace.working_directory,
         output_contract: "worker_report",
       });
-      const relativeFile = `team-${index + 1}.txt`;
+      const relativeFile = `${teamId}.txt`;
       await writeFile(
         path.join(workspace.working_directory, relativeFile),
         `${teamId}\n`,
@@ -1337,7 +1337,7 @@ async function withIntegratedTeams(
         "rev-parse",
         "HEAD",
       ]);
-      const workerResult = workerReport(teamId, workerKey, relativeFile, commitSha);
+      const workerResult = workerReport(teamId, workerKey, relativeFile);
       await store.recordAssignmentUpdate(
         run.run_id,
         worker.assignment_id,
@@ -1421,7 +1421,6 @@ function workerReport(
   teamId: string,
   workerKey: string,
   changedFile: string,
-  commitSha: string,
 ): WorkerReport {
   return {
     kind: "worker_report",
@@ -1430,7 +1429,7 @@ function workerReport(
     status: "completed",
     summary: `${workerKey} complete`,
     changed_files: [changedFile],
-    commit_sha: commitSha,
+    commit_sha: null,
     verification: [
       {
         name: "focused check",
@@ -1454,7 +1453,7 @@ function workerPlan(teamId: string, workerKey: string): PlWorkerPlan {
         dependencies: [],
         acceptance_criteria: [`${workerKey} complete`],
         verification: [`Verify ${workerKey}`],
-        commit_required: true,
+        commit_required: false,
       },
     ],
   };

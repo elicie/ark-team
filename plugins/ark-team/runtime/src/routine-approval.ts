@@ -94,7 +94,7 @@ function isRoutineCommit(
   command: string,
   role: AssignmentRecord["role"],
 ): boolean {
-  if (role !== "pl" && role !== "worker" && role !== "integration_pl") {
+  if (role !== "pl" && role !== "integration_pl") {
     return false;
   }
   return /^git commit -m (?:"[^"]{1,200}"|'[^']{1,200}')$/.test(command);
@@ -105,7 +105,7 @@ function isRoutineAdd(
   assignment: RoutineApprovalContext["assignment"],
   teams: RoutineApprovalContext["teams"],
 ): boolean {
-  if (assignment.role !== "pl" && assignment.role !== "worker") {
+  if (assignment.role !== "pl") {
     return false;
   }
   const match = command.match(

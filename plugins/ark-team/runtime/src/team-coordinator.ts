@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import type {
   AssignmentRecord,
   RunRecord,
@@ -538,6 +540,8 @@ export function buildPlPlanningAssignment(team: TeamRecord): string {
     `Dependencies: ${JSON.stringify(team.dependencies)}`,
     `Acceptance criteria: ${JSON.stringify(team.acceptance_criteria)}`,
     `Verification: ${JSON.stringify(team.verification)}`,
+    "Workers that may run in the same dependency wave must have non-overlapping owned_paths.",
+    "Set commit_required to false for every worker. Workers edit, test, and report; the PL owns team staging and commit.",
     "Inspect the linked team worktree and return one strict pl_worker_plan.",
     `Return exactly ${team.worker_count} bounded worker records with unique ownership and explicit dependency keys.`,
     "Do not implement the mission in this planning turn.",
@@ -557,6 +561,7 @@ function buildWorkerAssignment(
     `Acceptance criteria: ${JSON.stringify(worker.acceptance_criteria)}`,
     `Verification: ${JSON.stringify(worker.verification)}`,
     `Local commit required: ${worker.commit_required}`,
+    "Do not run git add or git commit. The PL owns staging and the team commit.",
     "Execute only this bounded assignment and return one strict worker_report.",
   ].join("\n");
 }
@@ -573,6 +578,8 @@ function buildPlFinalAssignment(
     "The managed workers returned these validated reports:",
     JSON.stringify(reports),
     "Inspect their observable changes and evidence in the team worktree.",
+    "If workers changed files, stage only team-owned paths, create one local team commit, leave the worktree clean, and return its full SHA as integration_commit_sha.",
+    "Do not create an empty commit when workers changed no files.",
     "Consolidate them into one strict pl_report. Do not claim completion when required evidence failed or is missing.",
   ].join("\n");
 }
@@ -592,6 +599,12 @@ function buildCorrectionAssignment(
     "Previous structured report:",
     JSON.stringify(assignment.structured_report),
     `Return a corrected strict ${assignment.output_contract} for the same bounded assignment.`,
+    ...(assignment.output_contract === "pl_worker_plan"
+      ? [
+          "Workers that may run in the same dependency wave must have non-overlapping owned_paths.",
+          "Set commit_required to false for every worker; the PL owns team staging and commit.",
+        ]
+      : []),
     "Inspect the existing worktree evidence. Do not claim completion until every stated deficiency is resolved.",
   ].join("\n");
 }
@@ -605,6 +618,43 @@ function plWorkerPlanProblem(
   }
   if (plan.workers.length !== team.worker_count) {
     return `PL planned ${plan.workers.length} workers, expected ${team.worker_count}`;
+  }
+  const committingWorker = plan.workers.find(
+    (worker) => worker.commit_required,
+  );
+  if (committingWorker) {
+    return `Worker ${committingWorker.worker_key} must set commit_required to false; the PL owns the team commit`;
+  }
+  const workersByKey = new Map(
+    plan.workers.map((worker) => [worker.worker_key, worker]),
+  );
+  const waves = new Map<string, number>();
+  for (let leftIndex = 0; leftIndex < plan.workers.length; leftIndex += 1) {
+    const left = plan.workers[leftIndex];
+    if (!left) {
+      continue;
+    }
+    for (
+      let rightIndex = leftIndex + 1;
+      rightIndex < plan.workers.length;
+      rightIndex += 1
+    ) {
+      const right = plan.workers[rightIndex];
+      if (
+        !right ||
+        workerWave(left.worker_key, workersByKey, waves) !==
+          workerWave(right.worker_key, workersByKey, waves)
+      ) {
+        continue;
+      }
+      const overlap = findOwnedPathOverlap(
+        left.owned_paths,
+        right.owned_paths,
+      );
+      if (overlap) {
+        return `Concurrent workers ${left.worker_key} and ${right.worker_key} have overlapping owned_paths: ${overlap}`;
+      }
+    }
   }
   return null;
 }
@@ -639,8 +689,14 @@ function workerReportProblem(
   if (report.verification.some((verification) => verification.status !== "passed")) {
     return `Worker ${plannedWorker.worker_key} lacks passing verification`;
   }
-  if (plannedWorker.commit_required && report.commit_sha === null) {
-    return `Worker ${plannedWorker.worker_key} omitted its required local commit`;
+  if (report.commit_sha !== null) {
+    return `Worker ${plannedWorker.worker_key} must leave staging and commit to the PL`;
+  }
+  const unownedPath = report.changed_files.find(
+    (changedFile) => !isOwnedPath(changedFile, plannedWorker.owned_paths),
+  );
+  if (unownedPath !== undefined) {
+    return `Worker ${plannedWorker.worker_key} reported a changed file outside owned_paths: ${unownedPath}`;
   }
   return null;
 }
@@ -712,6 +768,95 @@ function finalPlReportProblem(
   );
   if (JSON.stringify(actualReports) !== JSON.stringify(reported)) {
     return `Final PL report for ${team.team_id} changed or omitted worker evidence`;
+  }
+  if (
+    actualReports.some((worker) => worker.changed_files.length > 0) &&
+    report.integration_commit_sha === null
+  ) {
+    return `Final PL report for ${team.team_id} omitted the team commit`;
+  }
+  return null;
+}
+
+function isOwnedPath(
+  changedFile: string,
+  ownedPaths: readonly string[],
+): boolean {
+  const changed = normalizeRelativePath(changedFile);
+  if (changed === null) {
+    return false;
+  }
+  return ownedPaths.some((ownedPath) => {
+    const owned = normalizeRelativePath(ownedPath);
+    return (
+      owned !== null &&
+      (changed === owned || changed.startsWith(`${owned}/`))
+    );
+  });
+}
+
+function normalizeRelativePath(candidate: string): string | null {
+  if (
+    !candidate ||
+    path.posix.isAbsolute(candidate) ||
+    candidate.includes("\\")
+  ) {
+    return null;
+  }
+  const normalized = path.posix.normalize(candidate);
+  if (
+    normalized === "." ||
+    normalized === ".." ||
+    normalized.startsWith("../")
+  ) {
+    return null;
+  }
+  return normalized.replace(/^\.\//, "");
+}
+
+function workerWave(
+  workerKey: string,
+  workersByKey: ReadonlyMap<
+    string,
+    { dependencies: readonly string[] }
+  >,
+  waves: Map<string, number>,
+): number {
+  const existing = waves.get(workerKey);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const dependencies = workersByKey.get(workerKey)?.dependencies ?? [];
+  const wave =
+    dependencies.length === 0
+      ? 0
+      : Math.max(
+          ...dependencies.map((dependency) =>
+            workerWave(dependency, workersByKey, waves),
+          ),
+        ) + 1;
+  waves.set(workerKey, wave);
+  return wave;
+}
+
+function findOwnedPathOverlap(
+  leftPaths: readonly string[],
+  rightPaths: readonly string[],
+): string | null {
+  for (const leftPath of leftPaths) {
+    const left = normalizeRelativePath(leftPath);
+    for (const rightPath of rightPaths) {
+      const right = normalizeRelativePath(rightPath);
+      if (
+        left !== null &&
+        right !== null &&
+        (left === right ||
+          left.startsWith(`${right}/`) ||
+          right.startsWith(`${left}/`))
+      ) {
+        return `${leftPath} <> ${rightPath}`;
+      }
+    }
   }
   return null;
 }

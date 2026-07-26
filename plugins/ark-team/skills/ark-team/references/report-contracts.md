@@ -33,6 +33,10 @@ Known risks:
 Blockers or follow-up:
 ```
 
+For managed shared-team worktrees, require workers to report `none` for the
+local commit. The owning PL stages validated worker changes and creates the
+team commit.
+
 Reject a `completed` report that lacks evidence appropriate to the task.
 
 ## PL report

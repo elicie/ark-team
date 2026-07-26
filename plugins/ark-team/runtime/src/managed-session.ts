@@ -73,7 +73,7 @@ export const managedRoleProfiles: Readonly<Record<ManagedRole, ManagedRoleProfil
       "Execute exactly one bounded assignment inside the assigned linked Git worktree.",
       "Do not spawn or delegate to other agents.",
       "Preserve unrelated user work, run focused verification, and report observable evidence to the owning PL.",
-      "Create a local commit only when the assignment explicitly requests it.",
+      "Do not stage or commit changes; the owning PL creates the team commit after worker validation.",
     ].join(" "),
   },
 };

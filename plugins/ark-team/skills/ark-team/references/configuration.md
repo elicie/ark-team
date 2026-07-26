@@ -287,8 +287,8 @@ the returned model, `xhigh` effort, `workspace-write` sandbox,
 The low-level gateway returns `waiting_user` for command, file-change, and
 permission requests without answering them. The persistent scheduler may
 deliver `approve_once` automatically only when its exact-worktree routine
-classifier accepts `npm ci`, a bounded local test, team-owned staging, a local
-commit, or an integration merge of a recorded team branch. It persists the
+classifier accepts `npm ci`, a bounded local test, PL-owned staging, a PL or
+integration-PL commit, or an integration merge of a recorded team branch. It persists the
 request and `routine_policy` decision before continuing the same turn. An exact
 ` && ` chain is eligible only when it has at most four components and every
 component independently passes the same classifier.

@@ -15,7 +15,7 @@ const teams = [
 ];
 
 test("TEST-1603 accepts only bounded routine Git and npm commands", () => {
-  const teamAssignment = {
+  const workerAssignment = {
     role: "worker" as const,
     team_id: "team-a",
     working_directory: worktree,
@@ -24,13 +24,31 @@ test("TEST-1603 accepts only bounded routine Git and npm commands", () => {
     "/usr/bin/zsh -lc 'npm ci'",
     "/usr/bin/zsh -lc 'npm test'",
     "/usr/bin/zsh -lc 'npm run test:unit'",
+  ]) {
+    assert.equal(
+      isRoutineCommandApproval({
+        assignment: workerAssignment,
+        approval: commandApproval(command, worktree),
+        teams,
+      }),
+      true,
+      command,
+    );
+  }
+
+  const plAssignment = {
+    role: "pl" as const,
+    team_id: "team-a",
+    working_directory: worktree,
+  };
+  for (const command of [
     "/usr/bin/zsh -lc 'git add src/slugify.ts test/slugify.test.ts'",
     "/usr/bin/zsh -lc 'git add -- src/slugify.ts test/slugify.test.ts && git commit -m \"Implement slugify\"'",
     "/usr/bin/zsh -lc 'git commit -m \"Implement slugify\"'",
   ]) {
     assert.equal(
       isRoutineCommandApproval({
-        assignment: teamAssignment,
+        assignment: plAssignment,
         approval: commandApproval(command, worktree),
         teams,
       }),
@@ -63,6 +81,8 @@ test("TEST-1604 rejects dangerous, broad, composed, and misplaced approvals", ()
     working_directory: worktree,
   };
   for (const command of [
+    "/usr/bin/zsh -lc 'git add src/slugify.ts test/slugify.test.ts'",
+    "/usr/bin/zsh -lc 'git commit -m \"Implement slugify\"'",
     "/usr/bin/zsh -lc 'git push origin main'",
     "/usr/bin/zsh -lc 'git reset --hard HEAD~1'",
     "/usr/bin/zsh -lc 'git clean -fd'",

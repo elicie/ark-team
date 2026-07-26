@@ -42,6 +42,8 @@ const expectedAgents: ExpectedAgent[] = [
       "Spawn only the custom agent named ark_worker",
       "WORKER_SPAWN_REQUEST",
       "one PL report",
+      "non-overlapping paths",
+      "team's local commit",
     ],
   },
   {
@@ -54,6 +56,7 @@ const expectedAgents: ExpectedAgent[] = [
       "Do not spawn or delegate to other agents.",
       "one worker report",
       "owning ark_pl",
+      "Do not stage or commit changes",
     ],
   },
 ];
@@ -96,6 +99,8 @@ test("TEST-201 skill selects named roles and preserves the fallback hierarchy", 
   assert.match(skill, /Preserve the logical reporting hierarchy/);
   assert.match(skill, /Do not treat custom-agent TOML permissions as an isolation boundary/);
   assert.match(skill, /For a writing run, require a managed runtime/);
+  assert.match(skill, /Workers edit, test, and report without/);
+  assert.match(skill, /create the team's local commit/);
 });
 
 function readString(content: string, key: string): string {

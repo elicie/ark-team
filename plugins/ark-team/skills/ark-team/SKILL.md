@@ -67,6 +67,11 @@ Do the following as PM:
 
 Give every PL a bounded mission, owned paths or artifacts, dependencies, and a definition of done.
 
+Within one team worktree, let dependency-ready workers run in parallel only
+when their owned paths do not overlap. Workers edit, test, and report without
+staging or committing. After validating all worker reports, require the PL to
+stage only team-owned paths and create the team's local commit.
+
 Require workers to report to their PL. Require PLs to validate and consolidate worker results before reporting to PM.
 
 Select the named custom agents for every role:
@@ -137,8 +142,8 @@ reason and counters, and wait for the user to choose `retry_once` or
 
 Continue ordinary in-scope work without approval. Pause for the dangerous actions listed in the operating contract.
 
-The managed scheduler resolves only exact-worktree routine test, owned-path
-staging, local commit, and recorded-branch integration requests with one-time
+The managed scheduler resolves only exact-worktree routine test, PL-owned-path
+staging, PL or integration commit, and recorded-branch integration requests with one-time
 approval and records `routine_policy` in the event log. A bounded exact ` && `
 chain is eligible only when every component independently qualifies. The
 policy never applies to remote, destructive, partially validated shell,

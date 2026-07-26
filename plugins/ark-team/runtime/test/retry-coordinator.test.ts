@@ -108,12 +108,14 @@ test("TEST-1003 and TEST-1004 apply two same-session corrections per report stag
         }
         if (request.output_contract === "pl_worker_plan") {
           planTurns += 1;
-          return completedPlPlan(
-            teamId,
-            planTurns < 3
-              ? workerPlan(teamId, ["worker-1"])
-              : workerPlan(teamId, ["worker-1", "worker-2"]),
-          );
+          const report = workerPlan(teamId, ["worker-1", "worker-2"]);
+          if (planTurns === 1 && report.workers[0]) {
+            report.workers[0].commit_required = true;
+          }
+          if (planTurns === 2 && report.workers[1]) {
+            report.workers[1].owned_paths = ["src/worker-1.ts"];
+          }
+          return completedPlPlan(teamId, report);
         }
         if (request.output_contract === "worker_report") {
           const workerKey = extract(request.assignment, "Worker key");
@@ -160,6 +162,58 @@ test("TEST-1003 and TEST-1004 apply two same-session corrections per report stag
           .length,
         6,
       );
+
+      await cleanupPrepared(manager, repository, prepared);
+    },
+  );
+});
+
+test("TEST-1613 corrects worker reports outside owned paths", async () => {
+  await withCoordinatorFixture(
+    plan([team("team-a", 1)]),
+    async ({ runId, store, manager, prepared, repository }) => {
+      let workerTurns = 0;
+      const scheduler = schedulerWith(store, async (request) => {
+        const teamId = extract(request.assignment, "Team");
+        if (request.output_contract === "pl_worker_plan") {
+          return completedPlPlan(
+            teamId,
+            workerPlan(teamId, ["worker-1"]),
+          );
+        }
+        if (request.output_contract === "worker_report") {
+          workerTurns += 1;
+          const workerKey = extract(request.assignment, "Worker key");
+          const report = workerReport(teamId, workerKey, true);
+          if (workerTurns === 1) {
+            report.changed_files = ["src/outside.ts"];
+          }
+          return completedUpdate(
+            "worker",
+            `worker-${teamId}-${workerKey}`,
+            `worker-${workerKey}`,
+            report,
+          );
+        }
+        if (request.output_contract === "pl_report") {
+          return completedPlReport(
+            teamId,
+            request.resume_session_id ?? `pl-${teamId}`,
+            true,
+            ["worker-1"],
+          );
+        }
+        throw new Error("Unexpected output contract");
+      });
+      const coordinator = new TeamCoordinator(store, scheduler);
+
+      const result = await coordinator.advance(runId);
+      assert.equal(result.run.state, "integrating");
+      assert.equal(workerTurns, 2);
+      const worker = result.assignments.find(
+        (assignment) => assignment.role === "worker",
+      );
+      assert.equal(worker?.correction_count, 1);
 
       await cleanupPrepared(manager, repository, prepared);
     },
@@ -416,7 +470,7 @@ function completedPlReport(
     worker_reports: workerKeys.map((workerKey) =>
       workerReport(teamId, workerKey, true),
     ),
-    integration_commit_sha: null,
+    integration_commit_sha: completed ? "a".repeat(40) : null,
     verification: [
       {
         name: "team verification",
@@ -486,7 +540,7 @@ function workerPlan(teamId: string, workerKeys: string[]): PlWorkerPlan {
       dependencies: [],
       acceptance_criteria: [`${workerKey} is complete.`],
       verification: [`Verify ${workerKey}.`],
-      commit_required: false,
+      commit_required: false as const,
     })),
   };
 }

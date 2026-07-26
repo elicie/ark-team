@@ -50,7 +50,7 @@ Require each PL to:
 - coordinate dependencies;
 - inspect worker evidence;
 - request up to two correction rounds;
-- integrate work inside the team's assigned workspace when needed; and
+- stage only team-owned worker changes and create the team's local commit; and
 - return one consolidated report to PM.
 
 Do not let a PL declare success solely from worker statements. Require observable evidence.
@@ -65,7 +65,7 @@ Require each worker to:
 - preserve unrelated user changes;
 - perform the requested implementation, research, review, or verification;
 - run focused checks;
-- commit writing work locally when instructed; and
+- leave staging and commit to the owning PL; and
 - report result, evidence, risks, and blockers to the PL.
 
 Use Z.AI, Kimi, or another external provider only after an explicit user request.
@@ -174,8 +174,8 @@ Follow any stricter repository, system, or user instruction.
 For an interactive managed writer session, the controller may automatically
 deliver one-time approval only for a command it independently validates as a
 routine operation in the exact registered worktree: lockfile-pinned `npm ci`,
-bounded local test scripts, `git add` limited to recorded team-owned paths,
-an inert-message local `git commit`, or an integration-PL merge of an exact
+bounded local test scripts, a PL's `git add` limited to recorded team-owned paths,
+an inert-message PL or integration-PL local `git commit`, or an integration-PL merge of an exact
 recorded team branch. Up to four commands may be joined by exact ` && `
 separators only when every component independently passes those checks.
 Persist the request and its `routine_policy` decision before delivery. Never

@@ -17,6 +17,9 @@ and verification requirements.
 Keep changes inside the assigned workspace and preserve unrelated user work.
 Request approval only for actions outside the approved ordinary local workflow.
 Local edits, focused tests, and instructed local commits are ordinary work.
+Workers that may run in the same dependency wave must own non-overlapping paths.
+Workers edit, test, and report without staging or committing. After validating
+their results, stage only team-owned paths and create the team's local commit.
 
 Inspect worker artifacts and verification evidence. Allow at most two correction
 rounds per worker. Consolidate worker outcomes into one PL report with team,

@@ -64,6 +64,17 @@ test("TEST-902–TEST-906 run PL/worker waves, approvals, reports, and dependenc
     assert.equal(first.waiting_approvals, 2);
     assert.equal(first.run.state, "waiting_user");
     assert.deepEqual(harness.initialPlanningTeams.sort(), ["team-a", "team-b"]);
+    assert.equal(harness.initialPlanningAssignments.length, 2);
+    for (const assignment of harness.initialPlanningAssignments) {
+      assert.match(
+        assignment,
+        /same dependency wave must have non-overlapping owned_paths/,
+      );
+      assert.match(
+        assignment,
+        /Set commit_required to false for every worker/,
+      );
+    }
     assert.equal(
       first.assignments.some((assignment) => assignment.team_id === "team-c"),
       false,
@@ -153,6 +164,7 @@ test("TEST-902–TEST-906 run PL/worker waves, approvals, reports, and dependenc
 
 class CoordinatorHarness {
   readonly initialPlanningTeams: string[] = [];
+  readonly initialPlanningAssignments: string[] = [];
   readonly planningOrder: string[] = [];
   readonly workerStartOrder: string[] = [];
   readonly resumedSessions: string[] = [];
@@ -181,6 +193,7 @@ class HarnessSession implements ApprovalSessionHandle {
     this.request = request;
     const teamId = extract(request.assignment, "Team");
     if (request.output_contract === "pl_worker_plan") {
+      this.harness.initialPlanningAssignments.push(request.assignment);
       this.harness.planningOrder.push(teamId);
       if (teamId === "team-a" || teamId === "team-b") {
         await this.harness.waitForInitialPlanning(teamId);
@@ -310,7 +323,7 @@ function completedPlReport(
     status: "completed" as const,
     summary: `${teamId} completed`,
     worker_reports: workers,
-    integration_commit_sha: null,
+    integration_commit_sha: "a".repeat(40),
     verification: [
       {
         name: "team verification",
@@ -388,7 +401,7 @@ function worker(workerKey: string, dependencies: string[]) {
     dependencies,
     acceptance_criteria: [`${workerKey} is complete.`],
     verification: [`Verify ${workerKey}.`],
-    commit_required: false,
+    commit_required: false as const,
   };
 }
 
