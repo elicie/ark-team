@@ -1,1268 +1,1056 @@
-# Closed Contract — SLICE-017
+# Closed Contract — SLICE-017 — verification-spec-v2
 
-- Spec identity: `verification-spec-v1` — the user-approved SDD package for a
-  deterministic local API, browser, screenshot, image-review, and comparison
-  verification handoff.
+- Package identity: `verification-spec-v2`.
 - Package status: `SPEC_APPROVED`.
-- Authority: the owning PL's approved SDD package and this explicit handoff;
-  no product behavior is inferred from an external source.
 - Authority date: 2026-07-26 UTC.
-- Git source identity: `origin/main` / `refs/heads/main` at commit
-  `50531832a57e3fd0dae093b7ad0b51197e668045`.
-- Descriptive main label: `Ark Team verification source — main @ 5053183`.
-- Capture state: `GIT_CLEAN` at capture. The source checkout had no staged,
-  unstaged, or untracked paths before this contract was authored.
-- Source fingerprint: Git tree
-  `de77e16a2c257456721bd44fc260f6b90afd2af6`; the tuple
-  `commit + tree + refs/heads/main + authority date` is the package identity.
-- Source-drift policy: strict. Before implementation or verification, compare
-  the recorded commit, tree, branch label, and clean-capture assertion with the
-  selected source. Any mismatch is `SPEC_DRIFT`; stop, preserve artifacts, and
-  recapture or obtain an explicit package delta. Do not silently rebase this
-  contract or accept a changed source as equivalent.
-- Reference boundary: `NONE`. The assignment package and the recorded Git
-  source are the only authorities; no web, installed-product, external API,
-  screenshot, image, model, or other reference material is admitted.
-- Objective: define one closed, documentation-only implementation handoff for
-  reproducible local verification. The future implementation must persist an
-  immutable run/config snapshot, gate unavailable capabilities, exercise the
-  declared API and browser contracts, capture controlled visual artifacts,
-  review and compare them against an immutable baseline, and report a bounded
-  outcome without leaking secrets or claiming unrun work.
+- Authority: the user-approved assignment, the authority/evidence review, the
+  inspected repository source and configuration conventions, the role and
+  approval contracts, and the adjacent Closed Contract slice documents.
+- Reference boundary: `NONE`. No web page, installed product, remote service,
+  screenshot, image, model output, or external API is an authority for product
+  behavior in this package.
+- Deliverable: this documentation file only. It defines a future local
+  verification coordinator and does not implement or execute that coordinator.
 
-## Evidence inventory
+## Authority and evidence boundary
 
-The inventory is classified so that observations are not mistaken for future
-implementation evidence.
+The following inventory records what informed this contract. It distinguishes
+normative authority from observations and from checks that have not been run.
 
-| Evidence ID | Class | Captured item | Authority and use | Limitation |
+| Evidence ID | Class | Observed or supplied item | Use | Boundary |
 | --- | --- | --- | --- | --- |
-| `EVID-1701` | `SDD_PACKAGE` | The assignment's requirements, acceptance criteria, and verification obligations | Normative source for this closed contract | Does not prove implementation or runtime behavior |
-| `EVID-1702` | `GIT_SOURCE_IDENTITY` | `origin/main`, commit `50531832a57e3fd0dae093b7ad0b51197e668045`, tree `de77e16a2c257456721bd44fc260f6b90afd2af6` | Identifies the captured source and drift boundary | Valid only for the recorded capture |
-| `EVID-1703` | `GIT_CAPTURE_STATE` | Clean Git status before authoring this file | Establishes the baseline method `GIT_CLEAN` | The intended new slice file is the only post-capture change |
-| `EVID-1704` | `REPOSITORY_CONVENTION` | `docs/slices/SLICE-016.md` and adjacent Closed Contract slices | Supplies document structure and traceability conventions | Convention is not evidence that the new contract is implemented |
-| `EVID-1705` | `OPERATING_CONSTRAINT` | Local-only execution, explicit dangerous-action approval, bounded artifacts, and no private reasoning | Fixes safety and reporting controls | No command, server, browser, API, screenshot, or image-review run is claimed |
-| `EVID-1706` | `NOT_EXECUTED` | No product runtime, live browser, API, screenshot, image reviewer, comparator, generator, build, or product test was run for this handoff | Makes the verification boundary explicit | All `TEST-17xx` procedures below remain future implementation checks |
+| `EVID-1701` | `USER_REQUIREMENT` | Assignment scope, acceptance criteria, dependency, and handoff obligations | Normative authority for this slice | Does not prove implementation or runtime behavior |
+| `EVID-1702` | `DOCUMENT_CONVENTION` | Adjacent Closed Contract slices, especially the objective/requirement/acceptance/test/slice convention | Defines document structure and traceability form | Convention is not product evidence |
+| `EVID-1703` | `SOURCE_OBSERVATION` | Controller/integration flow places coordinator verification after integration and before the original Sol/xhigh read-only PM final review | Fixes the PM gate and coordinator boundary | No live controller run was performed |
+| `EVID-1704` | `SOURCE_OBSERVATION` | Existing TOML configuration and persisted run-record mechanisms are the extension points for resolved verification configuration and snapshots | Fixes the first-slice integration boundary | The required extension is not implemented by this document |
+| `EVID-1705` | `CONSTRAINT` | Role hierarchy, literal-argv execution, approval routing, local-only scope, and artifact-safety constraints | Fixes safety, ownership, and reporting controls | No dangerous, remote, or product action is authorized here |
+| `EVID-1706` | `PARTIAL_PROTOCOL_OBSERVATION` | The app-server/local-image protocol is usable only when an active-turn runtime signal advertises `localImage`; model or package presence is not sufficient | Defines semantic-review capability detection | No active runtime signal was observed |
+| `EVID-1707` | `NOT_EXECUTED` | Browser, API, server, screenshot, image review, comparison, build, product tests, and bootstrap behavior | Makes the future verification boundary explicit | Every `TEST-17xx` below remains `NOT_RUN` |
 
-`EVID-1701` and `EVID-1705` are authority inputs, not observed product
-results. `EVID-1702` and `EVID-1703` are source-capture facts. No row in this
-document claims future runtime verification was executed.
+No route, selector, action, baseline, browser installation, image capability,
+secret, remote authority, or visual result is inferred from these findings.
+Unknown acceptance-relevant facts are handled by the structured
+`SPEC_DELTA_REQUIRED` result defined below.
 
-## Closed terminology and fixed literals
+## Scope, actors, vocabulary, and status
 
-- A **source snapshot** is the exact Git identity and clean-state record above.
-- A **baseline** is an approved, immutable visual artifact plus its hash and
-  capture snapshot. A baseline is never replaced in place.
-- A **run snapshot** is the immutable configuration and environment record
-  created before the first API request or browser navigation.
-- An **artifact root** is the pre-registered absolute directory for one run;
-  every output path is resolved beneath it with component-boundary checks and
-  symlink escape checks.
-- A **capability** is an independently checked ability such as `server`,
-  `api`, `browser`, `screenshot`, `image_review`, or `comparison`.
-- A **passed** result is complete, not partial. Missing capability,
-  missing artifact, source drift, unresolved approval, or an unrun required
-  check cannot be represented as passed.
-- Required viewport literals are exactly `375x812`, `768x1024`, and
-  `1440x900`. The device scale factor is `1`; locale is `en-US`; timezone is
-  `UTC`; color scheme is `light`; and reduced motion is `no-preference`.
-- The bootstrap server defaults to port `10001`. If it is occupied, the
-  implementation selects the next available port at or above `10001` and
-  records that literal port in the run snapshot. Port `3000` is prohibited.
-  The server binds `0.0.0.0` and accepts the hostname `dev`. A Next.js target
-  must include `dev` in `allowedDevOrigins`.
-- The default bootstrap origin is `http://dev:<recorded-port>`. A scenario may
-  declare another local path only when the path, method, expected response, and
-  readiness condition are all present in the immutable scenario snapshot.
+### Scope and actors
 
-## Scope, actors, lifecycle, and outcomes
+This slice specifies one coordinator for bounded local verification. It covers
+dynamic source/config capture, strict configuration, immutable run records,
+capability discovery, local-server readiness, literal-argv API checks,
+reproducible browser checks, exact screenshot capture, semantic image review,
+immutable baseline comparison, artifact retention, PM gating, rollback, and a
+single bootstrap scenario.
 
-### Scope
+Actors are the coordinator, implementation PL, integration PL, original PM,
+operator/approving user, local server, API adapter, browser adapter, screenshot
+adapter, semantic-review adapter, comparison adapter, reviewer, and artifact
+store. Only the coordinator advances verification state. Adapters return typed
+records and cannot mutate snapshots, baselines, outcomes, or registered paths.
 
-This slice defines the contract for a verification coordinator and its local
-evidence. It covers source identity, run/config snapshots, server readiness,
-capability gating, API requests, browser actions, screenshot capture, image
-review, baseline comparison, artifact retention, outcomes, and the bootstrap
-scenario. It is intentionally a handoff, not an implementation.
+The coordinator runs after an integrated result exists and before the original
+Sol/xhigh read-only PM final review. It is not a team and does not alter the
+Sol/Terra/Luna hierarchy, sandbox rules, or approval rules.
 
-Actors are the verification coordinator, the operator or approving user, the
-local server under test, the literal-argv API client, the browser runner, the
-screenshot capturer, the image-review capability, the comparison engine, and
-the artifact store. The coordinator is the only component that changes run
-state. A reviewer may approve or reject a baseline or image review, but may
-not alter the captured bytes.
+### Closed vocabulary
 
-The lifecycle is:
+- **Implementation baseline**: a dynamic, immutable capture of the selected
+  source worktree and approved package immediately before implementation or a
+  later verification stage begins.
+- **Package fingerprint**: the SHA-256 of the canonical approved
+  `SLICE-017.md` bytes together with its package identity and authority date.
+- **Run snapshot**: the immutable, resolved configuration and environment
+  record created before the first server, API, or browser action.
+- **Artifact root**: the registered absolute per-run directory
+  `<ARK_TEAM_STATE_ROOT>/<run_id>/verification`; all per-run outputs stay
+  beneath it.
+- **Approved baseline**: an immutable, content-addressed visual artifact and
+  manifest approved by one explicit user decision for its exact identity and
+  environment tuple.
+- **Required check**: a check whose `required` field is `true` in the immutable
+  run snapshot. A required check cannot be silently downgraded.
+- **Capability**: an independently detected ability named `server`, `api`,
+  `browser`, `screenshot`, `semantic_review`, or `comparison`.
+- **Passed**: every required assertion and required evidence exists and
+  passed. Missing capability, missing artifact, source drift, unresolved
+  approval, skipped required work, or unrun work is not passed.
+
+The only verification terminal outcomes are `passed`, `failed`,
+`unavailable`, `skipped`, and `error`. `SPEC_DELTA_REQUIRED` is a structured
+package/contract disposition and is never a passed outcome.
+
+The coordinator lifecycle is closed:
 
 ```text
-planned
-  → snapshotted
-  → capability_checked
-  → server_ready
-  → executing
-  → captured
-  → reviewed
-  → compared
-  → passed | failed | unavailable | skipped | error
+integrated → configured → snapshotted → capabilities → ready → executing
+→ collecting → deciding
+deciding → passed | failed | unavailable | skipped | error
+passed with every required check → pm_review_pending → original_pm_review
 ```
 
-The following terminal outcome values are closed:
-
-| Outcome | Meaning | Required behavior |
-| --- | --- | --- |
-| `passed` | Every required API, browser, artifact, review, and comparison check passed | Persist all evidence references and the exact snapshot |
-| `failed` | A required assertion, API response, browser assertion, image review, or comparison threshold failed | Preserve the failing artifact and redacted diagnostic; do not retry indefinitely |
-| `unavailable` | A required capability is unavailable or its version is not accepted | Do not execute the dependent check and do not claim passed |
-| `skipped` | An optional check has an unavailable declared prerequisite | Persist its bounded reason and do not use it to satisfy a required check |
-| `error` | Source drift, malformed input, unsafe artifact, timeout exhaustion, or incomplete required evidence occurred | Stop dependent work and preserve bounded diagnostics |
-
-Closed error codes are `SOURCE_DRIFT`, `PACKAGE_FINGERPRINT_MISMATCH`,
+Invalid, repeated, or out-of-order transitions leave the prior state unchanged
+and produce `error` with a bounded diagnostic. Closed error codes are
+`SOURCE_DRIFT`, `PACKAGE_FINGERPRINT_MISMATCH`, `CONFIG_INVALID`,
 `SCENARIO_SNAPSHOT_MISMATCH`, `ARTIFACT_ROOT_INVALID`,
 `BASELINE_NOT_APPROVED`, `CAPABILITY_UNAVAILABLE`, `SERVER_NOT_READY`,
 `API_CONTRACT_MISMATCH`, `BROWSER_CONTRACT_MISMATCH`,
 `SCREENSHOT_CAPTURE_FAILED`, `IMAGE_REVIEW_REJECTED`,
-`COMPARISON_THRESHOLD_FAILED`, `APPROVAL_REQUIRED`, `TIMEOUT`, and
-`INVALID_RECORD`. Every error stores its code, stage, case ID, and a bounded
-redacted message; it stores no credentials, raw model reasoning, or unrestricted
-command output.
+`COMPARISON_THRESHOLD_FAILED`, `APPROVAL_REQUIRED`, `TIMEOUT`,
+`ENVIRONMENT_UNAVAILABLE`, and `INVALID_RECORD`.
 
-### Explicit documentation-only exclusions
+Every error stores its code, stage, case ID, snapshot ID, UTC time, and bounded
+sanitized message. It stores no credential, cookie, secret header, private
+reasoning, or unrestricted command/response output.
 
-This slice does not create or modify product/runtime behavior, test fixtures,
-API routes, browser pages, server configuration, image assets, baselines,
-generators, CI, deployments, infrastructure, Docker configuration, databases,
-remote repositories, credentials, permissions, or external integrations. It
-does not start a development server, call an API, drive a browser, take a
-screenshot, invoke image review or comparison, run product tests/builds, or
-claim that any future `TEST-17xx` procedure passed. It does not choose a
-product-specific endpoint or visual acceptance result outside the literals and
-scenario fields defined here.
+### Documentation-only boundary
 
-## Requirements
+This package does not change product/runtime behavior, routes, fixtures,
+browser pages, server configuration, image assets, baselines, generators, CI,
+deployments, infrastructure, Docker configuration, databases, permissions,
+credentials, remote repositories, or external integrations. It does not start
+a server, call an API, drive a browser, capture an image, invoke image review
+or comparison, run product tests/builds, install a browser/dependency, or claim
+that any future verification passed.
 
-### OBJ-1701 — Authoritative source and approval boundary
+## Normative requirements
 
-#### REQ-1701 — Immutable source identity and clean capture
+### OBJ-1701 — Authority and dynamic source capture
+
+#### REQ-1701 — Dynamic implementation-baseline capture
 
 - Level: `MUST`
-- Source: `SDD_PACKAGE`
-- Actors: coordinator, operator, implementation PL
-- Preconditions: a Git source and package identity are available.
-- Trigger: a run or implementation begins.
-- Observable result: the system records the exact source label, ref, commit,
-  tree fingerprint, authority date, package status, and capture state; a clean
-  capture records `GIT_CLEAN` and a machine-readable empty status.
+- Source: `SDD_PACKAGE` and `SOURCE_OBSERVATION`
+- Actors: implementation PL, coordinator, and operator
+- Preconditions: an approved package and a selected local Git worktree exist.
+- Trigger: implementation of `IS-1701` or any later verification stage is
+  about to begin.
+- Observable result: the system captures one immutable baseline before any
+  dependent action with package ID/fingerprint, authority date, worktree root,
+  ref or detached-state label, full commit, full tree fingerprint, porcelain
+  status, clean-state classification, capture method, and UTC timestamp. The
+  baseline is dynamically read from the selected worktree; an implementation
+  baseline eligible for a stage is `GIT_CLEAN`, while `GIT_DIRTY` is captured
+  and blocks that stage. This contract does not hard-code a commit, tree,
+  branch, or absolute target path.
 - Acceptance: `AC-1701`
 - Verification: `TEST-1701`
 - Implementation slice: `IS-1701`
 
-#### REQ-1702 — Strict drift and reference-boundary enforcement
+#### REQ-1702 — Strict source drift and reference-boundary enforcement
 
 - Level: `MUST`
-- Source: `DECISION`
+- Source: `SAFETY_POLICY`
 - Actors: coordinator and operator
-- Preconditions: a recorded source fingerprint and `Reference boundary: NONE`
-  exist.
-- Trigger: any source, scenario, baseline, or package identity differs from
-  the recorded identity.
-- Observable result: execution stops with `SPEC_DRIFT` or
-  `PACKAGE_FINGERPRINT_MISMATCH`; no external reference is consulted and no
-  stale baseline is used.
+- Preconditions: an implementation baseline and package fingerprint exist.
+- Trigger: any commit, tree, ref label, clean-state assertion, package
+  fingerprint, resolved scenario, or baseline identity differs from the
+  captured values, or a non-`NONE` reference is requested.
+- Observable result: dependent work stops before execution with
+  `SOURCE_DRIFT` or `PACKAGE_FINGERPRINT_MISMATCH`; stale snapshots and
+  baselines are not used, and no external reference is consulted.
 - Acceptance: `AC-1702`
 - Verification: `TEST-1702`
 - Implementation slice: `IS-1701`
 
-### OBJ-1702 — Closed behavior, actors, data, and failure semantics
+### OBJ-1702 — Records, lifecycle, and ownership
 
-#### REQ-1703 — Bounded actor lifecycle and outcome semantics
+#### REQ-1703 — Closed lifecycle and terminal outcomes
 
 - Level: `MUST`
 - Source: `SDD_PACKAGE`
-- Actors: coordinator, server, API client, browser runner, reviewer, and
-  comparison engine
+- Actors: coordinator and all verification adapters
 - Preconditions: a valid run snapshot exists.
-- Trigger: a run advances through a lifecycle stage.
-- Observable result: only the listed lifecycle transitions and terminal
-  outcomes are accepted; a missing, repeated, or out-of-order transition
-  produces `error` without changing the prior state.
+- Trigger: a stage transition or terminal result is submitted.
+- Observable result: only the lifecycle transitions and five terminal outcomes
+  listed above are accepted; invalid or replayed events preserve state and
+  produce a linked `error` record.
 - Acceptance: `AC-1703`
 - Verification: `TEST-1703`
 - Implementation slice: `IS-1703`
 
-#### REQ-1704 — Versioned data and interface records
+#### REQ-1704 — Versioned, linked, and append-only evidence records
 
 - Level: `MUST`
 - Source: `CONSTRAINT`
 - Actors: coordinator and artifact store
-- Preconditions: the run is being snapshotted.
-- Trigger: a record or artifact reference is persisted.
-- Observable result: each record has `schema_version: 1`, a non-empty run ID,
-  case ID, stage, timestamp, source fingerprint, and artifact references; API,
-  browser, screenshot, review, comparison, and outcome records are linked by
-  those identifiers and reject unknown required states.
+- Preconditions: a snapshot, case, or artifact record is being persisted.
+- Trigger: a record is created or an adapter returns evidence.
+- Observable result: every record has `schema_version: 1`, non-empty run and
+  case IDs, stage, UTC timestamp, source/package fingerprint, required flag,
+  adapter/version where applicable, and explicit artifact/hash links. Unknown
+  required states and missing acceptance-relevant fields are rejected; evidence
+  records are append-only.
 - Acceptance: `AC-1704`
 - Verification: `TEST-1704`
 - Implementation slice: `IS-1701`
 
-### OBJ-1703 — Configuration and run snapshots
+### OBJ-1703 — Strict configuration and immutable run snapshot
 
-#### REQ-1705 — Immutable configuration/run snapshot
+#### REQ-1705 — Strict resolved configuration and pre-action snapshot
 
 - Level: `MUST`
-- Source: `SDD_PACKAGE`
-- Actors: coordinator and operator
-- Preconditions: the source identity has passed `REQ-1701`.
-- Trigger: the first run action is requested.
-- Observable result: before any server, API, or browser action, the coordinator
-  stores one immutable snapshot containing package status and fingerprint,
-  source identity, run/case IDs, scenario version, artifact and baseline roots,
-  server origin and port, capability requirements, viewport literals, browser
-  context, timeouts, retry limits, API contract, browser contract, comparison
-  thresholds, approval policy, and creation timestamp.
+- Source: `SOURCE_OBSERVATION` and `INTERFACE_CONTRACT`
+- Actors: coordinator, implementation PL, and artifact store
+- Preconditions: the existing project configuration mechanism is available.
+- Trigger: a verification run is requested.
+- Observable result: the coordinator validates and resolves the complete
+  `[verification.coordinator]` object, persists its byte-stable canonical form
+  and SHA-256 together with the dynamic implementation baseline, then creates
+  one immutable run snapshot before a server, API, or browser action. Unknown
+  fields, implicit acceptance-relevant defaults, blank values, duplicate IDs,
+  unsupported adapters, out-of-range values, secret-bearing values, and
+  missing required values produce `CONFIG_INVALID`.
+
+  The resolved object contains explicit values for `schema_version: 1`,
+  `enabled`, required capabilities, literal server argv/lifecycle/readiness,
+  API probes, browser adapter/cases/actions, exact viewports, baseline root and
+  identity tuple, comparison policy, evidence limits, timeouts, retry policy,
+  and approval policy. The snapshot contains package/source identity, run/case
+  IDs, scenario version, resolved config hash, artifact/baseline roots, origin
+  and selected port, browser context, contracts, thresholds, and creation
+  time. Later resume/reopen uses only this snapshot.
 - Acceptance: `AC-1705`
 - Verification: `TEST-1705`
 - Implementation slice: `IS-1701`
 
-#### REQ-1706 — Artifact root and baseline controls
+#### REQ-1706 — Artifact-root and approved-baseline controls
 
 - Level: `MUST`
 - Source: `SECURITY_POLICY`
-- Actors: coordinator, artifact store, reviewer
-- Preconditions: a run-specific artifact root and a separate baseline identity
-  have been registered.
-- Trigger: an artifact or baseline is written, read, reviewed, or cleaned.
-- Observable result: paths are absolute, normalized, beneath their registered
-  root, and not symlink escapes; every artifact is non-empty, typed, hashed
-  with SHA-256, and linked to the snapshot. Approved baselines are immutable,
-  content-addressed, and retained through comparison and rollback.
+- Actors: coordinator, artifact store, reviewer, and operator
+- Preconditions: a snapshot is present and roots have been registered.
+- Trigger: an artifact or baseline is created, read, reviewed, compared, or
+  cleaned.
+- Observable result: paths are absolute, canonical, component-boundary safe,
+  beneath their registered root, and free of symlink traversal. Per-run
+  artifacts are non-empty, type-checked, SHA-256 hashed, size-bounded, and
+  linked to the snapshot. Approved baselines are separate, read-only,
+  content-addressed, retain their approval manifest, and cannot be replaced or
+  deleted by comparison or ordinary cleanup.
 - Acceptance: `AC-1706`
 - Verification: `TEST-1706`
 - Implementation slice: `IS-1702`
 
-### OBJ-1704 — Coordinator architecture and result ownership
+### OBJ-1704 — Coordinator and deterministic failure handling
 
-#### REQ-1707 — Single coordinator with explicit component boundaries
+#### REQ-1707 — Sole coordinator state ownership
 
 - Level: `MUST`
 - Source: `DECISION`
-- Actors: coordinator and all verification components
+- Actors: coordinator and all adapters/reviewers
 - Preconditions: a valid snapshot and capability matrix exist.
-- Trigger: a component returns a result or error.
-- Observable result: only the coordinator advances lifecycle state; components
-  return typed records and cannot mutate snapshots, baselines, outcomes, or
-  artifact paths directly. The coordinator stores ordering and provenance.
+- Trigger: an adapter or reviewer returns a result, artifact, or error.
+- Observable result: only the coordinator mutates lifecycle state, snapshots,
+  baselines, outcomes, and registered roots. Components return typed records
+  with provenance and cannot write coordinator-owned state directly.
 - Acceptance: `AC-1707`
 - Verification: `TEST-1707`
 - Implementation slice: `IS-1703`
 
-#### REQ-1708 — Deterministic errors, retries, and outcome reporting
+#### REQ-1708 — Bounded retries and deterministic outcome reporting
 
 - Level: `MUST`
 - Source: `RELIABILITY_POLICY`
 - Actors: coordinator and operator
 - Preconditions: a case has a valid snapshot.
-- Trigger: an action times out, fails, or returns an unexpected result.
-- Observable result: the exact closed error code is persisted; each API/browser
-  case has at most two attempts, with one retry, and no hidden retry occurs for
-  screenshot, review, or comparison. A terminal outcome is emitted exactly
-  once and includes pass/fail/blocked reason, case IDs, artifact hashes, and
-  snapshot identity.
+- Trigger: an action fails, times out, or returns an unexpected result.
+- Observable result: API, browser, and readiness actions have two total
+  attempts; screenshot, artifact write, semantic review, comparison, and
+  cleanup have one. Retry never changes the snapshot, baseline, required flag,
+  or input. The coordinator persists the exact closed error code, bounded
+  diagnostic, attempt count, evidence references, and exactly one terminal
+  outcome per run.
 - Acceptance: `AC-1708`
 - Verification: `TEST-1708`
 - Implementation slice: `IS-1703`
 
-### OBJ-1705 — API and browser contracts
+### OBJ-1705 — Literal API and reproducible browser contracts
 
-#### REQ-1709 — Literal local API contract
+#### REQ-1709 — Literal local API verification
 
 - Level: `MUST`
 - Source: `INTERFACE_CONTRACT`
-- Actors: API client and local server
-- Preconditions: `server` and `api` capabilities are available and the server
-  origin is recorded in the snapshot.
+- Actors: API adapter and local server
+- Preconditions: `server` and `api` capabilities are available and the
+  snapshot contains one API probe.
 - Trigger: an API case begins.
-- Observable result: the client sends only the snapshot's literal method, path,
-  query, allowlisted headers, and body; paths are relative to the recorded
-  local origin and reject traversal, redirects to another origin, shell
-  interpretation, and undeclared headers. The case records status, bounded
-  redacted headers/body digest, response schema result, elapsed time, and exact
-  expected status/content type.
+- Observable result: the adapter uses literal argv and sends only the
+  snapshot's method, relative path, exact query, allowlisted headers, and body
+  digest. It rejects absolute/cross-origin URLs, `..` traversal, proxy use,
+  credentials, undeclared headers, shell interpretation, and redirects outside
+  the recorded origin. It records status, content type, bounded redacted
+  metadata/body preview, digest, elapsed milliseconds, expected status, and
+  exact contract identity.
 - Acceptance: `AC-1709`
 - Verification: `TEST-1709`
 - Implementation slice: `IS-1705`
 
-#### REQ-1710 — Reproducible browser contract
+#### REQ-1710 — Reproducible local browser verification
 
 - Level: `MUST`
 - Source: `INTERFACE_CONTRACT`
-- Actors: browser runner and local server
-- Preconditions: `browser` capability is available and the browser version,
-  context, viewport, URL, readiness condition, and action list are snapshotted.
+- Actors: browser adapter and local server
+- Preconditions: `browser` is available and browser version, context, URL,
+  readiness condition, viewport, and action list are snapshotted.
 - Trigger: a browser case begins.
-- Observable result: a fresh isolated browser context uses Chromium, DPR `1`,
-  locale `en-US`, timezone `UTC`, light color scheme, and
+- Observable result: a fresh isolated Chromium context uses DPR `1`, locale
+  `en-US`, timezone `UTC`, light color scheme, and
   `no-preference` reduced motion. It navigates only to the recorded local
-  origin, waits for the declared readiness condition without unbounded sleeps,
-  executes the ordered declared actions, and records console/page errors and
-  navigation outcome.
+  origin, waits for the declared bounded readiness condition, executes ordered
+  declared actions, and records navigation, console, page-error, dialog, and
+  assertion evidence. No unbounded sleep or undeclared action is accepted.
 - Acceptance: `AC-1710`
 - Verification: `TEST-1710`
 - Implementation slice: `IS-1705`
 
-### OBJ-1706 — Visual artifacts, image review, and comparison
+### OBJ-1706 — Screenshots, semantic review, and comparison
 
-#### REQ-1711 — Controlled screenshot capture
+#### REQ-1711 — Exact screenshot artifacts
 
 - Level: `MUST`
 - Source: `VISUAL_CONTRACT`
-- Actors: browser runner, screenshot capturer, artifact store
-- Preconditions: the browser case is ready and the screenshot capability is
-  available.
-- Trigger: the declared readiness condition is satisfied.
-- Observable result: PNGs are captured at exactly `375x812`, `768x1024`, and
-  `1440x900`; the
-  capture uses DPR `1`, full declared page bounds, no browser chrome, and no
-  post-capture resizing. The artifact path, dimensions, byte size, SHA-256,
-  source fingerprint, and snapshot ID are persisted.
+- Actors: browser adapter, screenshot adapter, and artifact store
+- Preconditions: browser readiness and `screenshot` capability passed.
+- Trigger: the declared browser action sequence is complete.
+- Observable result: exactly one PNG is captured for each of `375x812`,
+  `768x1024`, and `1440x900`, at DPR `1`, with no browser chrome, resize,
+  crop, JPEG conversion, or unrecorded post-processing. Each record includes
+  actual dimensions, viewport, byte size, SHA-256, URL/case, source/package
+  fingerprint, browser/adapter version, UTC capture time, and artifact path.
 - Acceptance: `AC-1711`
 - Verification: `TEST-1711`
 - Implementation slice: `IS-1706`
 
-#### REQ-1712 — Image-review contract and capability gating
+#### REQ-1712 — Capability-gated semantic image review
 
 - Level: `MUST`
-- Source: `VISUAL_CONTRACT`
-- Actors: image-review capability, reviewer, coordinator
-- Preconditions: a valid screenshot artifact exists and `image_review` is
-  available with a recorded version and model/reviewer identity.
-- Trigger: a screenshot is ready for review.
-- Observable result: review checks dimensions, clipping, missing/extra UI,
-  text legibility, obvious layout shifts, and privacy leakage; it returns only
-  `approved`, `rejected`, or `blocked` with bounded observations and the input
-  artifact hash. If the capability is unavailable, the result is
-  `unavailable`, never an inferred approval.
+- Source: `VISUAL_CONTRACT` and `PARTIAL_PROTOCOL_OBSERVATION`
+- Actors: semantic-review adapter, reviewer, and coordinator
+- Preconditions: a valid screenshot exists and `semantic_review` has an
+  explicit active runtime capability signal and recorded version/identity.
+- Trigger: a screenshot is submitted for review.
+- Observable result: review returns only `approved`, `rejected`, or `blocked`,
+  with input hash, identity/version, checklist version, UTC time, and bounded
+  observations covering clipping, missing/extra UI, legibility, obvious layout
+  shifts, and privacy leakage. For the local-image protocol, the only turn
+  extension is `{ "type": "localImage", "path": "<absolute-path>" }`; the
+  path is an existing regular non-symlink PNG beneath the current run's
+  screenshot root. A turn accepts at most three such items and each item is at
+  most 10 MiB. Findings are limited to 50 entries and 16 KiB. Missing runtime
+  signal yields `unavailable` for a required review and `skipped` for an
+  optional review; model/package presence alone never implies approval.
 - Acceptance: `AC-1712`
 - Verification: `TEST-1712`
 - Implementation slice: `IS-1706`
 
-#### REQ-1713 — Immutable baseline and measurable comparison
+#### REQ-1713 — Immutable baseline and deterministic comparison
 
 - Level: `MUST`
 - Source: `VISUAL_CONTRACT`
-- Actors: comparison engine, reviewer, coordinator
-- Preconditions: the baseline is approved, content-addressed, captured under
-  the same scenario, browser context, viewport, DPR, and source-compatible
-  snapshot, and the comparison capability is available.
+- Actors: comparison adapter, reviewer, and coordinator
+- Preconditions: an approved baseline matches the scenario, source-compatible
+  snapshot/environment tuple, viewport, browser context, and dimensions; the
+  `comparison` capability is available.
 - Trigger: a candidate screenshot is ready.
-- Observable result: the engine compares equal-dimension PNGs and persists
-  `pixel_diff_fraction`, `max_channel_delta`, and a deterministic diff image.
-  Comparison passes only when `pixel_diff_fraction <= 0.005`,
-  `max_channel_delta <= 8`, the image review is `approved`, and no declared
-  critical region differs. A candidate with a missing or incompatible baseline
-  returns `error` with code `BASELINE_NOT_APPROVED`; it never creates or overwrites
-  a baseline automatically.
+- Observable result: equal-dimension PNGs are decoded to RGBA8 without resize,
+  crop, alpha normalization, or color-space conversion. The adapter computes
+  row-major `pixel_diff_fraction` and `max_channel_delta`, writes a
+  deterministic diff PNG whose changed pixels are opaque magenta and unchanged
+  pixels are transparent, and persists all input/output hashes and metrics.
+  Passing requires approved semantic review, no declared critical-region
+  difference, `pixel_diff_fraction <= 0.005`, and
+  `max_channel_delta <= 8`. Missing/incompatible approval produces
+  `BASELINE_NOT_APPROVED`; comparison never creates or overwrites a baseline.
 - Acceptance: `AC-1713`
 - Verification: `TEST-1713`
 - Implementation slice: `IS-1706`
 
 ### OBJ-1707 — Capability, server, security, privacy, and operations
 
-#### REQ-1714 — Capability matrix is a hard gate
+#### REQ-1714 — Hard capability gates
 
 - Level: `MUST`
 - Source: `SAFETY_POLICY`
 - Actors: coordinator and operator
-- Preconditions: the run snapshot declares required capabilities.
-- Trigger: capability discovery completes or a required capability later
-  becomes unavailable.
-- Observable result: each required capability has `available` or `unavailable`,
-  version, check time, and bounded diagnostic. Any unavailable required
-  capability prevents dependent execution and yields `unavailable`;
-  there is no silent browser-to-API, screenshot-to-text, image-review-to-pixel,
-  or comparator-to-review substitution.
+- Preconditions: required capabilities are declared in the immutable snapshot.
+- Trigger: discovery completes or a required capability becomes unavailable.
+- Observable result: each capability has an availability state, adapter/name,
+  version where available, check time, and bounded diagnostic. An unavailable
+  required capability prevents dependent work and yields `unavailable`; an
+  optional dependent check yields `skipped`. No browser-to-API,
+  screenshot-to-text, semantic-review-to-pixel, or comparator-to-review
+  substitution can satisfy a required check.
 - Acceptance: `AC-1714`
 - Verification: `TEST-1714`
 - Implementation slice: `IS-1704`
 
-#### REQ-1715 — Local server and development-server constraints
+#### REQ-1715 — Local development-server contract
 
 - Level: `MUST`
 - Source: `OPERATING_CONSTRAINT`
 - Actors: coordinator and local server
-- Preconditions: a local server is required by the scenario.
+- Preconditions: the scenario declares a local server and readiness check.
 - Trigger: server startup or readiness probing begins.
-- Observable result: the server binds `0.0.0.0`, uses port `10001` or the next
-  available port at or above it, advertises `http://dev:<port>`, and records
-  the actual command as literal argv. Port `3000`, Docker, infrastructure
-  mutation, remote service use, and unregistered server processes are rejected.
-  Readiness has a bounded 30,000 ms timeout and a declared HTTP/status
-  condition.
+- Observable result: the server uses literal argv, binds `0.0.0.0`, accepts
+  hostname `dev`, and uses port `10001` or the next available integer at or
+  above `10001`, recording the selected port in the snapshot. The origin is
+  `http://dev:<recorded-port>`, readiness is an explicit HTTP/status condition
+  within 30,000 ms, and port `3000`, Docker, remote services, infrastructure
+  mutation, and unregistered processes are rejected. A Next.js target includes
+  `dev` in `allowedDevOrigins`.
 - Acceptance: `AC-1715`
 - Verification: `TEST-1715`
 - Implementation slice: `IS-1704`
 
-#### REQ-1716 — Security, privacy, compatibility, and operations controls
+#### REQ-1716 — Security, privacy, approval, and operations contract
 
 - Level: `MUST`
-- Source: `SECURITY_POLICY`
-- Actors: coordinator, operator, artifact store, and all runners
-- Preconditions: the run is authorized for local verification.
+- Source: `SECURITY_POLICY` and `OPERATING_CONSTRAINT`
+- Actors: coordinator, operator, artifact store, and all adapters
+- Preconditions: local verification is authorized.
 - Trigger: any command, request, log, artifact, approval, retry, or cleanup.
-- Observable result: network access is limited to the recorded local origin;
-  secrets, tokens, cookies, authorization headers, personal data, raw model
-  reasoning, and unrestricted command output are redacted or rejected. Every
-  command uses literal argv in the registered worktree or artifact root. A
-  remote, destructive, permission, credential, deployment, or file-change
-  action stays `waiting_user` with its opaque approval ID. The report includes
-  runtime/browser/API versions, UTC timestamps, timeout and retry counters,
-  and enough evidence to reproduce the result.
+- Observable result: network targets are limited to the recorded local origin;
+  commands are literal argv in the registered worktree or artifact root;
+  secrets, tokens, cookies, authorization/secret headers, personal data, raw
+  model reasoning, and unrestricted command/console/network output are rejected
+  or redacted. Remote, destructive, credential, permission, deployment,
+  infrastructure, Docker, and product file-change actions remain
+  `waiting_user` with an opaque one-time approval ID. Reports include UTC
+  timestamps, runtime/browser/API versions, capability matrix, timeout and
+  retry counters, hashes, redacted errors, and cleanup state.
 - Acceptance: `AC-1716`
 - Verification: `TEST-1716`
 - Implementation slice: `IS-1704`
 
-### OBJ-1708 — Rollout, rollback, and migration
+### OBJ-1708 — Versioned rollout and safe rollback
 
-#### REQ-1717 — Guarded rollout and compatibility versioning
+#### REQ-1717 — Versioned guarded rollout
 
 - Level: `MUST`
 - Source: `OPERATIONS_POLICY`
-- Actors: implementation PL, coordinator, and operator
-- Preconditions: implementation slices `IS-1701` through `IS-1706` have passed
-  their focused checks.
+- Actors: implementation PL, coordinator, integration PL, and operator
+- Preconditions: the first vertical slice and its mapped checks are accepted.
 - Trigger: the verification contract is enabled for a project.
-- Observable result: enablement is behind the versioned `verification_contract_v1`
-  capability/configuration; a run announces its schema and package fingerprint
-  before execution. Existing runs retain their snapshots and are not silently
-  reinterpreted by a newer contract.
+- Observable result: enablement is explicitly versioned as
+  `verification_contract_v1`; the package fingerprint, schema version, and
+  source baseline are announced before execution. Existing records retain
+  their snapshots and are not reinterpreted by a later contract version.
+  Stages enable in order: source/config/snapshot, artifacts/baselines,
+  coordinator, capability/server, API/browser, visual checks, then bootstrap.
 - Acceptance: `AC-1717`
 - Verification: `TEST-1717`
 - Implementation slice: `IS-1707`
 
-#### REQ-1718 — Safe rollback and no destructive migration
+#### REQ-1718 — Non-destructive rollback and recovery
 
 - Level: `MUST`
 - Source: `OPERATIONS_POLICY`
 - Actors: operator and coordinator
-- Preconditions: a run or artifact exists under version 1.
-- Trigger: rollout is disabled, a contract mismatch is found, or recovery is
-  requested.
-- Observable result: rollback disables new verification starts, preserves
-  source identity, snapshots, baselines, candidate artifacts, diff images,
-  review records, and redacted logs, and returns resumable runs as
-  `error` with code `SPEC_DRIFT` or `ENVIRONMENT_UNAVAILABLE`. No database migration, baseline
-  deletion, branch deletion, broad cleanup, or in-place schema rewrite is
-  performed by this slice.
+- Preconditions: a v1 run, snapshot, or artifact exists.
+- Trigger: disablement, contract mismatch, source drift, capability loss, or
+  recovery request.
+- Observable result: new starts are disabled; snapshots, source baselines,
+  config hashes, approved baselines, actuals, diff images, review records,
+  manifests, and redacted logs remain readable and recoverable. A resumable
+  run returns `error` with `SPEC_DRIFT` or `ENVIRONMENT_UNAVAILABLE` after
+  revalidation. No database migration, schema rewrite, broad cleanup, branch
+  deletion, baseline deletion, or in-place baseline replacement occurs.
 - Acceptance: `AC-1718`
 - Verification: `TEST-1718`
 - Implementation slice: `IS-1707`
 
-### OBJ-1709 — Bootstrap, ordered implementation, and handoff
+### OBJ-1709 — Bootstrap, PM gate, and delta handoff
 
 #### REQ-1719 — Reproducible bootstrap scenario
 
 - Level: `MUST`
 - Source: `SDD_PACKAGE`
-- Actors: coordinator, local server, API client, browser runner, reviewer, and
-  comparison engine
-- Preconditions: a clean source snapshot, an approved package fingerprint, a
-  registered artifact root, and all required capabilities are available.
+- Actors: coordinator, local server, API adapter, browser adapter, screenshot
+  adapter, semantic reviewer, comparison adapter, and artifact store
+- Preconditions: source/package identity passed, the run snapshot exists, the
+  artifact root and approved baseline are registered, and all required
+  capabilities are available.
 - Trigger: `BOOTSTRAP-1701` is requested.
 - Observable result: the future implementation performs this exact order:
-  (1) validate source and package identity; (2) create the immutable run
-  snapshot; (3) discover and persist capabilities; (4) start or attach only to
-  the registered local server on `dev` and port `10001` or the recorded next
-  port; (5) probe `GET /` at the recorded local origin and require HTTP `200`;
-  (6) create a fresh browser context, navigate to the same origin, and require
-  the declared readiness condition; (7) capture required `375x812`, `768x1024`,
-  and `1440x900` screenshots; (8) run image review;
-  (9) compare with the approved baseline; and (10) persist one terminal
-  outcome and handoff report. Any failed precondition stops at its stage with
-  the corresponding closed outcome.
+  (1) validate dynamic source/package identity; (2) validate and persist the
+  resolved config; (3) create the immutable run snapshot; (4) discover and
+  persist capabilities; (5) start/attach only to the registered local server;
+  (6) probe `GET /` at the recorded origin and require HTTP `200`; (7) create
+  a fresh browser context and satisfy readiness; (8) execute the declared
+  browser case and capture all three screenshots; (9) run semantic review;
+  (10) compare with the approved baseline; and (11) persist exactly one
+  terminal outcome and handoff report. A failed precondition stops at its
+  stage with the corresponding closed outcome.
 - Acceptance: `AC-1719`
 - Verification: `TEST-1719`
 - Implementation slice: `IS-1707`
 
-#### REQ-1720 — Ordered implementation slices and package handoff
+#### REQ-1720 — PM success gate and complete first-slice handoff
 
 - Level: `MUST`
-- Source: `SDD_PACKAGE`
-- Actors: owning PL, implementation workers, integration PL, and PM
-- Preconditions: this document is `SPEC_APPROVED` and all acceptance-relevant
-  fields are closed.
-- Trigger: implementation is assigned.
-- Observable result: work is performed in order, with no later slice starting
-  before its dependency is accepted:
-  `IS-1701` schemas/source snapshot → `IS-1702` artifact and baseline controls
-  → `IS-1703` coordinator/lifecycle → `IS-1704` server and capability gates
-  → `IS-1705` API/browser runners → `IS-1706` screenshot/review/comparison →
-  `IS-1707` outcomes/bootstrap/operations. Each slice reports its exact
-  `REQ-17xx`/`AC-17xx`/`TEST-17xx` coverage and artifact hashes. The handoff
-  remains `SPEC_APPROVED` until implementation and verification independently
-  establish a later terminal implementation status.
+- Source: `SOURCE_OBSERVATION` and `SDD_PACKAGE`
+- Actors: coordinator, implementation PL, integration PL, and original PM
+- Preconditions: integration has produced its result and the coordinator has
+  a terminal verification report.
+- Trigger: the coordinator reports to the original PM.
+- Observable result: only one report with `passed` for every required check,
+  complete `REQ → AC → TEST → IS` evidence, source/package fingerprint,
+  snapshot ID, artifact/baseline hashes, attempt counts, and redacted errors
+  can enter `pm_review_pending` and the original Sol/xhigh read-only PM final
+  review. Any `failed`, `unavailable`, `skipped`, `error`, missing evidence,
+  unresolved approval, or `SPEC_DELTA_REQUIRED` blocks PM success and remains
+  a recorded non-pass. `IS-1701` is closed only when its requirements
+  `REQ-1701`, `REQ-1702`, `REQ-1704`, and `REQ-1705`, their mapped acceptance
+  criteria/tests, dynamic baseline, resolved config hash, immutable snapshot,
+  and rollback record all have observable evidence; no later slice starts
+  before that closure.
 - Acceptance: `AC-1720`
 - Verification: `TEST-1720`
 - Implementation slice: `IS-1707`
 
-## Acceptance criteria
-
-### AC-1701 — Source capture is authoritative and clean
-
-The package record names `origin/main`, `refs/heads/main`, commit
-`50531832a57e3fd0dae093b7ad0b51197e668045`, tree fingerprint
-`de77e16a2c257456721bd44fc260f6b90afd2af6`, authority date 2026-07-26 UTC,
-descriptive main label, and `GIT_CLEAN`. The status inventory is empty at
-capture and the intended `docs/slices/SLICE-017.md` addition is the only owned
-post-capture path.
-
-### AC-1702 — Drift and references fail closed
-
-Changing the Git commit, tree, ref/label, clean-state assertion, package
-fingerprint, scenario, or baseline identity before execution produces
-`SPEC_DRIFT` or `PACKAGE_FINGERPRINT_MISMATCH` and performs no dependent check.
-No source outside `Reference boundary: NONE` is consulted.
-
-### AC-1703 — Lifecycle and outcomes are closed
-
-Valid transitions follow the listed lifecycle exactly. Invalid or replayed
-transitions leave state unchanged. The only terminal outcomes are `passed`,
-`failed`, `unavailable`, `skipped`, and `error`, each with its required
-evidence or redacted diagnostic.
-
-### AC-1704 — Records are linked and versioned
-
-Every snapshot, request, browser event, screenshot, review, comparison,
-artifact, error, and terminal report has schema version 1, non-empty IDs,
-timestamps, source fingerprint, and explicit links. Unknown or blank
-acceptance-relevant fields are rejected.
-
-### AC-1705 — Run configuration cannot drift
-
-The complete configuration/run snapshot is persisted before execution and is
-immutable. Reopening a run uses the stored source, scenario, server, viewport,
-browser, capability, API, artifact, baseline, approval, timeout, retry, and
-comparison values even if project configuration later changes.
-
-### AC-1706 — Artifacts and baselines are controlled
-
-Traversal, symlink escape, primary-checkout output, missing hashes, empty
-artifacts, and baseline overwrite are rejected. A valid artifact has the exact
-registered root, type, dimensions where applicable, byte size, SHA-256, and
-snapshot link; an approved baseline remains recoverable.
-
-### AC-1707 — Component ownership is explicit
-
-Only the coordinator mutates state and emits outcomes. Runners and reviewers
-return typed, linked records and cannot change the snapshot, baseline, or
-artifact root.
-
-### AC-1708 — Failures converge deterministically
-
-API/browser actions receive at most one retry and no hidden screenshot/review/
-comparison retry. Every terminal outcome is emitted once with a bounded error,
-attempt count, and evidence references; a timeout cannot remain indefinitely
-active.
-
-### AC-1709 — API calls obey the local literal contract
-
-The API client sends only the snapshotted local method/path/query/allowlisted
-headers/body, rejects traversal and cross-origin redirects, and records the
-exact expected response and redacted observed response.
-
-### AC-1710 — Browser execution is reproducible
-
-The browser uses the snapshotted Chromium context and exact `375x812`,
-`768x1024`, and `1440x900` viewport literals, navigates only to the local origin,
-executes declared actions in order, and records readiness, console, page-error,
-and navigation evidence.
-
-### AC-1711 — Screenshot bytes are controlled
-
-Required screenshots are PNGs at the exact viewport and DPR values, with no
-post-capture resize, a non-empty artifact, and a persisted SHA-256 and source/
-run link.
-
-### AC-1712 — Image review is gated and auditable
-
-An unavailable image-review capability yields `unavailable`; it cannot
-be treated as approval. An available reviewer returns `approved`, `rejected`,
-or `blocked` with identity/version, input hash, bounded observations, and UTC
-time.
-
-### AC-1713 — Comparison is measurable and baseline-safe
-
-Only compatible equal-dimension images compare. A passed result requires approved image
-review, no critical-region difference, `pixel_diff_fraction <= 0.005`, and
-`max_channel_delta <= 8`. A candidate cannot create or overwrite a baseline.
-
-### AC-1714 — Capability absence blocks dependent work
-
-The persisted capability matrix gates server, API, browser, screenshot,
-image-review, and comparison stages independently. No silent fallback or
-unrecorded capability substitution can produce passed.
-
-### AC-1715 — Server constraints are enforced
-
-The server uses `0.0.0.0`, `dev`, port `10001` or the recorded next available
-port at or above it, and a declared HTTP readiness check within 30,000 ms.
-Port `3000`, Docker, infrastructure, unregistered processes, and remote
-services are rejected.
-
-### AC-1716 — Safety and operational evidence are preserved
-
-Local-only literal-argv execution, artifact-root containment, redaction,
-approval gating, version reporting, UTC timing, bounded retries, and cleanup
-records are present. Dangerous, remote, destructive, permission, credential,
-deployment, and file-change actions remain explicit `waiting_user` decisions.
-
-### AC-1717 — Rollout is versioned
-
-`verification_contract_v1` is announced and snapshotted before execution;
-existing runs retain their original contract and cannot be reinterpreted by a
-new version.
-
-### AC-1718 — Rollback is non-destructive
-
-Disabling the contract preserves every snapshot, baseline, artifact, diff,
-review, and log, and returns affected work as a resumable drift or environment
-block. No destructive migration or in-place baseline replacement occurs.
-
-### AC-1719 — Bootstrap order is reproducible
-
-`BOOTSTRAP-1701` runs the ten ordered steps in `REQ-1719`, including `GET /`
-HTTP 200 readiness, exact viewport literals, image review, baseline comparison,
-and one terminal outcome. No step is claimed to have run in this documentation
-handoff.
-
-### AC-1720 — Handoff is complete and traceable
-
-The ordered `IS-1701` through `IS-1707` plan is the only implementation path;
-each requirement, acceptance criterion, and test has an explicit mapping. The
-package remains `SPEC_APPROVED` until a later implementation loop records
-actual evidence and a new terminal status.
-
-## Verification cases
-
-All procedures below are future checks for the implementation slices. Their
-status in this documentation-only handoff is `NOT_RUN`.
-
-### TEST-1701 — Source identity and clean capture
-
-Read Git ref, commit, tree, and porcelain status from the selected source;
-compare them with the package record and assert the exact main label, authority
-date, fingerprint, and `GIT_CLEAN` state. Expected: `AC-1701`.
-
-### TEST-1702 — Drift and reference-boundary negative cases
-
-Run with a changed commit/tree, changed ref label, dirty status, changed
-scenario, changed baseline, and a forbidden external reference. Assert that
-each stops before dependent execution with `SPEC_DRIFT` or
-`PACKAGE_FINGERPRINT_MISMATCH`. Expected: `AC-1702`.
-
-### TEST-1703 — Lifecycle state machine
-
-Exercise every valid transition, an out-of-order transition, a duplicate
-terminal transition, and a replayed event. Assert exact state preservation and
-closed outcomes. Expected: `AC-1703`.
-
-### TEST-1704 — Record schema and identifier linkage
-
-Validate serialized snapshots and all linked records against schema version 1;
-try blank IDs, unknown states, missing fingerprints, and missing artifact
-links. Expected: `AC-1704`.
-
-### TEST-1705 — Snapshot immutability and reopen
-
-Create a run snapshot, mutate source/config/scenario inputs, reopen the run,
-and assert byte-equivalent effective configuration and unchanged identity.
-Expected: `AC-1705`.
-
-### TEST-1706 — Artifact-root and baseline security
-
-Attempt traversal, symlink escape, primary-checkout output, empty output,
-missing hash, and baseline overwrite; then write valid PNG, JSON, and diff
-artifacts and verify root containment, SHA-256, dimensions, and retention.
-Expected: `AC-1706`.
-
-### TEST-1707 — Coordinator ownership
-
-Use instrumented runner, reviewer, and comparison fakes that attempt direct
-state, snapshot, baseline, and root mutation. Assert that only coordinator
-operations persist changes and all records retain provenance. Expected:
-`AC-1707`.
-
-### TEST-1708 — Timeout and retry convergence
-
-Make API/browser attempts timeout once and then pass, fail both attempts, and
-make screenshot/review/comparison fail. Assert one retry only for API/browser,
-no hidden retry elsewhere, one terminal outcome, and bounded redacted errors.
-Expected: `AC-1708`.
-
-### TEST-1709 — API contract positives and negatives
-
-Issue the snapshotted local request and verify method/path/headers/body,
-status/content type, digest, and timing. Attempt traversal, undeclared header,
-cross-origin redirect, undeclared method, and shell text. Expected: `AC-1709`.
-
-### TEST-1710 — Browser context and action order
-
-Inspect browser context metadata, run both required viewports, verify local-only
-navigation, readiness, action order, console/page-error capture, and rejection
-of an undeclared action. Expected: `AC-1710`.
-
-### TEST-1711 — Screenshot dimensions and byte integrity
-
-Capture the bootstrap page at `375x812`, `768x1024`, and `1440x900` with DPR `1`; inspect
-PNG dimensions, byte size, hash, and path; attempt resize and wrong viewport.
-Expected: `AC-1711`.
-
-### TEST-1712 — Image-review gating and audit
-
-Run with unavailable, available-approved, available-rejected, and
-available-blocked image-review capabilities. Assert no unavailable case can
-pass and every available result contains identity/version, input hash, and
-bounded observations. Expected: `AC-1712`.
-
-### TEST-1713 — Comparison thresholds and baseline immutability
-
-Compare identical images, a candidate at each threshold boundary, a candidate
-over each threshold, different dimensions, a missing baseline, and a baseline
-overwrite attempt. Assert the exact threshold and immutable-baseline behavior.
-Expected: `AC-1713`.
-
-### TEST-1714 — Capability matrix hard gates
-
-Disable each required capability independently and assert only dependent
-stages are skipped, the outcome is `unavailable`, and no fallback result
-or passed result is emitted. Expected: `AC-1714`.
-
-### TEST-1715 — Server constraints and readiness
-
-Start on `10001`, occupy it and start on the next available port, inspect
-`0.0.0.0`/`dev`, enforce the 30,000 ms readiness bound, and reject `3000`,
-Docker, remote, unregistered, or shell-interpreted launch paths. Expected:
-`AC-1715`.
-
-### TEST-1716 — Security, privacy, approval, and operations audit
-
-Inject credentials, cookies, authorization headers, private reasoning, remote,
-destructive, permission, deployment, and file-change requests. Assert redaction
-or rejection, opaque `waiting_user` approvals where required, literal argv,
-root containment, UTC records, and bounded cleanup. Expected: `AC-1716`.
-
-### TEST-1717 — Versioned rollout compatibility
-
-Enable `verification_contract_v1`, create a run, change the active contract,
-reopen the run, and assert its original schema/fingerprint/snapshot remains in
-force while new runs announce the new version. Expected: `AC-1717`.
-
-### TEST-1718 — Rollback and recovery preservation
-
-Disable the contract during planned, executing, captured, and compared states;
-assert preserved snapshots, baselines, artifacts, diff images, reviews, and
-logs, with no destructive migration or in-place rewrite. Expected: `AC-1718`.
-
-### TEST-1719 — Bootstrap end-to-end procedure
-
-From a clean source and approved baseline, execute `BOOTSTRAP-1701` with the
-local server and all capabilities. Inspect the ordered event log, both literal
-viewports, `GET /` HTTP 200 evidence, image-review record, comparison metrics,
-artifact hashes, and exactly one terminal outcome. Expected: `AC-1719`.
-
-### TEST-1720 — Handoff traceability and implementation ordering
-
-Validate that each `REQ-17xx`, `AC-17xx`, and `TEST-17xx` appears exactly once
-in the coverage matrix, maps to one `IS-170x`, has no blank or placeholder
-field, and
-that dependency order rejects a later slice before its prerequisite. Expected:
-`AC-1720`.
-
-## Coverage and closed traceability
-
-The following table is the normative closed mapping. `Implementation slice`
-means the future implementation unit; this document itself is the sole current
-implementation deliverable and is not product behavior.
-
-| Objective | Requirement | Acceptance | Verification | Implementation slice |
-| --- | --- | --- | --- | --- |
-| `OBJ-1701` | `REQ-1701` | `AC-1701` | `TEST-1701` | `IS-1701` |
-| `OBJ-1701` | `REQ-1702` | `AC-1702` | `TEST-1702` | `IS-1701` |
-| `OBJ-1702` | `REQ-1703` | `AC-1703` | `TEST-1703` | `IS-1703` |
-| `OBJ-1702` | `REQ-1704` | `AC-1704` | `TEST-1704` | `IS-1701` |
-| `OBJ-1703` | `REQ-1705` | `AC-1705` | `TEST-1705` | `IS-1701` |
-| `OBJ-1703` | `REQ-1706` | `AC-1706` | `TEST-1706` | `IS-1702` |
-| `OBJ-1704` | `REQ-1707` | `AC-1707` | `TEST-1707` | `IS-1703` |
-| `OBJ-1704` | `REQ-1708` | `AC-1708` | `TEST-1708` | `IS-1703` |
-| `OBJ-1705` | `REQ-1709` | `AC-1709` | `TEST-1709` | `IS-1705` |
-| `OBJ-1705` | `REQ-1710` | `AC-1710` | `TEST-1710` | `IS-1705` |
-| `OBJ-1706` | `REQ-1711` | `AC-1711` | `TEST-1711` | `IS-1706` |
-| `OBJ-1706` | `REQ-1712` | `AC-1712` | `TEST-1712` | `IS-1706` |
-| `OBJ-1706` | `REQ-1713` | `AC-1713` | `TEST-1713` | `IS-1706` |
-| `OBJ-1707` | `REQ-1714` | `AC-1714` | `TEST-1714` | `IS-1704` |
-| `OBJ-1707` | `REQ-1715` | `AC-1715` | `TEST-1715` | `IS-1704` |
-| `OBJ-1707` | `REQ-1716` | `AC-1716` | `TEST-1716` | `IS-1704` |
-| `OBJ-1708` | `REQ-1717` | `AC-1717` | `TEST-1717` | `IS-1707` |
-| `OBJ-1708` | `REQ-1718` | `AC-1718` | `TEST-1718` | `IS-1707` |
-| `OBJ-1709` | `REQ-1719` | `AC-1719` | `TEST-1719` | `IS-1707` |
-| `OBJ-1709` | `REQ-1720` | `AC-1720` | `TEST-1720` | `IS-1707` |
-
-Closed traceability is therefore:
+#### REQ-1721 — Structured SPEC_DELTA_REQUIRED disposition
+
+- Level: `MUST`
+- Source: `SAFETY_POLICY`
+- Actors: coordinator, implementation PL, integration PL, and PM
+- Preconditions: a required route, selector, action, baseline, capability,
+  dependency, configuration field, authority fact, or acceptance condition is
+  missing, contradictory, unsafe, environment-incompatible, or unverifiable.
+- Trigger: the issue is detected before or during a future implementation
+  stage.
+- Observable result: execution stops before the affected dependent behavior and
+  emits one bounded record with exactly these fields: `status` set to
+  `SPEC_DELTA_REQUIRED`; `runtime_status` set to `not_started`;
+  `affected_ids` containing the relevant `OBJ`, `REQ`, `AC`, `TEST`, and `IS`
+  identifiers; `classification` in `omission`, `contradiction`,
+  `unsafe_input`, `environment_mismatch`, or `unverifiable`; `source_snapshot`
+  identity; bounded observable `evidence`; `impact`; `proposed_resolution`;
+  `blocking_stage`; and UTC creation time. The record contains no secret,
+  private reasoning, or unrestricted output, and is not treated as an approval
+  or pass.
+- Acceptance: `AC-1721`
+- Verification: `TEST-1721`
+- Implementation slice: `IS-1707`
+
+## Closed traceability
+
+Every requirement has exactly one acceptance criterion and one verification
+case. Every first-slice requirement has one complete
+`OBJ → REQ → AC → TEST → IS → SLICE-017` path.
+
+| Objective | Requirement | Acceptance | Verification | Implementation slice | First vertical slice |
+| --- | --- | --- | --- | --- | --- |
+| `OBJ-1701` | `REQ-1701` | `AC-1701` | `TEST-1701` | `IS-1701` | yes |
+| `OBJ-1701` | `REQ-1702` | `AC-1702` | `TEST-1702` | `IS-1701` | yes |
+| `OBJ-1702` | `REQ-1703` | `AC-1703` | `TEST-1703` | `IS-1703` | no |
+| `OBJ-1702` | `REQ-1704` | `AC-1704` | `TEST-1704` | `IS-1701` | yes |
+| `OBJ-1703` | `REQ-1705` | `AC-1705` | `TEST-1705` | `IS-1701` | yes |
+| `OBJ-1703` | `REQ-1706` | `AC-1706` | `TEST-1706` | `IS-1702` | no |
+| `OBJ-1704` | `REQ-1707` | `AC-1707` | `TEST-1707` | `IS-1703` | no |
+| `OBJ-1704` | `REQ-1708` | `AC-1708` | `TEST-1708` | `IS-1703` | no |
+| `OBJ-1705` | `REQ-1709` | `AC-1709` | `TEST-1709` | `IS-1705` | no |
+| `OBJ-1705` | `REQ-1710` | `AC-1710` | `TEST-1710` | `IS-1705` | no |
+| `OBJ-1706` | `REQ-1711` | `AC-1711` | `TEST-1711` | `IS-1706` | no |
+| `OBJ-1706` | `REQ-1712` | `AC-1712` | `TEST-1712` | `IS-1706` | no |
+| `OBJ-1706` | `REQ-1713` | `AC-1713` | `TEST-1713` | `IS-1706` | no |
+| `OBJ-1707` | `REQ-1714` | `AC-1714` | `TEST-1714` | `IS-1704` | no |
+| `OBJ-1707` | `REQ-1715` | `AC-1715` | `TEST-1715` | `IS-1704` | no |
+| `OBJ-1707` | `REQ-1716` | `AC-1716` | `TEST-1716` | `IS-1704` | no |
+| `OBJ-1708` | `REQ-1717` | `AC-1717` | `TEST-1717` | `IS-1707` | no |
+| `OBJ-1708` | `REQ-1718` | `AC-1718` | `TEST-1718` | `IS-1707` | no |
+| `OBJ-1709` | `REQ-1719` | `AC-1719` | `TEST-1719` | `IS-1707` | no |
+| `OBJ-1709` | `REQ-1720` | `AC-1720` | `TEST-1720` | `IS-1707` | no |
+| `OBJ-1709` | `REQ-1721` | `AC-1721` | `TEST-1721` | `IS-1707` | no |
+
+The normative path is:
 
 ```text
 OBJ-17xx → REQ-17xx → AC-17xx → TEST-17xx → IS-170x → SLICE-017
 ```
 
-No requirement, acceptance criterion, or test is intentionally unlinked, and
-no acceptance-relevant cell is blank or a placeholder.
+### First vertical slice — IS-1701 closure
 
-## Ordered implementation slices
+`IS-1701 — Dynamic source baseline, strict configuration, record schemas, and
+immutable run snapshot` is the first complete vertical slice. It includes
+exactly `REQ-1701`, `REQ-1702`, `REQ-1704`, and `REQ-1705`, with
+`AC-1701`/`TEST-1701`, `AC-1702`/`TEST-1702`, `AC-1704`/`TEST-1704`, and
+`AC-1705`/`TEST-1705`.
 
-1. `IS-1701 — Contract, source identity, and snapshot schemas`: persist the
-   package/source tuple, strict drift check, schema version, run/config
-   snapshot, identifiers, and closed lifecycle/outcome enums.
-2. `IS-1702 — Artifact and baseline controls`: create and validate registered
-   roots, content hashes, PNG metadata, immutable approved baselines, diff
-   artifacts, retention, and safe cleanup records.
-3. `IS-1703 — Coordinator and failure convergence`: implement sole ownership of
-   state transitions, typed component results, bounded timeout/retry handling,
-   and one terminal outcome.
-4. `IS-1704 — Server and capability gates`: implement local server readiness,
-   exact port/host constraints, capability discovery, hard gating, literal
-   argv, approval routing, and redaction.
-5. `IS-1705 — API/browser runners`: implement the snapshotted API request and
-   browser context/action contracts with local-only navigation and evidence.
-6. `IS-1706 — Screenshot, image review, and comparison`: implement both exact
-   viewport captures, review result schema, threshold comparison, and
-   baseline-safe behavior.
-7. `IS-1707 — Bootstrap, rollout, rollback, and handoff`: implement
-   `BOOTSTRAP-1701`, versioned enablement, preservation on rollback, ordered
-   integration, and final reports.
+Its implementation inputs are the selected worktree, approved package bytes,
+the existing TOML loader, the existing persisted run-record mechanism, and a
+registered state root. Its outputs are a dynamic implementation-baseline
+record, validated canonical resolved configuration plus hash, schema-versioned
+record definitions, and an immutable pre-action run snapshot. It does not
+start a server, make an API request, launch a browser, capture a screenshot,
+invoke semantic review, or compare images.
 
-Each implementation slice must run its mapped `TEST-17xx` checks, report
-observable evidence and artifact hashes, and leave unrelated user work
-untouched. The implementation may not add behavior not represented in this
-closed contract without a spec delta.
+The slice is closed only when all four mapped tests pass with observable
+records and hashes, the snapshot is reopened byte-equivalently, and its
+rollback record disables new config reads while preserving existing snapshots
+and evidence. `IS-1702` cannot begin before this closure. A missing prerequisite
+or contradiction emits `SPEC_DELTA_REQUIRED` with `runtime_status: not_started`.
 
-## Configuration and run snapshot contract
+### Ordered implementation slices
 
-The persisted v1 snapshot has these required, non-empty fields:
+1. `IS-1701`: dynamic source baseline, strict configuration, record schemas,
+   and immutable run snapshot.
+2. `IS-1702`: registered artifact roots, hashes, PNG metadata, immutable
+   approved baselines, diff artifacts, retention, and safe cleanup records.
+3. `IS-1703`: coordinator ownership, lifecycle, typed adapter records, bounded
+   timeout/retry handling, and one terminal outcome.
+4. `IS-1704`: capability discovery, local server readiness, port/host rules,
+   approvals, redaction, and local-only security gates.
+5. `IS-1705`: snapshotted API probes and reproducible browser cases.
+6. `IS-1706`: exact screenshots, semantic review, deterministic comparison,
+   and baseline-safe visual evidence.
+7. `IS-1707`: versioned rollout, rollback, bootstrap, PM gate, and structured
+   delta handoff.
 
-```text
-schema_version=1
-package_id=verification-spec-v1
-package_status=SPEC_APPROVED
-source_label=Ark Team verification source — main @ 5053183
-source_ref=refs/heads/main
-source_commit=50531832a57e3fd0dae093b7ad0b51197e668045
-source_tree=de77e16a2c257456721bd44fc260f6b90afd2af6
-reference_boundary=NONE
-run_id=<opaque stable run identifier>
-case_id=BOOTSTRAP-1701
-scenario_version=1
-artifact_root=<absolute registered per-run root>
-baseline_id=<immutable approved baseline hash and snapshot link>
-server_host=dev
-server_bind=0.0.0.0
-server_port=<10001 or recorded next available port>
-api_origin=http://dev:<server_port>
-viewports=375x812,768x1024,1440x900
-device_scale_factor=1
-locale=en-US
-timezone=UTC
-color_scheme=light
-reduced_motion=no-preference
-required_capabilities=server,api,browser,screenshot,image_review,comparison
-api_contract=<versioned literal request/response record>
-browser_contract=<versioned literal navigation/action/readiness record>
-timeouts_ms=server:30000,api:30000,browser:60000,case:120000
-attempt_policy=api/browser:2-total; screenshot/review/comparison:1-total
-comparison_policy=pixel_diff_fraction<=0.005;max_channel_delta<=8;critical_regions=none-or-declared
-approval_policy=opaque-one-time-user-decision-for-dangerous-or-external-actions
-created_at_utc=<RFC3339 timestamp>
+Each later slice reports its mapped requirements, acceptance/tests, source and
+package identity, artifact hashes, and rollback state. No slice adds behavior
+outside this contract without an approved package change.
+
+## Configuration contract
+
+The future extension is under the existing project configuration mechanism at
+`.codex/team-orchestrator.toml`:
+
+```toml
+[verification.coordinator]
+schema_version = 1
+enabled = true
+required_capabilities = ["server", "api", "browser", "screenshot", "semantic_review", "comparison"]
+server_argv = ["<literal-program>", "<literal-arg>"]
+server_bind = "0.0.0.0"
+server_host = "dev"
+server_port_floor = 10001
+server_readiness_path = "/"
+server_readiness_status = 200
+server_readiness_timeout_ms = 30000
+api_probes = [{ id = "<id>", method = "GET", path = "/", query = {}, headers = {}, expected_status = 200, expected_content_type = "<type>", body_digest = "<digest-or-none>", required = true }]
+api_adapter = "<allowlisted-literal-argv-adapter>"
+browser_adapter = "<allowlisted-adapter>"
+browser_cases = [{ id = "<id>", path = "/", readiness = "<bounded-condition>", actions = [], required = true }]
+viewports = ["375x812", "768x1024", "1440x900"]
+baseline_root = "<canonical-approved-root>"
+baseline_identity = "<explicit-hash-and-environment-tuple>"
+pixel_diff_fraction_max = 0.005
+max_channel_delta = 8
+critical_regions = []
+evidence_limits = { console_events = 100, network_events = 100, metadata_bytes = 65536, api_preview_bytes = 65536, file_bytes = 52428800, total_bytes = 524288000, file_count = 500 }
+console_bytes = 32768
+network_bytes = 32768
+semantic_review_required = true
+retention_days = 30
+server_timeout_ms = 30000
+api_timeout_ms = 30000
+browser_timeout_ms = 60000
+case_timeout_ms = 120000
+attempts = { readiness = 2, api = 2, browser = 2, screenshot = 1, semantic_review = 1, comparison = 1, artifact_write = 1, cleanup = 1 }
+approval_policy = "explicit-one-time-user-decision"
 ```
 
-`<...>` fields are runtime values with required formats, not unresolved
-acceptance-relevant unknowns: run IDs are generated opaque IDs, the artifact
-root and baseline are registered before execution, the port is selected by the
-closed rule, and the two contract records are complete scenario inputs. A
-missing value is `error`, not an invitation to guess.
+The implementation validates literal argv (no shell), unique bounded IDs,
+relative paths without `..`, allowlisted methods/headers, bounded action lists,
+allowlisted API/browser adapters, exact viewport order, explicit
+environment/baseline identity, and every timeout/attempt/limit. It rejects
+unknown keys, empty/implicit fields, secrets, unsupported adapters, duplicate
+IDs, unbounded arrays, and out-of-range values. The resolved canonical object,
+hash, and dynamic source baseline are persisted before dependent work. An API
+adapter such as curl is usable only after capability detection and only through
+the literal-argv interface; no globally installed adapter is assumed.
 
-## API, browser, screenshot, image-review, and comparison interfaces
+## Artifact, baseline, and security contract
 
-The API case record contains `case_id`, `method`, relative `path`, exact query
-map, allowlisted request headers, request body digest, expected status, expected
-content type, response schema version, timeout, and attempt number. The client
-must reject path segments `..`, absolute/cross-origin URLs, undeclared headers,
-redirects outside `api_origin`, shell metacharacter interpretation, and body
-data that is not represented in the snapshot. It records a bounded response
-digest and redacted response metadata.
+Per-run paths are exactly beneath
+`<ARK_TEAM_STATE_ROOT>/<run_id>/verification`; screenshots and diffs use:
 
-The browser case record contains browser capability/version, URL relative to
-`api_origin`, readiness condition, ordered actions, expected title or selector
-assertions, viewport, DPR, locale, timezone, color scheme, reduced-motion mode,
-timeout, and attempt number. A fresh context is required per case. Browser
-console errors, page errors, failed navigations, unexpected dialogs, and
-undeclared actions are recorded as failures unless the scenario explicitly
-declares a bounded expected event.
+```text
+screenshots/<case-id>/375x812.actual.png
+screenshots/<case-id>/768x1024.actual.png
+screenshots/<case-id>/1440x900.actual.png
+diffs/<case-id>/375x812.diff.png
+diffs/<case-id>/768x1024.diff.png
+diffs/<case-id>/1440x900.diff.png
+```
 
-The screenshot record contains PNG media type, viewport literal, DPR, pixel
-dimensions, byte size, SHA-256, capture timestamp, input page/case, and artifact
-path. Screenshot capture is after readiness and before comparison; no resizing,
-JPEG conversion, crop, or unrecorded post-processing is allowed.
+The baseline root is a separate, explicitly configured approved root and is
+read-only after approval. Every path is canonicalized with component-boundary
+and symlink checks. Only `.png`, `.json`, `.jsonl`, and `.txt` are accepted.
+Writes use an exclusive temporary file and atomic rename after validation.
+Each file is non-empty, SHA-256 hashed, size-bounded, and linked to run/case/
+stage/source/package identity. Limits are 500 files, 50 MiB per file, 500 MiB
+per run, 64 KiB per metadata record, 100 console events, 100 network events,
+32 KiB each for console and network evidence, and 64 KiB API preview. No
+target-project runtime artifact is used as a per-run output.
 
-The image-review record contains reviewer capability identity and version,
-input artifact hash, review checklist version, `approved`/`rejected`/`blocked`,
-bounded observations, and timestamp. Review cannot alter the input image or
-baseline. An unavailable reviewer is a hard capability block.
+An approved baseline manifest contains approval ID, approver, exact baseline
+identity/hash, source/environment tuple, dimensions, viewport, browser/adapter
+versions, path, and UTC time. Creating or updating one requires an explicit
+one-time user approval naming that identity; comparison cannot create or
+replace it. Cleanup operates only on a registered canonical run root after a
+final report and preserves the manifest/hash/audit record in durable state; it
+never deletes a baseline or an unregistered path.
 
-The comparison record contains baseline ID/hash, candidate ID/hash, exact
-dimensions, `pixel_diff_fraction`, `max_channel_delta`, critical-region result,
-review result, comparator version, and generated diff-artifact hash. It is
-`passed` only under `REQ-1713`; otherwise it is `failed`, `unavailable`, or
-`error` with the relevant reason.
+Network access is restricted to `http://dev:<recorded-port>`. Every command is
+literal argv and runs only in the registered worktree or artifact root. Remote,
+destructive, credential, permission, deployment, infrastructure, Docker, and
+product file-change actions remain `waiting_user` with an opaque approval ID.
+Secrets, cookies, authorization/secret headers, personal data, raw reasoning,
+and unrestricted command/console/network payloads are rejected or redacted.
 
-## Approval, artifact, baseline, server, and privacy controls
-
-The artifact root is registered before any write and must be outside the
-primary checkout, owned by the current run, and validated by normalized
-component-boundary and symlink checks. The baseline root is separate and
-read-only after approval. Cleanup may remove only registered clean run roots
-after the final report and must preserve the manifest, hashes, and audit record;
-it may not remove a baseline or any user path.
-
-Routine local preparation and tests remain subject to the repository's existing
-managed-session policy. Any command or action that is remote, destructive,
-credential-bearing, permission-changing, deployment-related, or outside the
-registered worktree/artifact root stays in `waiting_user` with its opaque
-request ID. No session-wide approval is allowed. Every automatically resolved
-routine decision, if applicable to a future implementation, records the exact
-one-time decision and `routine_policy` source without command output or private
-reasoning.
-
-The local server is the only permitted network target. API and browser evidence
-must include origin, method/path or URL, timestamp, status, and redacted
-metadata. Secrets are rejected from scenario configuration and redacted from
-headers, bodies, logs, screenshots, review observations, and error messages.
-
-## Rollout, rollback, migration, and operations
+## Rollout, rollback, PM gate, and handoff
 
 Rollout is additive and version-gated as `verification_contract_v1`. The
-implementation first enables schema/source/artifact checks, then capability and
-server gates, then API/browser execution, then visual review/comparison, and
-finally bootstrap orchestration. Each stage must pass its mapped tests before
-the next stage is enabled.
+implementation enables the seven slices in order and announces package
+fingerprint, source baseline, schema, and config hash before each stage. A
+future schema uses a new version and an explicit conversion contract; v1
+records are not guessed, rewritten, or reinterpreted.
 
-There is no database migration in this slice. Persisted v1 records are
-append-only for evidence and immutable for snapshots/baselines. A future schema
-must use a new version and an explicit conversion contract; an unsupported
-version returns `error` and is not guessed or rewritten. Rollback disables
-new starts, leaves existing records and artifacts readable, and preserves every
-baseline and diff. Recovery resumes only from the recorded state after source
-and capability revalidation.
+Rollback disables new starts and leaves all existing records readable. Recovery
+begins only after rechecking the dynamic source baseline, package fingerprint,
+config hash, capability matrix, and approval state. It preserves snapshots,
+actuals, diffs, baselines, review records, manifests, and redacted logs. It
+does not perform destructive migration, branch deletion, broad cleanup, or
+baseline deletion.
 
-Operational reports include run ID, package/source fingerprint, scenario,
-outcome, stage, timestamps in UTC, server/browser/API versions, capability
-matrix, attempt counts, artifact and baseline hashes, redacted errors,
-approval source, and cleanup state. They do not include raw reasoning,
-credentials, unrestricted command output, or unbounded response bodies.
+After integration, the coordinator emits one bounded report. Only an all-
+required-pass report with complete traceability and evidence reaches
+`pm_review_pending` and the original Sol/xhigh read-only PM final review. A
+non-pass report is recorded and blocks PM success; it is not retried by the PM
+gate as if it passed.
 
-## Bootstrap and package handoff
+The structured delta record is:
 
-`BOOTSTRAP-1701` is the sole smoke scenario in this handoff. Its fixed inputs
-are the source/package identity above, `GET /` with expected HTTP `200`, local
-origin `http://dev:<recorded-port>`, viewports `375x812`, `768x1024`, and
-`1440x900`, DPR `1`, UTC/en-US/light/no-preference browser context,
-registered artifact root, approved immutable baseline, and the required
-capability set. The scenario's output is one persisted terminal outcome and a
-report that links every check and artifact. It has no external dependency and
-does not authorize remote, destructive, Docker, infrastructure, or deployment
-actions.
+```json
+{
+  "status": "SPEC_DELTA_REQUIRED",
+  "runtime_status": "not_started",
+  "affected_ids": ["OBJ-170x", "REQ-17xx", "AC-17xx", "TEST-17xx", "IS-170x"],
+  "classification": "omission | contradiction | unsafe_input | environment_mismatch | unverifiable",
+  "source_snapshot": {"worktree_root": "<absolute>", "commit": "<full>", "tree": "<full>", "package_fingerprint": "<sha256>"},
+  "evidence": [{"kind": "bounded-observation", "value": "<sanitized>"}],
+  "impact": "<bounded>",
+  "proposed_resolution": "<bounded>",
+  "blocking_stage": "<IS-170x>",
+  "created_at_utc": "<RFC3339>"
+}
+```
 
-Package handoff:
+The record is returned before dependent behavior starts and is routed to the
+implementation PL, integration PL, and PM for an explicit package decision.
 
-- Consumer: owning implementation PL, then integration PL and PM.
-- Current status: `SPEC_APPROVED`.
-- Current deliverable: exactly `docs/slices/SLICE-017.md`; no product behavior
-  is implemented by this slice.
-- Implementation order: `IS-1701` through `IS-1707` in the ordered list above.
-- Acceptance gate: all `AC-1701` through `AC-1720` and their mapped
-  `TEST-1701` through `TEST-1720` must have observable evidence before a later
-  implementation loop can report an implementation terminal status.
-- Source-drift gate: recheck the commit/tree/clean state and package
-  fingerprint before each implementation stage; route differences as a spec
-  delta.
-- Handoff report: return changed paths, commit SHA, exact artifact hashes,
-  `REQ → AC → TEST` evidence, outcome, residual risks, and rollback state. Do
-  not report a future test as run when it is not present in the evidence.
-- Current verification statement: content-only audit is the only verification
-  performed for this documentation handoff. No product tests, builds,
-  generators, Docker, servers, live browser/API scenarios, screenshot capture,
-  image review, or comparison execution is claimed.
+## Documentation-run status
 
-## Baseline and slice result
+This handoff records static source, convention, and content inspection only.
+`TEST-1701` through `TEST-1721` are `NOT_RUN`. No server, API, browser,
+screenshot, image review, deterministic comparison, bootstrap, product test,
+build, generator, Docker, infrastructure, or remote action was run or is
+claimed. The only current deliverable is `docs/slices/SLICE-017.md`.
 
-- Target: `/home/elicie/.codex/team-orchestrator/runs/.worktrees/ark-20260726t075628z-af8de8/verification-spec`
-- Recorded at: 2026-07-26 UTC.
-- Method: `GIT_CLEAN` at capture.
-- `TARGET_BASELINE_ID`: `GIT:50531832a57e3fd0dae093b7ad0b51197e668045:TREE:de77e16a2c257456721bd44fc260f6b90afd2af6`.
-- Existing modified/untracked artifacts at capture: none.
-- Existing validation failures at capture: none observed in the read-only
-  source inspection; product tests were not run for this documentation-only
-  assignment.
-- Relevant commands confirmed: `git rev-parse HEAD`, `git rev-parse HEAD^{tree}`,
-  `git status --porcelain=v1`, and content inspection of adjacent slice docs.
-- Environmental limits: no Docker, infrastructure, development server,
-  product build/test, generator, API, browser, screenshot, image-review,
-  comparison, external network, or remote Git action.
+## Acceptance criteria
 
-Slice result:
+### AC-1701 — Baseline is dynamically captured
 
-- Status: `SPEC_APPROVED`.
-- Changed artifact: exactly `docs/slices/SLICE-017.md`.
-- Verification summary: content-only self-audit required by the assignment;
-  `TEST-1701` through `TEST-1720` are specified and `NOT_RUN`.
-- Security/NFR summary: closed controls cover source drift, capabilities,
-  artifact roots, baselines, approvals, ports, privacy, reliability,
-  compatibility, rollout, rollback, and operations.
-- Warnings and unverified areas: all future product behavior and runtime
-  verification remain unverified by design; no unsupported implementation claim
-  is made.
-- Rollback/recovery: remove or supersede only this documentation contract via
-  an explicit spec delta; future implementation rollback follows `REQ-1718`
-  and preserves evidence.
-- Recommended next action: owning PL independently review this file, then
-  authorize the ordered implementation slices only if the package remains
-  `SPEC_APPROVED` and the source fingerprint is unchanged.
-## PL correction addendum — controlling contract v1.1
+Before `IS-1701` or a later stage, the implementation records the selected
+worktree root, ref/detached label, full commit, full tree, machine-readable
+porcelain status, clean-state classification, package fingerprint, authority
+date, capture method, and UTC time. No hard-coded source identity or absolute
+target path is used. The baseline is immutable for that stage.
 
-This addendum controls wherever earlier prose conflicts. It is part of this
-single-file package; status remains SPEC_APPROVED.
+### AC-1702 — Drift fails closed
 
-### Corrected source and evidence coverage
+Changed source identity, dirty-state classification, package fingerprint,
+scenario, baseline identity, or reference boundary stops dependent work before
+execution with `SOURCE_DRIFT` or `PACKAGE_FINGERPRINT_MISMATCH`. No external
+reference is consulted.
 
-- SOURCE_KIND: GIT_REPOSITORY.
-- SOURCE_ID: GIT-COMMIT:50531832a57e3fd0dae093b7ad0b51197e668045.
-- SOURCE_BRANCH_AT_CAPTURE: main is descriptive only.
-- WORKTREE_STATE_AT_CAPTURE: clean.
-- SOURCE_DRIFT_POLICY: FAIL_AND_REFREEZE; a changed commit, package
-  fingerprint, configuration snapshot, baseline identity, or integrated commit
-  yields error before a dependent check until an explicit spec delta is
-  approved.
-- REFERENCE_BOUNDARY: NONE; authority date is 2026-07-26 UTC; authority is the
-  explicit user assignment, captured source, and existing Closed Contract
-  conventions; package version is verification-spec-v1.1.
+### AC-1703 — Lifecycle is closed
 
-| Surface | Class | Channel | Coverage | Bounded evidence/use |
-| --- | --- | --- | --- | --- |
-| User statements | USER_REQUIREMENT | USER_STATEMENT | EXPLORED | Normative assignment, not runtime proof. |
-| Existing slices / SLICE-016 | FACT | DOCUMENT | EXPLORED | Closed Contract, ID, traceability conventions. |
-| Controller/integration flow | FACT | SOURCE | EXPLORED | Integrated result precedes original PM final review. |
-| Project config and run persistence | FACT | SOURCE | EXPLORED | Existing TOML loader and persisted resolved config. |
-| Role/approval contracts | FACT | SOURCE | EXPLORED | Sol/Terra/Luna and sandbox/approval safeguards. |
-| App-server 0.145 / localImage | FACT | DOCUMENT | PARTIAL | Protocol target; no live image signal observed here. |
-| Dependency metadata | FACT | SOURCE | EXPLORED | No global or target browser dependency assumed. |
-| Capability-gated design | DECISION | USER_STATEMENT | EXPLORED | Explicit future adapter choice. |
-| Routes/actions/selectors/baselines | UNKNOWN | UNVERIFIED | OUT_OF_SCOPE | Required validated future config, never inferred. |
-| Runtime checks | FACT | UNVERIFIED | OUT_OF_SCOPE | Browser/API/screenshot/comparison tests are not run. |
+Valid transitions follow the lifecycle exactly. Out-of-order, duplicate, and
+replayed transitions preserve prior state. Only the five listed terminal
+outcomes are accepted, each with its required evidence or bounded diagnostic.
 
-The only non-blocking assumption is a future strict extension of the existing
-project-config schema. Failure to add it returns SPEC_DELTA_REQUIRED; no
-approved slice depends on an unknown product route, selector, or baseline.
+### AC-1704 — Records are versioned and linked
 
-### Corrected architecture, outcomes, and PM gate
+Every snapshot, config, capability, request, browser event, screenshot, review,
+comparison, artifact, error, and report has schema version 1, required IDs, UTC
+time, source/package fingerprint, required flag, and explicit links. Blank,
+unknown, or acceptance-relevant missing fields are rejected.
 
-Controller.VerificationCoordinator runs after the integrated result and before
-the original Sol/xhigh read-only PM final review. It is not a fifth team; it
-does not change the Sol/Terra/Luna hierarchy or weaken sandbox/approval
-contracts. Team and integration smoke checks MAY remain but cannot replace or
-falsely satisfy coordinator verification.
+### AC-1705 — Configuration and snapshot cannot drift
 
-Only the coordinator persists state. Exact check outcomes are passed, failed,
-unavailable, skipped, and error. passed means every assertion and required
-evidence exists; failed means assertion or comparison failure; unavailable means
-a missing required capability; skipped means missing optional prerequisite; error
-means malformed configuration, stale/missing/duplicate artifact, unsafe path,
-timeout exhaustion, or incomplete required evidence. Each result stores ID,
-required flag, attempts, UTC times, adapter/version, sanitized reason, manifest
-keys, and hashes.
+The strict resolved `[verification.coordinator]` object and its SHA-256 are
+persisted before any server/API/browser action, together with the dynamic source
+baseline. The snapshot contains all required config, environment, contract,
+timeout, retry, approval, artifact, and baseline values and is immutable on
+reopen. Unknown fields and implicit required defaults return `CONFIG_INVALID`.
 
-    integrated -> configured -> capabilities -> ready -> executing -> collecting -> deciding
-    deciding -> passed | failed | unavailable | skipped | error
-    passed for all required checks -> pm_review_pending -> original PM review
-    all other terminal results -> recorded_nonpass (no PM success gate)
+### AC-1706 — Artifact and baseline paths are safe
 
-API/browser/readiness have two total attempts; screenshot, comparison, semantic
-review, artifact write, and cleanup have one. Server/API timeout is 30,000 ms,
-browser is 60,000 ms, case total is 120,000 ms, cleanup waits 10,000 ms only
-for registered run-started processes. Retry never alters snapshot, baseline,
-required flag, or input.
+Traversal, non-canonical roots, symlink escape, primary-checkout output, empty
+files, missing hashes, unsupported extensions, and baseline replacement are
+rejected. Valid per-run artifacts are contained, bounded, typed, SHA-256
+hashed, and linked; approved baselines remain immutable and recoverable.
 
-### Corrected project configuration and snapshot schema
+### AC-1707 — Coordinator owns state
 
-The future extension lives under the existing project configuration mechanism,
-.codex/team-orchestrator.toml, as [verification.coordinator]. The current strict
-schema rejects it until IS-1701 deliberately extends that schema. The future
-implementation strictly validates, resolves without secrets, and persists the
-entire resolved object and SHA-256 snapshot hash in the existing run record
-before it starts a server, API probe, or browser. Later advance/restart uses
-only that persisted snapshot.
+Instrumented adapters that attempt to mutate state, snapshots, baselines, or
+roots cannot do so. Only the coordinator persists transitions, provenance, and
+terminal outcomes.
 
-| Required field | Closed validation |
-| --- | --- |
-| schema_version | Exact integer 1. |
-| enabled and required_capabilities | Explicit boolean and 1–6 unique names from curl, browser, screenshot, comparison, semantic_review. |
-| server_argv / lifecycle | 1–32 literal nonempty argv strings, no shell; bind 0.0.0.0; readiness path/status/timeout explicit. |
-| api_probes | 1–50 unique IDs, relative / paths without .., literal method, expected 100–599 status/content type, body digest policy, required flag. |
-| browser_adapter / cases | Fixed allowlisted adapter name; 1–50 unique case IDs, local path, ready selector, 0–50 ordered actions, required flag. |
-| viewports | Exactly and only 375x812, 768x1024, 1440x900 in that order. |
-| baseline_root / identities | Canonical project-relative path and explicit expected identity/environment tuple. |
-| comparison policy | Explicit pixel_diff_fraction_max=0.005, max_channel_delta=8, and explicit critical-region list. |
-| evidence policy | Explicit console/network count/byte limits, artifact retention, semantic-review required flag, and artifact limits. |
-| timeouts / attempts | Explicit: server/API 30000, browser 60000, case 120000 ms; API/browser two total, others one. |
+### AC-1708 — Retries converge
 
-Unknown fields, blank values, secret-bearing values, unsupported adapters,
-duplicate IDs, absent required values, unbounded arrays, out-of-range values,
-or acceptance-relevant implicit defaults are error before execution.
+Readiness/API/browser have at most two total attempts; artifact,
+screenshot/review/comparison, and cleanup have one. A timeout or failure emits
+one bounded terminal record with exact code, attempts, and evidence, without
+changing immutable inputs.
 
-### Corrected API, browser, and server contract
+### AC-1709 — API contract is literal and local
 
-API verification capability-detects curl or an equivalently specified adapter.
-It uses literal argv and never shell interpretation. The only accepted origin is
-http://dev:<port> where port is 10001 or the next available integer at or above
-10001; method/path/query/body/allowlisted headers/status/content-type assertions
-all come from the snapshot. It rejects absolute URLs, redirects to a different
-origin, path traversal, proxy use, credentials, secret headers, and unrestricted
-request or response bodies. Evidence is method, relative path, status, content
-type, elapsed milliseconds, redacted headers, and a SHA-256 digest plus at most
-64 KiB sanitized body preview.
+Positive probes use only snapshotted literal argv and request fields. Negative
+cases for traversal, absolute/cross-origin URLs, proxy/credentials,
+undeclared headers, shell interpretation, and cross-origin redirects are
+rejected. Observed response evidence is bounded, redacted, hashed, and linked.
 
-Browser verification uses a driver abstraction with detect, navigate, interact,
-capture, and close. A supported driver performs real local navigation and
-declared interaction in a fresh context. The initial slice does not require a
-globally installed browser package and does not silently add a dependency to a
-target project. Driver detection records supported with version or a bounded
-unavailable diagnostic. Missing driver produces unavailable for a required case
-and skipped for optional; driver execution failure produces error.
+### AC-1710 — Browser contract is reproducible
 
-Development servers never use Docker, bind 0.0.0.0, use 10001 or next available
-port at or above it, accept dev, never use 3000, and advertise only
-http://dev:<port>. A readiness HTTP status check is bounded to 30,000 ms.
-Server argv is recorded literally. No push, pull request, deploy, remote merge,
-or other remote action is permitted.
+A fresh Chromium context uses exact DPR/locale/timezone/color/reduced-motion
+values, navigates only to the recorded origin, waits on a bounded declared
+condition, executes ordered actions, and records navigation, console,
+page-error, dialog, and assertion evidence.
 
-### Corrected screenshots, baselines, artifacts, and comparison
+### AC-1711 — Screenshot bytes are exact
 
-After declared readiness and browser action, capture exactly three PNG actuals:
+Exactly one non-empty PNG per required viewport has exact pixel dimensions and
+DPR `1`, no unrecorded transformation, and persisted metadata, hash, source,
+case, browser/adapter version, and capture time.
 
-    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/screenshots/<case-id>/375x812.actual.png
-    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/screenshots/<case-id>/768x1024.actual.png
-    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/screenshots/<case-id>/1440x900.actual.png
-    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/diffs/<case-id>/375x812.diff.png
-    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/diffs/<case-id>/768x1024.diff.png
-    <ARK_TEAM_STATE_ROOT>/<run-id>/verification/diffs/<case-id>/1440x900.diff.png
+### AC-1712 — Semantic review is capability-gated
 
-Each is DPR 1 PNG with no resize, crop, or post-processing and records actual
-dimensions, viewport, locale en-US, timezone UTC, color scheme light, reduced
-motion no-preference, adapter/browser version, URL, SHA-256, capture time, up
-to 100 console events/32 KiB, and up to 100 network events/32 KiB. Network
-evidence contains local method/path/status/duration only. Missing, mismatched,
-stale, or duplicate actual/baseline/diff artifact is error.
+The local-image input path is canonical, regular, non-symlink PNG under the run
+root and is sent only when the active-turn runtime signal advertises the
+capability. At most three items of at most 10 MiB each are sent per turn, and
+findings are limited to 50 entries/16 KiB. Review returns only `approved`,
+`rejected`, or `blocked` with bounded findings. Missing signal is `unavailable`
+for required review and `skipped` for optional review; it cannot become
+approval.
 
-A baseline MAY be in the canonical configured project baseline root. Creating
-or updating it requires exact explicit user approve_once approval for that
-operation and baseline identity; routine local approval cannot substitute. The
-manifest records approval ID, approver, UTC time, path, source/environment tuple,
-and SHA-256. All per-run actuals, diffs, logs, manifests, reviews, and reports
-stay under the exact Ark state-root/run-id directory above, never under the
-target project.
+### AC-1713 — Comparison is deterministic and baseline-safe
 
-Canonical artifact paths reject .., noncanonical root spellings, empty
-components, symlink traversal, and paths outside exactly two allowed roots: the
-per-run state directory and read-only approved baseline root. Only .png, .json,
-.jsonl, and .txt are allowed. Use exclusive temporary write then atomic rename
-after validating the parent. Limit 500 files, 50 MiB per file, 500 MiB total,
-64 KiB metadata per check, 100 console events, 100 network events, and 64 KiB
-API preview. SHA-256 every persisted file. Retain 30 days; delete only a
-registered canonical run directory after final report; never delete a baseline.
-Persist no private reasoning, credential, cookie, authorization/secret header,
-unrestricted console/network payload, or target-project run artifact.
+Only compatible equal-dimension RGBA8 PNGs compare. Metrics and diff bytes are
+persisted; changed pixels in the deterministic diff are opaque magenta and
+unchanged pixels are transparent. Pass requires approved review, no
+critical-region difference, `pixel_diff_fraction <= 0.005`, and
+`max_channel_delta <= 8`. No automatic baseline creation or overwrite is
+possible.
 
-Deterministic comparison decodes equal-dimension PNGs to RGBA8 without resize,
-crop, alpha normalization, or color-space conversion. It computes per-channel
-absolute deltas in row-major order, pixel_diff_fraction = differing_pixels /
-total_pixels, and max_channel_delta = maximum channel delta. Its deterministic
-diff PNG has changed pixels opaque magenta and unchanged pixels transparent.
-Pass requires fraction <= 0.005, max delta <= 8, and no declared critical-region
-difference. Persist baseline/actual/diff SHA-256 values, dimensions, thresholds,
-metrics, and stable passed/failed. Semantic review is separate evidence and
-cannot override deterministic failed.
+### AC-1714 — Capability absence blocks work
 
-### Corrected localImage semantic-review contract
+Each required capability has persisted availability, adapter/version, check
+time, and bounded diagnostic. Missing required capability prevents its
+dependent check and cannot be replaced by another capability.
 
-For semantic review, the exact current app-server turn input extension is one
-item shaped { "type": "localImage", "path": "<absolute-path>" }. Before it is
-constructed, canonicalize the path and require an existing regular, non-symlink
-PNG beneath this run's verification/screenshots root; allow at most three items
-per turn and at most 10 MiB per item. The adapter must observe and persist an
-explicit active-turn runtime capability signal advertising localImage; model name
-alone is not a signal. Missing signal yields unavailable when semantic review is
-required and skipped when optional. When signalled, persist only bounded
-observable findings {severity, category, viewport, description} (maximum 50 /
-16 KiB), input SHA-256, and capability version. Do not persist private reasoning.
+### AC-1715 — Server constraints are enforced
 
-### Corrected slice closure, handoff, and package status
+The server uses literal argv, `0.0.0.0`, hostname `dev`, port `10001` or the
+recorded next port at or above it, and an explicit HTTP readiness check within
+30,000 ms. Port `3000`, Docker, remote services, infrastructure mutation, and
+unregistered processes fail closed. Next.js includes `dev` in
+`allowedDevOrigins`.
 
-The ordered implementation plan is independently implementable and verifiable:
+### AC-1716 — Security and operations evidence is bounded
 
-| Slice | Includes | Dependencies and affected contract | Completion and rollback |
-| --- | --- | --- | --- |
-| IS-1701 | REQ-1701,1702,1704,1705; matching AC/TEST | Existing config loader, RunRecord, state store | Tests 1701,1702,1704,1705 pass; stop new config reads and retain snapshots. |
-| IS-1702 | REQ-1706; AC/TEST-1706 | IS-1701; artifact/baseline root contract | Test 1706 passes; disable new roots and preserve records. |
-| IS-1703 | REQ-1703,1707,1708; matching AC/TEST | IS-1701,1702; coordinator, lifecycle, and typed records | Tests 1703,1707,1708 pass; disable coordinator without changing existing flow. |
-| IS-1704 | REQ-1714,1715,1716; matching AC/TEST | IS-1701..1703; local capability/server/approval record | Tests 1714,1715,1716 pass; report non-pass capability without install. |
-| IS-1705 | REQ-1709,1710; AC/TEST-1709,1710 | IS-1703,1704; API/browser adapter schema | Tests 1709,1710 pass; block adapters and preserve evidence. |
-| IS-1706 | REQ-1711,1712,1713; matching AC/TEST | IS-1702,1704,1705; screenshot/baseline/comparison/image adapter | Tests 1711,1712,1713 pass; unavailable/skipped does not alter comparator. |
-| IS-1707 | REQ-1715..1720; AC/TEST-1715..1720 | IS-1701..1706; rollout and PM handoff | Tests 1715..1720 plus earlier tests pass; disable starts and preserve records. |
+Only the local origin is contacted; argv, roots, redaction, approval IDs,
+version data, UTC timing, retries, hashes, and cleanup are recorded. Dangerous
+or out-of-scope actions remain `waiting_user`. Secrets, private reasoning, and
+unrestricted command/response data do not enter records.
 
-This table controls inconsistent earlier slice prose; every row remains complete
-OBJ-17xx -> REQ-17xx -> AC-17xx -> TEST-17xx -> IS-170x -> SLICE-017 through
-the normative traceability table. The exact first approved implementation slice
-is IS-1701 — Configuration and immutable run snapshot.
+### AC-1717 — Rollout is versioned and staged
 
-Post-implementation bootstrap requires deterministic tests and one real local
-scenario: bounded development-server startup; literal-argv API assertion; real
-browser navigation/action; all three screenshot sizes; actual/diff hashes;
-console/network evidence; capability-gated semantic review; original PM
-acceptance; and cleanup without Docker or remote action. It is future work and
-has not been run during this documentation-only package.
+`verification_contract_v1`, package fingerprint, schema, and source baseline
+are announced before a run. Stages are enabled in the declared order, and
+existing snapshots are not reinterpreted by a new version.
 
-### Handoff
+### AC-1718 — Rollback preserves evidence
 
-- Package identity/status: verification-spec-v1.1 / SPEC_APPROVED.
-- Ordered approved slices: IS-1701 through IS-1707.
-- Exact next action: implement IS-1701 only, then obtain TEST-1701 through
-  TEST-1705 implementation evidence before IS-1702.
-- Constraints: no Docker, no port 3000, no browser/dependency installation, no
-  push, pull request, deploy, remote merge, or other remote action.
-- Baseline expectation: exact explicit user approval naming baseline identity
-  before any create/update; per-run artifacts never enter the target project.
-- Warnings and prohibited assumptions: do not infer browser, curl, image
-  capability, route, selector, baseline, secret, or remote authority from model
-  or package presence.
-- Rollback: preserve snapshots, baselines, actuals, diffs, manifests, reviews,
-  and redacted logs; block new starts rather than performing destructive
-  migration or baseline deletion.
+Disabling starts preserves snapshots, config/source hashes, baselines, actuals,
+diffs, reviews, manifests, and redacted logs. Recovery returns a bounded
+drift/environment error after revalidation. No destructive migration, baseline
+deletion, broad cleanup, or in-place rewrite occurs.
 
-If a future implementation finds missing capability, malformed configuration,
-unsafe path, contradiction, or unsupported dependency, it returns
-SPEC_DELTA_REQUIRED with affected REQ/AC/TEST/IS IDs, classification
-(omission, contradiction, unsafe_input, environment_mismatch, or unverifiable),
-bounded observable evidence, impact, proposed resolution, and runtime_status
-not_started. It does not guess or proceed.
+### AC-1719 — Bootstrap order is closed
 
-### Documentation-run status
+`BOOTSTRAP-1701` validates identity/config, snapshots, discovers capabilities,
+starts the constrained local server, requires `GET /` HTTP 200, runs fresh
+browser readiness/actions, captures all three viewports, reviews, compares,
+and writes exactly one terminal report. This documentation handoff makes no
+claim that the procedure ran.
 
-This package records static source/convention/content inspection only. Future
-TEST-1701 through TEST-1720 are NOT_RUN. Browser, API, screenshot, semantic
-review, deterministic comparison, and bootstrap verification are NOT_RUN.
-Product behavior, tests, builds, generators, Docker, development servers, live
-browser/API scenarios, and remote actions were not run for this specification.
+### AC-1720 — PM gate and first slice are complete
+
+Only a complete all-required-pass report reaches `pm_review_pending` and the
+original PM final review. `IS-1701` has closed evidence for its four mapped
+requirements, acceptance/tests, dynamic baseline, config hash, immutable run
+snapshot, and rollback record before `IS-1702` begins. Any non-pass or missing
+evidence blocks PM success.
+
+### AC-1721 — Delta records are structured and bounded
+
+A missing, contradictory, unsafe, environment-incompatible, or unverifiable
+contract fact produces one `SPEC_DELTA_REQUIRED` record with the exact required
+fields, affected traceability IDs, bounded evidence, `runtime_status:
+not_started`, and no private or secret data. Dependent behavior does not run.
+
+## Verification cases
+
+All procedures here are future implementation checks. Their status in this
+documentation-only package is `NOT_RUN`.
+
+### TEST-1701 — Dynamic baseline capture
+
+At the start of `IS-1701` and a later-stage replay, read the selected worktree
+with literal Git argv and assert full commit/tree/ref state, porcelain status,
+package fingerprint, authority date, clean classification, timestamp, and
+immutable stage record. Assert that changing the selected root changes the
+captured identity rather than matching a hard-coded value. Expected: `AC-1701`.
+
+### TEST-1702 — Drift and reference-boundary negatives
+
+Run changed commit/tree/ref, dirty state, package bytes, scenario, baseline,
+and forbidden external-reference cases. Assert stop-before-dependent-work and
+the exact drift/fingerprint error. Expected: `AC-1702`.
+
+### TEST-1703 — Lifecycle state machine
+
+Exercise every valid transition, out-of-order transition, duplicate terminal
+event, and replay. Assert exact state preservation, one terminal outcome, and
+closed outcome values. Expected: `AC-1703`.
+
+### TEST-1704 — Versioned record linkage
+
+Validate config, snapshot, capability, request, browser, screenshot, review,
+comparison, artifact, error, and report records. Try blank IDs, unknown states,
+missing fingerprints, missing required flags, and broken artifact links.
+Expected: `AC-1704`.
+
+### TEST-1705 — Strict config and snapshot immutability
+
+Load a complete `[verification.coordinator]` object, verify canonical bytes and
+hash, then try unknown fields, implicit values, duplicates, unsupported adapter,
+secret, invalid range, and missing field inputs. Start a snapshot, mutate
+source/config/scenario inputs, reopen it, and assert byte-equivalent resolved
+values and unchanged identity before any action. Expected: `AC-1705`.
+
+### TEST-1706 — Root, artifact, and baseline security
+
+Attempt traversal, non-canonical root, symlink escape, checkout output, empty
+file, unsupported type, missing hash, oversize file, and baseline replacement.
+Then write valid PNG/JSON/JSONL/TXT records and verify containment, limits,
+hashes, metadata, approval manifest, retention, and preservation. Expected:
+`AC-1706`.
+
+### TEST-1707 — Coordinator ownership
+
+Use instrumented adapters and reviewers that attempt direct mutation of state,
+snapshots, baselines, outcomes, and roots. Assert rejection and coordinator-
+only persistence. Expected: `AC-1707`.
+
+### TEST-1708 — Timeout and retry convergence
+
+Exercise timeout/failure for readiness/API/browser and for single-attempt
+screenshot/review/comparison/artifact/cleanup. Assert attempt ceilings,
+immutable inputs, exact error, evidence references, and exactly one terminal
+outcome. Expected: `AC-1708`.
+
+### TEST-1709 — API contract positives and negatives
+
+Use a local fake server and inspect literal argv/request evidence for declared
+probes. Reject traversal, absolute URL, cross-origin redirect, proxy,
+credential, undeclared header, shell metacharacter, unexpected status/content
+type, and unbounded body cases. Expected: `AC-1709`.
+
+### TEST-1710 — Browser context and action order
+
+Use a supported driver fake and local page to assert fresh Chromium context,
+exact context settings, local-only navigation, bounded readiness, ordered
+actions, and recorded console/page/dialog/navigation evidence. Assert missing
+driver is capability-gated rather than silently installed or substituted.
+Expected: `AC-1710`.
+
+### TEST-1711 — Screenshot dimensions and byte integrity
+
+Capture the three declared viewports with a controlled browser and assert one
+PNG per viewport, exact dimensions/DPR, no resize/crop/post-processing, nonzero
+bytes, metadata, and SHA-256. Expected: `AC-1711`.
+
+### TEST-1712 — Semantic-review capability and input contract
+
+Exercise active-turn `localImage` signal present, absent, malformed path,
+symlink path, outside-root path, oversize input, bounded findings, rejection,
+block, and approval. Assert required/optional unavailable behavior and no raw
+reasoning persistence. Expected: `AC-1712`.
+
+### TEST-1713 — Comparison thresholds and baseline immutability
+
+Compare equal valid PNGs and threshold-boundary cases; assert deterministic
+row-major metrics, diff bytes, critical-region behavior, review prerequisite,
+dimension mismatch handling, missing/incompatible baseline error, and no
+baseline create/overwrite. Expected: `AC-1713`.
+
+### TEST-1714 — Capability matrix hard gates
+
+Independently make server, API, browser, screenshot, semantic-review, and
+comparison unavailable. Assert required dependent checks are `unavailable`,
+optional checks are `skipped`, diagnostics are bounded, and no substitution
+produces `passed`. Expected: `AC-1714`.
+
+### TEST-1715 — Server constraints and readiness
+
+Inspect literal argv, bind/host, port-floor selection, `dev` origin, Next.js
+allowed-origin setting, readiness status/30,000 ms timeout, and rejection of
+port 3000, Docker, remote, infrastructure, or unregistered process cases.
+Expected: `AC-1715`.
+
+### TEST-1716 — Security, privacy, approval, and operations audit
+
+Attempt remote, destructive, credential, permission, deployment, Docker,
+secret-bearing, out-of-root, and product-file actions. Assert opaque
+`waiting_user` decisions, local-only network, literal argv, redaction, bounded
+logs, version/timing/hash/retry evidence, and cleanup state. Expected: `AC-1716`.
+
+### TEST-1717 — Versioned rollout compatibility
+
+Enable each stage in order, inspect the announced v1/package/source identity,
+and reopen an existing run after a version change. Assert no reinterpretation
+and no later stage before its prerequisite evidence. Expected: `AC-1717`.
+
+### TEST-1718 — Rollback and recovery preservation
+
+Disable starts during each stage and exercise source drift, capability loss,
+and recovery. Assert all listed records/artifacts remain readable, the exact
+bounded recovery outcome is recorded, and no destructive migration or baseline
+mutation occurs. Expected: `AC-1718`.
+
+### TEST-1719 — Bootstrap procedure order
+
+Instrument `BOOTSTRAP-1701` and assert the eleven ordered steps, `GET /` HTTP
+200, exact viewport set, one report, and stop-on-first-failed-precondition.
+This procedure remains future work and is not run by this documentation task.
+Expected: `AC-1719`.
+
+### TEST-1720 — PM gate and first-slice closure
+
+Provide complete and incomplete `IS-1701` evidence. Assert only complete
+`REQ-1701`, `REQ-1702`, `REQ-1704`, and `REQ-1705` evidence with baseline,
+config hash, immutable snapshot, and rollback record permits the next slice;
+assert only all-required-pass reports enter `pm_review_pending` and the
+original PM review. Expected: `AC-1720`.
+
+### TEST-1721 — SPEC_DELTA_REQUIRED schema
+
+Inject each delta classification and omit each required field in turn. Assert
+one bounded record, exact affected traceability IDs, `runtime_status` set to
+`not_started`, no dependent execution, and no secret/private/unrestricted
+content. Expected: `AC-1721`.
