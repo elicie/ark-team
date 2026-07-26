@@ -60,9 +60,9 @@ document claims future runtime verification was executed.
   symlink escape checks.
 - A **capability** is an independently checked ability such as `server`,
   `api`, `browser`, `screenshot`, `image_review`, or `comparison`.
-- A **PASS** is a complete result, not a partial result. Missing capability,
+- A **passed** result is complete, not partial. Missing capability,
   missing artifact, source drift, unresolved approval, or an unrun required
-  check cannot be represented as PASS.
+  check cannot be represented as passed.
 - Required viewport literals are exactly `375x812`, `768x1024`, and
   `1440x900`. The device scale factor is `1`; locale is `en-US`; timezone is
   `UTC`; color scheme is `light`; and reduced motion is `no-preference`.
@@ -103,19 +103,18 @@ planned
   → captured
   → reviewed
   → compared
-  → passed | failed | blocked | invalid
+  → passed | failed | unavailable | skipped | error
 ```
 
 The following terminal outcome values are closed:
 
 | Outcome | Meaning | Required behavior |
 | --- | --- | --- |
-| `PASS` | Every required API, browser, artifact, review, and comparison check passed | Persist all evidence references and the exact snapshot |
-| `FAIL` | A required assertion, API response, browser assertion, image review, or comparison threshold failed | Preserve the failing artifact and redacted diagnostic; do not retry indefinitely |
-| `BLOCKED_CAPABILITY` | A required capability is unavailable or its version is not accepted | Do not execute the dependent check and do not claim PASS |
-| `BLOCKED_ENVIRONMENT` | Server, port, artifact root, permission, or local runtime precondition is unavailable | Preserve the run as resumable and report the exact bounded error |
-| `SPEC_DRIFT` | Source, package, scenario, baseline, or snapshot identity changed | Stop before dependent execution and require recapture or a spec delta |
-| `INVALID` | The contract, artifact, request, or persisted record is malformed or unsafe | Fail closed without using the malformed value |
+| `passed` | Every required API, browser, artifact, review, and comparison check passed | Persist all evidence references and the exact snapshot |
+| `failed` | A required assertion, API response, browser assertion, image review, or comparison threshold failed | Preserve the failing artifact and redacted diagnostic; do not retry indefinitely |
+| `unavailable` | A required capability is unavailable or its version is not accepted | Do not execute the dependent check and do not claim passed |
+| `skipped` | An optional check has an unavailable declared prerequisite | Persist its bounded reason and do not use it to satisfy a required check |
+| `error` | Source drift, malformed input, unsafe artifact, timeout exhaustion, or incomplete required evidence occurred | Stop dependent work and preserve bounded diagnostics |
 
 Closed error codes are `SOURCE_DRIFT`, `PACKAGE_FINGERPRINT_MISMATCH`,
 `SCENARIO_SNAPSHOT_MISMATCH`, `ARTIFACT_ROOT_INVALID`,
@@ -185,7 +184,7 @@ scenario fields defined here.
 - Trigger: a run advances through a lifecycle stage.
 - Observable result: only the listed lifecycle transitions and terminal
   outcomes are accepted; a missing, repeated, or out-of-order transition
-  produces `INVALID` without changing the prior state.
+  produces `error` without changing the prior state.
 - Acceptance: `AC-1703`
 - Verification: `TEST-1703`
 - Implementation slice: `IS-1703`
@@ -341,7 +340,7 @@ scenario fields defined here.
   text legibility, obvious layout shifts, and privacy leakage; it returns only
   `approved`, `rejected`, or `blocked` with bounded observations and the input
   artifact hash. If the capability is unavailable, the result is
-  `BLOCKED_CAPABILITY`, never an inferred approval.
+  `unavailable`, never an inferred approval.
 - Acceptance: `AC-1712`
 - Verification: `TEST-1712`
 - Implementation slice: `IS-1706`
@@ -360,7 +359,7 @@ scenario fields defined here.
   Comparison passes only when `pixel_diff_fraction <= 0.005`,
   `max_channel_delta <= 8`, the image review is `approved`, and no declared
   critical region differs. A candidate with a missing or incompatible baseline
-  returns `BASELINE_NOT_APPROVED` or `INVALID`; it never creates or overwrites
+  returns `error` with code `BASELINE_NOT_APPROVED`; it never creates or overwrites
   a baseline automatically.
 - Acceptance: `AC-1713`
 - Verification: `TEST-1713`
@@ -378,7 +377,7 @@ scenario fields defined here.
   becomes unavailable.
 - Observable result: each required capability has `available` or `unavailable`,
   version, check time, and bounded diagnostic. Any unavailable required
-  capability prevents dependent execution and yields `BLOCKED_CAPABILITY`;
+  capability prevents dependent execution and yields `unavailable`;
   there is no silent browser-to-API, screenshot-to-text, image-review-to-pixel,
   or comparator-to-review substitution.
 - Acceptance: `AC-1714`
@@ -450,7 +449,7 @@ scenario fields defined here.
 - Observable result: rollback disables new verification starts, preserves
   source identity, snapshots, baselines, candidate artifacts, diff images,
   review records, and redacted logs, and returns resumable runs as
-  `SPEC_DRIFT` or `BLOCKED_ENVIRONMENT`. No database migration, baseline
+  `error` with code `SPEC_DRIFT` or `ENVIRONMENT_UNAVAILABLE`. No database migration, baseline
   deletion, branch deletion, broad cleanup, or in-place schema rewrite is
   performed by this slice.
 - Acceptance: `AC-1718`
@@ -525,9 +524,9 @@ No source outside `Reference boundary: NONE` is consulted.
 ### AC-1703 — Lifecycle and outcomes are closed
 
 Valid transitions follow the listed lifecycle exactly. Invalid or replayed
-transitions leave state unchanged. The only terminal outcomes are `PASS`,
-`FAIL`, `BLOCKED_CAPABILITY`, `BLOCKED_ENVIRONMENT`, `SPEC_DRIFT`, and
-`INVALID`, each with its required evidence or redacted diagnostic.
+transitions leave state unchanged. The only terminal outcomes are `passed`,
+`failed`, `unavailable`, `skipped`, and `error`, each with its required
+evidence or redacted diagnostic.
 
 ### AC-1704 — Records are linked and versioned
 
@@ -584,14 +583,14 @@ run link.
 
 ### AC-1712 — Image review is gated and auditable
 
-An unavailable image-review capability yields `BLOCKED_CAPABILITY`; it cannot
+An unavailable image-review capability yields `unavailable`; it cannot
 be treated as approval. An available reviewer returns `approved`, `rejected`,
 or `blocked` with identity/version, input hash, bounded observations, and UTC
 time.
 
 ### AC-1713 — Comparison is measurable and baseline-safe
 
-Only compatible equal-dimension images compare. PASS requires approved image
+Only compatible equal-dimension images compare. A passed result requires approved image
 review, no critical-region difference, `pixel_diff_fraction <= 0.005`, and
 `max_channel_delta <= 8`. A candidate cannot create or overwrite a baseline.
 
@@ -599,7 +598,7 @@ review, no critical-region difference, `pixel_diff_fraction <= 0.005`, and
 
 The persisted capability matrix gates server, API, browser, screenshot,
 image-review, and comparison stages independently. No silent fallback or
-unrecorded capability substitution can produce PASS.
+unrecorded capability substitution can produce passed.
 
 ### AC-1715 — Server constraints are enforced
 
@@ -733,8 +732,8 @@ Expected: `AC-1713`.
 ### TEST-1714 — Capability matrix hard gates
 
 Disable each required capability independently and assert only dependent
-stages are skipped, the outcome is `BLOCKED_CAPABILITY`, and no fallback result
-or PASS is emitted. Expected: `AC-1714`.
+stages are skipped, the outcome is `unavailable`, and no fallback result
+or passed result is emitted. Expected: `AC-1714`.
 
 ### TEST-1715 — Server constraints and readiness
 
@@ -885,7 +884,7 @@ created_at_utc=<RFC3339 timestamp>
 acceptance-relevant unknowns: run IDs are generated opaque IDs, the artifact
 root and baseline are registered before execution, the port is selected by the
 closed rule, and the two contract records are complete scenario inputs. A
-missing value is `INVALID`, not an invitation to guess.
+missing value is `error`, not an invitation to guess.
 
 ## API, browser, screenshot, image-review, and comparison interfaces
 
@@ -918,8 +917,8 @@ baseline. An unavailable reviewer is a hard capability block.
 The comparison record contains baseline ID/hash, candidate ID/hash, exact
 dimensions, `pixel_diff_fraction`, `max_channel_delta`, critical-region result,
 review result, comparator version, and generated diff-artifact hash. It is
-`PASS` only under `REQ-1713`; otherwise it is `FAIL`, `BLOCKED_CAPABILITY`, or
-`INVALID` with the relevant reason.
+`passed` only under `REQ-1713`; otherwise it is `failed`, `unavailable`, or
+`error` with the relevant reason.
 
 ## Approval, artifact, baseline, server, and privacy controls
 
@@ -955,7 +954,7 @@ the next stage is enabled.
 There is no database migration in this slice. Persisted v1 records are
 append-only for evidence and immutable for snapshots/baselines. A future schema
 must use a new version and an explicit conversion contract; an unsupported
-version returns `INVALID` and is not guessed or rewritten. Rollback disables
+version returns `error` and is not guessed or rewritten. Rollback disables
 new starts, leaves existing records and artifacts readable, and preserves every
 baseline and diff. Recovery resumes only from the recorded state after source
 and capability revalidation.
@@ -1216,12 +1215,12 @@ The ordered implementation plan is independently implementable and verifiable:
 
 | Slice | Includes | Dependencies and affected contract | Completion and rollback |
 | --- | --- | --- | --- |
-| IS-1701 | REQ-1701..1705; AC/TEST-1701..1705 | Existing config loader, RunRecord, state store | Tests 1701..1705 pass; stop new config reads and retain snapshots. |
-| IS-1702 | REQ-1706..1708; AC/TEST-1706..1708 | IS-1701; Controller/integration/PM ordering, artifact root | Tests 1706..1708 pass; disable coordinator without changing existing flow. |
-| IS-1703 | REQ-1714; AC/TEST-1714 | IS-1701; artifact-store record | Test 1714 passes; stop new writes and retain registered evidence. |
-| IS-1704 | REQ-1709, REQ-1710; AC/TEST-1709,1710 | IS-1701..1703; local adapter/capability record | Tests 1709,1710 pass; report non-pass capability without install. |
-| IS-1705 | REQ-1711, REQ-1713; AC/TEST-1711,1713 | IS-1703,1704; baseline/comparison schema | Tests 1711,1713 pass; block capture and preserve evidence. |
-| IS-1706 | REQ-1712; AC/TEST-1712 | IS-1703,1705; app-server image adapter | Test 1712 passes; unavailable/skipped does not alter comparator. |
+| IS-1701 | REQ-1701,1702,1704,1705; matching AC/TEST | Existing config loader, RunRecord, state store | Tests 1701,1702,1704,1705 pass; stop new config reads and retain snapshots. |
+| IS-1702 | REQ-1706; AC/TEST-1706 | IS-1701; artifact/baseline root contract | Test 1706 passes; disable new roots and preserve records. |
+| IS-1703 | REQ-1703,1707,1708; matching AC/TEST | IS-1701,1702; coordinator, lifecycle, and typed records | Tests 1703,1707,1708 pass; disable coordinator without changing existing flow. |
+| IS-1704 | REQ-1714,1715,1716; matching AC/TEST | IS-1701..1703; local capability/server/approval record | Tests 1714,1715,1716 pass; report non-pass capability without install. |
+| IS-1705 | REQ-1709,1710; AC/TEST-1709,1710 | IS-1703,1704; API/browser adapter schema | Tests 1709,1710 pass; block adapters and preserve evidence. |
+| IS-1706 | REQ-1711,1712,1713; matching AC/TEST | IS-1702,1704,1705; screenshot/baseline/comparison/image adapter | Tests 1711,1712,1713 pass; unavailable/skipped does not alter comparator. |
 | IS-1707 | REQ-1715..1720; AC/TEST-1715..1720 | IS-1701..1706; rollout and PM handoff | Tests 1715..1720 plus earlier tests pass; disable starts and preserve records. |
 
 This table controls inconsistent earlier slice prose; every row remains complete
