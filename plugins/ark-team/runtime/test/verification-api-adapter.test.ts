@@ -46,6 +46,16 @@ test("TEST-1709 builds one literal local curl request and normalizes bounded red
   assert.ok(request.execution.argv.includes("--proxy"));
   assert.ok(request.execution.argv.includes("--noproxy"));
   assert.ok(request.execution.argv.includes("--max-redirs"));
+  assert.ok(request.execution.argv.includes("--dump-header"));
+  assert.ok(request.execution.argv.includes("--max-time"));
+  assert.ok(request.execution.argv.includes("--max-filesize"));
+  assert.deepEqual(
+    request.execution.argv.slice(
+      request.execution.argv.indexOf("--resolve"),
+      request.execution.argv.indexOf("--resolve") + 2,
+    ),
+    ["--resolve", "dev:10001:127.0.0.1"],
+  );
   assert.equal(request.execution.argv[1], "--disable");
   assert.ok(
     request.execution.argv.includes(

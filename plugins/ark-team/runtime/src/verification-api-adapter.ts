@@ -279,8 +279,20 @@ export function createVerificationApiRequest(
     "--silent",
     "--show-error",
     "--globoff",
-    "--request",
-    probe.method,
+    ...(probe.method === "HEAD" ? [] : ["--dump-header", "-"]),
+    "--max-time",
+    (snapshot.timeouts_ms.api_ms / 1_000).toString(),
+    ...(probe.method === "HEAD"
+      ? []
+      : [
+          "--max-filesize",
+          snapshot.evidence_policy.max_file_bytes.toString(),
+        ]),
+    "--resolve",
+    `${url.hostname}:${url.port}:127.0.0.1`,
+    ...(probe.method === "HEAD"
+      ? ["--head"]
+      : ["--request", probe.method]),
     "--url",
     url.toString(),
     "--max-redirs",
