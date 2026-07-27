@@ -33,6 +33,7 @@ normative authority from observations and from checks that have not been run.
 | `EVID-1710` | `REFERENCE_OBSERVATION` | Playwright official documentation distinguishes executable tests/assertions from planner, generator, healer, CLI, and MCP agent workflows and exposes traces, screenshots, accessibility snapshots, and origin controls | Supports deterministic UI assertions plus a separate agentic exploration phase | Observed 2026-07-27 at release `v1.62.0` (`e3950d9c140d007bd52853b45813c6274b24e36f`, Apache-2.0); no dependency is assumed installed |
 | `EVID-1711` | `REFERENCE_OBSERVATION` | Stagehand official documentation separates `observe`/`act`/agent primitives from measurable evaluations and supports local or Browserbase environments | Corroborates plan-then-execute, structured validation, and repeated-evaluation constraints | Observed 2026-07-27 at server release `v3.7.4` (`6ff9490945e4ed762fa9ebca9dab6f46fa34bc4a`, MIT); cloud behavior is excluded |
 | `EVID-1712` | `SPEC_DELTA` | `verification-spec-v2` (`SLICE-017.md` SHA-256 `277fb413390f83f49fdf34fab4a42e3eca83d3f499fe5442e884f165a0128399`) fixed `retention_days = 30` but did not define the retention anchor or earliest cleanup time | Closes the retention ambiguity in `REQ-1706` and `TEST-1706` without claiming implementation | The v3 decision uses the terminal-report timestamp as the retention anchor |
+| `EVID-1713` | `SPEC_DELTA` | IS-1701 review showed that a record could carry unverified check requiredness and that the configuration example omitted already-required exact adapter/browser versions | Makes check linkage explicit in `REQ-1704` and repairs the configuration example without changing approved behavior | Schema-2 records use a check ID where applicable and reject requiredness that differs from the immutable snapshot |
 
 Repository evidence was captured from clean Git commit
 `150d81a4ebe97ce0aeb2046f8f1461a73fa91742`
@@ -272,7 +273,8 @@ that any future verification passed.
 - Preconditions: a snapshot, case, or artifact record is being persisted.
 - Trigger: a record is created or an adapter returns evidence.
 - Observable result: every new schema-2 record has `schema_version: 2`,
-  non-empty run and case IDs, lane where applicable, stage, UTC timestamp,
+  non-empty run and case IDs, check ID where applicable, lane where applicable,
+  stage, UTC timestamp,
   source/package fingerprint, lane/check requiredness, adapter/model/version
   where applicable, and explicit artifact/hash links. Existing schema-1
   records remain readable under their original contract and are never mixed
@@ -897,6 +899,7 @@ enabled = true
 required = true
 required_capabilities = ["api", "server"]
 api_adapter = "<allowlisted-literal-argv-adapter>"
+api_adapter_version = "<exact-version>"
 api_probes = [{ id = "<id>", method = "GET", path = "/", query = {}, headers = {}, expected_status = 200, expected_content_type = "<type>", body_digest = "<digest-or-none>", required = true }]
 
 [verification.coordinator.ui]
@@ -905,6 +908,8 @@ required = true
 required_capabilities = ["browser", "comparison", "screenshot", "semantic_review", "server"]
 optional_capabilities = ["agentic_browser"]
 deterministic_adapter = "<allowlisted-deterministic-browser-adapter>"
+deterministic_adapter_version = "<exact-version>"
+browser_build = "<exact-browser-build>"
 browser_cases = [{ id = "<id>", path = "/", readiness = "<bounded-condition>", actions = [], assertions = [{ kind = "visible", role = "heading", name = "<accessible-name>" }], required = true }]
 viewports = ["375x812", "768x1024", "1440x900"]
 baseline_root = "<canonical-approved-root>"
@@ -913,7 +918,7 @@ pixel_diff_fraction_max = 0.005
 max_channel_delta = 8
 critical_regions = []
 semantic_review_required = true
-agentic_tasks = [{ id = "<id>", required = false, adapter = "<allowlisted-local-agentic-adapter>", adapter_version = "<exact-version>", api_major = "<exact-major>", model_identity = "<exact-managed-or-local-model>", start_path = "/", goal = "<bounded-goal>", success_criteria = [{ kind = "visible", role = "heading", name = "<accessible-name>" }], allowed_actions = ["navigate", "snapshot", "click", "type", "screenshot"], max_steps = 20, timeout_ms = 120000, system_prompt_template = "<bounded-approved-template-bytes>", checklist = ["<bounded-check>"], prompt_sha256 = "<sha256>", checklist_sha256 = "<sha256>" }]
+agentic_tasks = [{ id = "<id>", required = false, adapter = "<allowlisted-local-agentic-adapter>", adapter_version = "<exact-version>", api_major = "<exact-major>", model_identity = "<exact-managed-or-local-model>", browser_build = "<exact-browser-build>", start_path = "/", goal = "<bounded-goal>", success_criteria = [{ kind = "visible", role = "heading", name = "<accessible-name>" }], allowed_actions = ["navigate", "snapshot", "click", "type", "screenshot"], max_steps = 20, timeout_ms = 120000, system_prompt_template = "<bounded-approved-template-bytes>", checklist = ["<bounded-check>"], prompt_sha256 = "<sha256>", checklist_sha256 = "<sha256>" }]
 ```
 
 This example enables both lanes. A backend-only configuration replaces the
@@ -939,6 +944,11 @@ explicit, duplicate-free, disjoint, and lexically sorted. Disabled-lane or
 top-level disabled residual fields, `required = true` on an agentic task,
 `latest` or version ranges, implicit model fallback, remote execution,
 cloud/tunnel/profile options, and undeclared tools are `CONFIG_INVALID`.
+
+For schema-2 evidence, `check_id` resolves to the snapshotted Backend API
+probe, deterministic UI browser case, or agentic UI task selected by the
+record type and lane. A deterministic browser record's `case_sha256` is the
+SHA-256 of the canonical JSON bytes of that exact snapshotted browser case.
 
 The implementation validates literal argv (no shell), unique bounded IDs,
 relative paths without `..`, allowlisted methods/headers/actions/assertions,
@@ -1093,7 +1103,8 @@ outcomes are accepted, each with its required evidence or bounded diagnostic.
 
 Every snapshot, config, lane summary, capability, request, deterministic or
 agentic browser event, screenshot, review, comparison, artifact, cleanup,
-error, and report has an explicit schema version, required IDs, UTC time,
+error, and report has an explicit schema version, required run/case/check IDs
+where applicable, UTC time,
 source/package fingerprint, lane/check requiredness, adapter/model provenance
 where applicable, and explicit links. Agentic result fields use their closed
 value sets. Blank, unknown, or acceptance-relevant missing fields are rejected.
@@ -1309,7 +1320,7 @@ closed outcome values. Expected: `AC-1703`.
 
 Validate config, snapshot, lane summary, capability, request, deterministic and
 agentic browser, screenshot, review, comparison, artifact, cleanup, error, and
-report records. Try blank IDs, unknown states, missing fingerprints, missing
+report records. Try blank or unknown check IDs, unknown states, missing fingerprints, missing
 lane/check requiredness, missing adapter/model provenance, and broken artifact
 links. For agentic results also reject every unknown execution/finding/
 self-judge value and missing input or ledger hash. Expected: `AC-1704`.
