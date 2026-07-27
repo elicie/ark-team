@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import { z } from "zod/v4";
 
 import {
@@ -8,8 +10,15 @@ import {
 } from "./role-contracts.js";
 import {
   DEFAULT_PROJECT_CONFIG,
+  projectConfigSha256,
   projectConfigSchema,
 } from "./project-config.js";
+import {
+  sha256CanonicalJson,
+  verificationLinkedRecordSchema,
+  verificationRunSnapshotSchema,
+  verificationRunSnapshotSha256,
+} from "./verification-contract.js";
 
 export const RUN_ID_PATTERN = /^ark-\d{8}t\d{6}z-[a-z0-9]{6}$/;
 export const ASSIGNMENT_ID_PATTERN = /^asg-[a-f0-9]{12}$/;
@@ -475,22 +484,242 @@ export const pmSessionRecordSchema = z.object({
 
 export type PmSessionRecord = z.infer<typeof pmSessionRecordSchema>;
 
-export const runRecordSchema = z.object({
-  schema_version: z.literal(1),
-  run_id: z.string().regex(RUN_ID_PATTERN),
-  objective: z.string().min(1),
-  project_path: z.string().min(1),
-  state: runStateSchema,
-  resume_state: runStateSchema.nullable(),
-  created_at: z.string().min(1),
-  updated_at: z.string().min(1),
-  revision: z.number().int().positive(),
-  event_count: z.number().int().nonnegative(),
-  assignment_count: z.number().int().nonnegative().default(0),
-  team_count: z.number().int().min(0).max(4).default(0),
-  project_config: projectConfigSchema.default(DEFAULT_PROJECT_CONFIG),
-  project_config_source: z.string().min(1).nullable().default(null),
-});
+export const runRecordSchema = z
+  .object({
+    schema_version: z.literal(1),
+    run_id: z.string().regex(RUN_ID_PATTERN),
+    objective: z.string().min(1),
+    project_path: z.string().min(1),
+    state: runStateSchema,
+    resume_state: runStateSchema.nullable(),
+    created_at: z.string().min(1),
+    updated_at: z.string().min(1),
+    revision: z.number().int().positive(),
+    event_count: z.number().int().nonnegative(),
+    assignment_count: z.number().int().nonnegative().default(0),
+    team_count: z.number().int().min(0).max(4).default(0),
+    project_config: projectConfigSchema.default(DEFAULT_PROJECT_CONFIG),
+    project_config_source: z.string().min(1).nullable().default(null),
+    project_config_sha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .nullable()
+      .default(null),
+    verification_snapshot: verificationRunSnapshotSchema.nullable().default(null),
+    verification_snapshot_sha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .nullable()
+      .default(null),
+    verification_records: z
+      .array(verificationLinkedRecordSchema)
+      .max(10_000)
+      .default([]),
+  })
+  .superRefine((run, context) => {
+    if (
+      run.project_config_sha256 !== null &&
+      run.project_config_sha256 !== projectConfigSha256(run.project_config)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["project_config_sha256"],
+        message: "project configuration hash does not match the persisted snapshot",
+      });
+    }
+    if (
+      (run.verification_snapshot === null) !==
+      (run.verification_snapshot_sha256 === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["verification_snapshot"],
+        message: "verification snapshot and hash must be present together",
+      });
+    }
+    if (run.verification_snapshot !== null) {
+      if (run.project_config_sha256 === null) {
+        context.addIssue({
+          code: "custom",
+          path: ["project_config_sha256"],
+          message: "verification snapshot requires a project configuration hash",
+        });
+      }
+      if (run.verification_snapshot.run_id !== run.run_id) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_snapshot", "run_id"],
+          message: "verification snapshot belongs to another run",
+        });
+      }
+      if (
+        run.verification_snapshot.baseline_root !==
+        path.resolve(
+          run.project_path,
+          run.verification_snapshot.resolved_config.baseline_root,
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_snapshot", "baseline_root"],
+          message: "verification baseline root does not match the run project",
+        });
+      }
+      if (
+        run.verification_snapshot_sha256 !==
+        verificationRunSnapshotSha256(run.verification_snapshot)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_snapshot_sha256"],
+          message: "verification snapshot hash does not match the persisted snapshot",
+        });
+      }
+      const coordinator = run.project_config.verification.coordinator;
+      if (coordinator === null) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_snapshot"],
+          message: "verification snapshot requires coordinator configuration",
+        });
+      } else if (
+        sha256CanonicalJson(coordinator) !==
+        sha256CanonicalJson(run.verification_snapshot.resolved_config)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_snapshot", "resolved_config"],
+          message: "verification snapshot configuration does not match the run",
+        });
+      }
+      const snapshot = run.verification_snapshot;
+      if (
+        run.verification_records.length < 3 ||
+        run.verification_records[0]?.record_type !== "source" ||
+        run.verification_records[1]?.record_type !== "config" ||
+        run.verification_records[2]?.record_type !== "snapshot"
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_records"],
+          message: "verification snapshot requires source, config, and snapshot records",
+        });
+      }
+      if (
+        run.verification_records[0]?.payload.kind !== "source" ||
+        run.verification_records[0].payload.source_sha256 !==
+          snapshot.source_fingerprint ||
+        run.verification_records[1]?.payload.kind !== "config" ||
+        run.verification_records[1].payload.config_sha256 !==
+          snapshot.resolved_config_sha256 ||
+        run.verification_records[2]?.payload.kind !== "snapshot" ||
+        run.verification_records[2].payload.snapshot_sha256 !==
+          run.verification_snapshot_sha256
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_records"],
+          message: "initial verification records do not link to persisted snapshot data",
+        });
+      }
+      const recordIds = new Set(
+        run.verification_records.map((record) => record.record_id),
+      );
+      if (recordIds.size !== run.verification_records.length) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_records"],
+          message: "verification record IDs must be unique",
+        });
+      }
+      const artifactIds = run.verification_records
+        .filter((record) => record.payload.kind === "artifact")
+        .map((record) =>
+          record.payload.kind === "artifact"
+            ? record.payload.artifact_id
+            : "",
+        );
+      if (new Set(artifactIds).size !== artifactIds.length) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_records"],
+          message: "verification artifact IDs must be unique",
+        });
+      }
+      const artifacts = new Map(
+        run.verification_records
+          .filter((record) => record.payload.kind === "artifact")
+          .map((record) => [
+            record.payload.kind === "artifact"
+              ? record.payload.artifact_id
+              : "",
+            record.payload,
+          ]),
+      );
+      let previousRecordHash: string | null = null;
+      run.verification_records.forEach((record, index) => {
+        if (
+          record.run_id !== run.run_id ||
+          record.case_id !== snapshot.case_id ||
+          record.snapshot_id !== snapshot.snapshot_id ||
+          record.source_fingerprint !== snapshot.source_fingerprint ||
+          record.package_fingerprint !== snapshot.package.package_fingerprint
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_records", index],
+            message: "verification record linkage does not match the run snapshot",
+          });
+        }
+        if (record.previous_record_sha256 !== previousRecordHash) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_records", index, "previous_record_sha256"],
+            message: "verification record hash chain is not append-only",
+          });
+        }
+        previousRecordHash = sha256CanonicalJson(record);
+        for (const reference of record.artifact_references) {
+          const artifact = artifacts.get(reference.artifact_id);
+          if (
+            artifact?.kind !== "artifact" ||
+            artifact.relative_path !== reference.relative_path ||
+            artifact.sha256 !== reference.sha256
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: ["verification_records", index, "artifact_references"],
+              message: "verification artifact reference is broken",
+            });
+          }
+        }
+        if (
+          record.payload.kind === "report" &&
+          record.payload.evidence_record_ids.some(
+            (recordId) =>
+              recordId === record.record_id || !recordIds.has(recordId),
+          )
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: [
+              "verification_records",
+              index,
+              "payload",
+              "evidence_record_ids",
+            ],
+            message: "verification report contains a broken evidence link",
+          });
+        }
+      });
+    } else if (run.verification_records.length !== 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["verification_records"],
+        message: "verification records require a run snapshot",
+      });
+    }
+  });
 
 export type RunRecord = z.infer<typeof runRecordSchema>;
 

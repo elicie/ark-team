@@ -5,6 +5,10 @@ import { parse } from "smol-toml";
 import { z } from "zod/v4";
 
 import { ArkTeamError } from "./errors.js";
+import {
+  sha256CanonicalJson,
+  verificationCoordinatorConfigSchema,
+} from "./verification-contract.js";
 
 const fixedModelsSchema = z
   .object({
@@ -96,6 +100,7 @@ export const projectConfigSchema = z
     verification: z
       .object({
         commands: z.array(verificationCommandSchema).max(50),
+        coordinator: verificationCoordinatorConfigSchema.nullable().default(null),
       })
       .strict(),
   })
@@ -158,6 +163,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = Object.freeze({
   }),
   verification: Object.freeze({
     commands: Object.freeze([]),
+    coordinator: null,
   }),
 }) as unknown as ProjectConfig;
 
@@ -169,6 +175,10 @@ export interface ResolvedProjectConfig {
 export interface ResolvedVerificationCommand {
   argv: string[];
   cwd: string;
+}
+
+export function projectConfigSha256(config: ProjectConfig): string {
+  return sha256CanonicalJson(projectConfigSchema.parse(config));
 }
 
 export async function loadProjectConfig(
@@ -206,6 +216,19 @@ export async function loadProjectConfig(
   const merged = mergeWithDefaults(parsed);
   const validated = projectConfigSchema.safeParse(merged);
   if (!validated.success) {
+    if (
+      validated.error.issues.some(
+        (issue) =>
+          issue.path[0] === "verification" &&
+          issue.path[1] === "coordinator",
+      )
+    ) {
+      throw new ArkTeamError(
+        "CONFIG_INVALID",
+        "Verification coordinator configuration does not match the approved schema",
+        { cause: validated.error },
+      );
+    }
     throw invalidConfig("Project configuration does not match the safe schema");
   }
   return {

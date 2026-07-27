@@ -5,11 +5,25 @@ import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 
 import { ArkTeamError } from "../src/errors.js";
+import { DEFAULT_PROJECT_CONFIG } from "../src/project-config.js";
 import { RunStore } from "../src/state-store.js";
+import {
+  APPROVED_VERIFICATION_PACKAGE,
+  sha256CanonicalJson,
+  type VerificationRunSnapshot,
+  verificationRunSnapshotSha256,
+} from "../src/verification-contract.js";
+import {
+  validVerificationCoordinatorConfig,
+  validVerificationSourceIdentity,
+} from "./verification-fixture.js";
 
 let testRoot: string;
 let stateRoot: string;
 let projectRoot: string;
+
+const loadApprovedVerificationPackage = () =>
+  readFile(path.resolve("docs", "slices", "SLICE-017.md"));
 
 beforeEach(async () => {
   testRoot = await mkdtemp(path.join(tmpdir(), "ark-team-state-test-"));
@@ -39,6 +53,309 @@ test("TEST-001 creates a run and reopens persisted state", async () => {
   const listed = await reopened.listRuns();
   assert.equal(listed.total, 1);
   assert.equal(listed.runs[0]?.run_id, created.run_id);
+});
+
+test("TEST-1705 persists one immutable verification snapshot and reopens it byte-equivalently", async () => {
+  const config = structuredClone(DEFAULT_PROJECT_CONFIG);
+  config.verification.coordinator = validVerificationCoordinatorConfig();
+  let sourceReads = 0;
+  const store = new RunStore({
+    root_path: stateRoot,
+    suffix: () => "170500",
+    verification_source_loader: async () => {
+      sourceReads += 1;
+      return validVerificationSourceIdentity(projectRoot);
+    },
+    verification_package_loader: loadApprovedVerificationPackage,
+  });
+  const created = await store.createRun({
+    objective: "Persist an immutable verification snapshot",
+    project_path: projectRoot,
+    project_config: config,
+    project_config_source: path.join(
+      projectRoot,
+      ".codex",
+      "team-orchestrator.toml",
+    ),
+  });
+  assert.match(created.project_config_sha256 ?? "", /^[a-f0-9]{64}$/);
+  assert.equal(created.verification_snapshot, null);
+
+  const recorded = await store.recordVerificationSnapshot(created.run_id, {
+    package_fingerprint:
+      APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+    server_port: 10_001,
+  });
+  assert.equal(sourceReads, 1);
+  assert.equal(recorded.verification_snapshot?.server.port, 10_001);
+  assert.equal(
+    recorded.verification_snapshot?.artifact_root,
+    path.join(stateRoot, created.run_id, "verification"),
+  );
+  assert.match(recorded.verification_snapshot_sha256 ?? "", /^[a-f0-9]{64}$/);
+  assert.deepEqual(
+    recorded.verification_records.map((record) => record.record_type),
+    ["source", "config", "snapshot"],
+  );
+  const snapshot = recorded.verification_snapshot;
+  assert.notEqual(snapshot, null);
+  if (snapshot === null) {
+    throw new Error("verification snapshot was not persisted");
+  }
+  const errorPayload = {
+    kind: "error" as const,
+    code: "SOURCE_DRIFT" as const,
+    message: "bounded test diagnostic",
+  };
+  const errorRecord = {
+    schema_version: 1 as const,
+    record_id: `${created.run_id}-error`,
+    record_type: "error" as const,
+    run_id: created.run_id,
+    case_id: snapshot.case_id,
+    snapshot_id: snapshot.snapshot_id,
+    stage: "snapshotted" as const,
+    timestamp_utc: "2026-07-26T18:00:01.000Z",
+    source_fingerprint: snapshot.source_fingerprint,
+    package_fingerprint: snapshot.package.package_fingerprint,
+    required: true,
+    previous_record_sha256: sha256CanonicalJson(
+      recorded.verification_records.at(-1),
+    ),
+    payload_sha256: sha256CanonicalJson(errorPayload),
+    payload: errorPayload,
+    adapter: null,
+    artifact_references: [],
+  };
+  const withEvidence = await store.appendVerificationRecord(
+    created.run_id,
+    errorRecord,
+  );
+  assert.equal(withEvidence.verification_records.length, 4);
+  await assert.rejects(
+    () =>
+      store.appendVerificationRecord(created.run_id, {
+        ...errorRecord,
+        record_id: `${created.run_id}-broken`,
+        snapshot_id: "snapshot-other",
+        previous_record_sha256: sha256CanonicalJson(
+          withEvidence.verification_records.at(-1),
+        ),
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_RECORD",
+  );
+  const packageDrift = new RunStore({
+    root_path: stateRoot,
+    verification_source_loader: async () =>
+      validVerificationSourceIdentity(projectRoot),
+    verification_package_loader: async () => "changed package bytes",
+  });
+  await assert.rejects(
+    () =>
+      packageDrift.recordVerificationSnapshot(created.run_id, {
+        package_fingerprint:
+          APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+        server_port: 10_001,
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError &&
+      error.code === "PACKAGE_FINGERPRINT_MISMATCH",
+  );
+  const sourceDrift = new RunStore({
+    root_path: stateRoot,
+    verification_source_loader: async () => ({
+      ...validVerificationSourceIdentity(projectRoot),
+      source_commit: "f".repeat(40),
+    }),
+    verification_package_loader: loadApprovedVerificationPackage,
+  });
+  await assert.rejects(
+    () =>
+      sourceDrift.recordVerificationSnapshot(created.run_id, {
+        package_fingerprint:
+          APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+        server_port: 10_001,
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "SOURCE_DRIFT",
+  );
+
+  config.verification.coordinator.baseline_identity.id = "mutated-input";
+  let replaySourceReads = 0;
+  const reopened = new RunStore({
+    root_path: stateRoot,
+    verification_source_loader: async () => {
+      replaySourceReads += 1;
+      return validVerificationSourceIdentity(projectRoot);
+    },
+    verification_package_loader: loadApprovedVerificationPackage,
+  });
+  const beforeReplay = await reopened.getRun(created.run_id);
+  assert.equal(
+    beforeReplay.verification_snapshot?.baseline_identity.id,
+    "baseline-home-v1",
+  );
+  const replayed = await reopened.recordVerificationSnapshot(created.run_id, {
+    package_fingerprint:
+      APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+    server_port: 10_001,
+  });
+  assert.equal(replaySourceReads, 1);
+  assert.deepEqual(replayed.verification_snapshot, recorded.verification_snapshot);
+  assert.equal(
+    replayed.verification_snapshot_sha256,
+    recorded.verification_snapshot_sha256,
+  );
+
+  await assert.rejects(
+    () =>
+      reopened.recordVerificationSnapshot(created.run_id, {
+        package_fingerprint:
+          APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+        server_port: 10_002,
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError &&
+      error.code === "SCENARIO_SNAPSHOT_MISMATCH",
+  );
+
+  const recordPath = path.join(stateRoot, created.run_id, "run.json");
+  const validRecord = await readFile(recordPath, "utf8");
+  const linkDrift = JSON.parse(validRecord) as {
+    run: {
+      verification_records: Array<{
+        payload: { kind: string; source_sha256?: string };
+        payload_sha256: string;
+        previous_record_sha256: string | null;
+      }>;
+    };
+  };
+  const sourceLink = linkDrift.run.verification_records[0];
+  if (sourceLink === undefined) {
+    throw new Error("source verification record was not persisted");
+  }
+  sourceLink.payload.source_sha256 = "f".repeat(64);
+  sourceLink.payload_sha256 = sha256CanonicalJson(sourceLink.payload);
+  linkDrift.run.verification_records.forEach((record, index, records) => {
+    record.previous_record_sha256 =
+      index === 0 ? null : sha256CanonicalJson(records[index - 1]);
+  });
+  await writeFile(
+    recordPath,
+    `${JSON.stringify(linkDrift, null, 2)}\n`,
+    "utf8",
+  );
+  await assert.rejects(
+    () => reopened.getRun(created.run_id),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "CORRUPT_STATE",
+  );
+
+  await writeFile(recordPath, validRecord, "utf8");
+  const rootDrift = JSON.parse(validRecord) as {
+    run: {
+      verification_snapshot: VerificationRunSnapshot;
+      verification_snapshot_sha256: string;
+    };
+  };
+  rootDrift.run.verification_snapshot.baseline_root =
+    path.join(testRoot, "different-baseline-root");
+  rootDrift.run.verification_snapshot_sha256 = verificationRunSnapshotSha256(
+    rootDrift.run.verification_snapshot,
+  );
+  await writeFile(
+    recordPath,
+    `${JSON.stringify(rootDrift, null, 2)}\n`,
+    "utf8",
+  );
+  await assert.rejects(
+    () => reopened.getRun(created.run_id),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "CORRUPT_STATE",
+  );
+
+  await writeFile(recordPath, validRecord, "utf8");
+  const corrupted = JSON.parse(validRecord) as {
+    run: { verification_snapshot: { case_id: string } };
+  };
+  corrupted.run.verification_snapshot.case_id = "";
+  await writeFile(recordPath, `${JSON.stringify(corrupted, null, 2)}\n`, "utf8");
+  await assert.rejects(
+    () => reopened.getRun(created.run_id),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "CORRUPT_STATE",
+  );
+});
+
+test("TEST-1705 rollback disables new snapshots and preserves existing evidence", async () => {
+  const config = structuredClone(DEFAULT_PROJECT_CONFIG);
+  config.verification.coordinator = validVerificationCoordinatorConfig();
+  const store = new RunStore({
+    root_path: stateRoot,
+    verification_source_loader: async () =>
+      validVerificationSourceIdentity(projectRoot),
+    verification_package_loader: loadApprovedVerificationPackage,
+  });
+  const existing = await store.createRun({
+    objective: "Preserve verification evidence through rollback",
+    project_path: projectRoot,
+    project_config: config,
+  });
+  const snapshotted = await store.recordVerificationSnapshot(existing.run_id, {
+    package_fingerprint:
+      APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+    server_port: 10_001,
+  });
+  const rollback = await store.recordVerificationRollback({
+    reason: "operator disabled new verification starts",
+  });
+  assert.equal(rollback.new_starts_enabled, false);
+  assert.equal(rollback.preserves_existing_records, true);
+
+  const blocked = await store.createRun({
+    objective: "Reject a new verification snapshot after rollback",
+    project_path: projectRoot,
+    project_config: config,
+  });
+  await assert.rejects(
+    () =>
+      store.recordVerificationSnapshot(blocked.run_id, {
+        package_fingerprint:
+          APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+        server_port: 10_001,
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_TRANSITION",
+  );
+
+  const reopened = new RunStore({ root_path: stateRoot });
+  assert.deepEqual(
+    (await reopened.getRun(existing.run_id)).verification_records,
+    snapshotted.verification_records,
+  );
+  assert.deepEqual(await reopened.getVerificationRollback(), rollback);
+});
+
+test("TEST-1705 rejects a missing coordinator as CONFIG_INVALID", async () => {
+  const store = new RunStore({
+    root_path: stateRoot,
+    verification_package_loader: loadApprovedVerificationPackage,
+  });
+  const run = await store.createRun({
+    objective: "Reject an incomplete verification configuration",
+    project_path: projectRoot,
+  });
+  await assert.rejects(
+    () =>
+      store.recordVerificationSnapshot(run.run_id, {
+        package_fingerprint:
+          APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+        server_port: 10_001,
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "CONFIG_INVALID",
+  );
 });
 
 test("TEST-002 pauses, resumes, cancels, and resumes from cancellation", async () => {

@@ -4,15 +4,19 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { stringify } from "smol-toml";
+
 import { ManagedAssignmentScheduler } from "../src/assignment-scheduler.js";
 import { ArkTeamError } from "../src/errors.js";
 import {
   DEFAULT_PROJECT_CONFIG,
   loadProjectConfig,
+  projectConfigSha256,
   resolveVerificationCommands,
 } from "../src/project-config.js";
 import { RunStore } from "../src/state-store.js";
 import { TeamCoordinator } from "../src/team-coordinator.js";
+import { validVerificationCoordinatorConfig } from "./verification-fixture.js";
 
 test("TEST-1401 resolves defaults and normalizes one valid project snapshot", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "ark-team-config-"));
@@ -108,6 +112,50 @@ test("TEST-1402 rejects malformed, unknown, unsafe, and secret-bearing project s
         error instanceof ArkTeamError &&
         error.code === "INVALID_PROJECT_CONFIG" &&
         error.message === "Project configuration is not valid TOML",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("TEST-1704 loads one strict coordinator config and hashes resolved bytes deterministically", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "ark-team-verification-config-"));
+  const configDirectory = path.join(root, ".codex");
+  await mkdir(configDirectory, { recursive: true });
+  try {
+    const expected = structuredClone(DEFAULT_PROJECT_CONFIG);
+    expected.verification.coordinator = validVerificationCoordinatorConfig();
+    await writeFile(
+      path.join(configDirectory, "team-orchestrator.toml"),
+      stringify(expected),
+      "utf8",
+    );
+
+    const resolved = await loadProjectConfig(root);
+    assert.deepEqual(resolved.config, expected);
+    assert.match(projectConfigSha256(resolved.config), /^[a-f0-9]{64}$/);
+    assert.equal(
+      projectConfigSha256(resolved.config),
+      projectConfigSha256(structuredClone(expected)),
+    );
+
+    const invalid = structuredClone(expected) as typeof expected & {
+      verification: {
+        coordinator: NonNullable<
+          typeof expected.verification.coordinator
+        > & { unknown: boolean };
+      };
+    };
+    invalid.verification.coordinator.unknown = true;
+    await writeFile(
+      path.join(configDirectory, "team-orchestrator.toml"),
+      stringify(invalid),
+      "utf8",
+    );
+    await assert.rejects(
+      () => loadProjectConfig(root),
+      (error: unknown) =>
+        error instanceof ArkTeamError && error.code === "CONFIG_INVALID",
     );
   } finally {
     await rm(root, { recursive: true, force: true });
