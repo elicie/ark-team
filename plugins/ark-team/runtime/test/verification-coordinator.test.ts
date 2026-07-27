@@ -58,6 +58,7 @@ test("TEST-1703 accepts only the closed lifecycle and persists one terminal repo
     assert.equal(replay.error_record.payload.code, "INVALID_RECORD");
   }
 
+  await completeReadiness(fixture);
   for (const stage of ["ready", "executing"] as const) {
     const transition = await fixture.coordinator.advance(fixture.run_id, stage);
     assert.equal(transition.accepted, true, stage);
@@ -109,12 +110,11 @@ test("TEST-1703 accepts only the closed lifecycle and persists one terminal repo
   assert.equal(duplicate.verification_records.at(-1)?.payload.kind, "error");
 });
 
-test("TEST-1703 covers every terminal branch and the passed PM-review edges", async (t) => {
+test("TEST-1703 covers executable terminal branches and the passed PM-review edges", async (t) => {
   for (const outcome of [
     "passed",
     "failed",
     "unavailable",
-    "skipped",
     "error",
   ] as const) {
     const fixture = await createFixture(t, "backend-only");
@@ -171,6 +171,7 @@ test("TEST-1707 gives adapters frozen inputs and rejects coordinator-owned recor
       capability: "browser",
       available: true,
       version: "1.0.0",
+      diagnostic: "browser available",
     },
     "backend",
     null,
@@ -184,6 +185,7 @@ test("TEST-1707 gives adapters frozen inputs and rejects coordinator-owned recor
       ),
     isArkError("INVALID_RECORD"),
   );
+  await completeReadiness(fixture);
   for (const stage of ["ready", "executing"] as const) {
     assert.equal(
       (await fixture.coordinator.advance(fixture.run_id, stage)).accepted,
@@ -847,7 +849,7 @@ test("TEST-1708 rejects action-id budget bypass, success replay, and reopened re
   assert.equal(bypassCalls, 0);
   assert.equal(
     (await exhausted.store.getRun(exhausted.run_id)).verification_state
-      ?.attempts.length,
+      ?.attempts.filter((attempt) => attempt.kind === "artifact_write").length,
     1,
   );
 
@@ -887,7 +889,9 @@ test("TEST-1708 rejects action-id budget bypass, success replay, and reopened re
   assert.equal(changedInputCalls, 0);
   assert.equal(
     (await immutableCheck.store.getRun(immutableCheck.run_id))
-      .verification_state?.attempts.length,
+      .verification_state?.attempts.filter(
+        (attempt) => attempt.kind === "api",
+      ).length,
     1,
   );
 
@@ -1084,7 +1088,7 @@ test("TEST-1722 records only enabled lanes and optional UI failure does not bloc
 
 test("TEST-1722 applies required precedence, optional-check visibility, and integrity override", async (t) => {
   for (const scenario of [
-    { backend: "skipped", ui: "failed", expected: "failed" },
+    { backend: "passed", ui: "failed", expected: "failed" },
     { backend: "failed", ui: "unavailable", expected: "unavailable" },
     { backend: "unavailable", ui: "error", expected: "error" },
   ] as const) {
@@ -1254,6 +1258,34 @@ async function createFixture(
     project_config: projectConfig,
   });
   const coordinator = new VerificationCoordinator(store);
+  coordinator.registerLocalRuntime({
+    capability_adapters: Object.fromEntries(
+      [
+        "agentic_browser",
+        "api",
+        "browser",
+        "comparison",
+        "screenshot",
+        "semantic_review",
+        "server",
+      ].map((capability) => [
+        capability,
+        { name: "fixture-capability-probe", version: "1.0.0" },
+      ]),
+    ) as never,
+    capability_probe: async (capability) => ({
+      available: true,
+      version: "1.0.0",
+      diagnostic: `${capability} available`,
+      adapter: {
+        name: "fixture-capability-probe",
+        version: "1.0.0",
+      },
+    }),
+    start_server: async () => undefined,
+    probe_http: async () => ({ status: 200 }),
+    execute_local: async () => undefined,
+  });
   const configured = await coordinator.advance(created.run_id, "configured");
   assert.equal(configured.accepted, true);
   const snapshotted = await coordinator.configure(created.run_id, {
@@ -1275,10 +1307,26 @@ async function createFixture(
 }
 
 async function advanceToExecuting(fixture: CoordinatorFixture): Promise<void> {
-  for (const stage of ["capabilities", "ready", "executing"] as const) {
+  const capabilities = await fixture.coordinator.advance(
+    fixture.run_id,
+    "capabilities",
+  );
+  assert.equal(capabilities.accepted, true, "capabilities");
+  await completeReadiness(fixture);
+  for (const stage of ["ready", "executing"] as const) {
     const result = await fixture.coordinator.advance(fixture.run_id, stage);
     assert.equal(result.accepted, true, stage);
   }
+}
+
+async function completeReadiness(
+  fixture: CoordinatorFixture,
+): Promise<void> {
+  const result = await fixture.coordinator.runReadiness(fixture.run_id, {
+    action_id: "fixture-readiness",
+    server: { framework: "other", allowed_dev_origins: [] },
+  });
+  assert.equal(result.ok, true, "readiness");
 }
 
 async function advanceToDeciding(fixture: CoordinatorFixture): Promise<void> {
@@ -1422,6 +1470,9 @@ async function submitCheckOutcomeEvidence(
     adapter: async () => ({
       ok: false,
       code,
+      ...(code === "CAPABILITY_UNAVAILABLE"
+        ? { capability: lane === "backend" ? ("api" as const) : ("browser" as const) }
+        : {}),
       message: `${lane} evidence resolved to ${outcome}`,
     }),
   });

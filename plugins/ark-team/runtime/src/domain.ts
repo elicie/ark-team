@@ -22,7 +22,6 @@ import {
   sha256CanonicalJson,
   verificationCleanupAuditSchema,
   verificationCoordinatorStateSchema,
-  verificationErrorDisposition,
   verificationEvidenceDisposition,
   verificationLinkedRecordSchema,
   verificationRecordMatchesSnapshot,
@@ -617,6 +616,35 @@ function coordinatorErrorRecordMatchesSnapshot(
     payload: Extract<VerificationRecordPayloadV2, { kind: "error" }>;
   },
 ): boolean {
+  if (record.payload.capability !== undefined) {
+    if (record.lane === null) {
+      return false;
+    }
+    const declaredCapabilities =
+      record.lane === "backend" && snapshot.backend_contract.enabled
+        ? snapshot.backend_contract.required_capabilities
+        : record.lane === "ui" && snapshot.ui_contract.enabled
+          ? [
+              ...snapshot.ui_contract.required_capabilities,
+              ...snapshot.ui_contract.optional_capabilities,
+            ]
+          : [];
+    if (!declaredCapabilities.includes(record.payload.capability)) {
+      return false;
+    }
+    const requiredCapabilities =
+      record.lane === "backend" && snapshot.backend_contract.enabled
+        ? snapshot.backend_contract.required_capabilities
+        : record.lane === "ui" && snapshot.ui_contract.enabled
+          ? snapshot.ui_contract.required_capabilities
+          : [];
+    if (
+      record.payload.capability_required !==
+      requiredCapabilities.includes(record.payload.capability)
+    ) {
+      return false;
+    }
+  }
   if (record.lane === null) {
     return (
       record.lane_required === null &&
@@ -821,6 +849,28 @@ export const runRecordSchema = z
         const laneSummaries = run.verification_records.filter(
           (record) => isVerificationRecordV2Kind(record, "lane_summary"),
         );
+        const approvalTerminalError =
+          reportPayload.outcome === "error" &&
+          reportPayload.evidence_record_ids.length === 1
+            ? run.verification_records.find(
+                (record) =>
+                  isVerificationRecordV2Kind(record, "error") &&
+                  record.record_id ===
+                    reportPayload.evidence_record_ids[0] &&
+                  record.payload.code === "APPROVAL_REQUIRED" &&
+                  record.payload.approval_id !== undefined,
+              )
+            : undefined;
+        if (approvalTerminalError !== undefined) {
+          if (laneSummaries.length !== 0) {
+            context.addIssue({
+              code: "custom",
+              path: ["verification_records"],
+              message:
+                "approval-terminal verification cannot contain lane summaries",
+            });
+          }
+        } else {
         const enabledLanes: Array<"backend" | "ui"> = [];
         if (snapshot.backend_contract.enabled) {
           enabledLanes.push("backend");
@@ -968,6 +1018,7 @@ export const runRecordSchema = z
               "terminal report outcome does not match required lane summaries",
           });
         }
+        }
       }
       if (
         run.verification_records.length < 3 ||
@@ -1097,10 +1148,10 @@ export const runRecordSchema = z
                   "coordinator errors require attempt, evidence, outcome, and integrity disposition",
               });
             } else {
-              const expectedDisposition = verificationErrorDisposition(
-                payload.code,
-              );
+              const expectedDisposition =
+                verificationEvidenceDisposition(record);
               if (
+                expectedDisposition === null ||
                 payload.outcome !== expectedDisposition.outcome ||
                 payload.integrity_failure !==
                   expectedDisposition.integrity_failure

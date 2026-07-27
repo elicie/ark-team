@@ -10,6 +10,8 @@ import { resolveStateRoot, RunStore } from "../src/state-store.js";
 import {
   APPROVED_VERIFICATION_PACKAGE,
   sha256CanonicalJson,
+  type VerificationCapability,
+  type VerificationLinkedRecord,
   type VerificationRunSnapshot,
   verificationRunSnapshotSha256,
 } from "../src/verification-contract.js";
@@ -35,6 +37,176 @@ beforeEach(async () => {
 afterEach(async () => {
   await rm(testRoot, { recursive: true, force: true });
 });
+
+async function completeCapabilityMatrix(
+  store: RunStore,
+  runId: string,
+): Promise<Awaited<ReturnType<RunStore["getRun"]>>> {
+  let run = await store.getRun(runId);
+  const snapshot = run.verification_snapshot;
+  if (snapshot === null || snapshot.schema_version !== 2) {
+    throw new Error("contract-v2 verification snapshot is required");
+  }
+  const demands: Array<{
+    lane: "backend" | "ui";
+    lane_required: boolean;
+    capability: VerificationCapability;
+    capability_required: boolean;
+  }> = [];
+  if (snapshot.backend_contract.enabled) {
+    const backend = snapshot.backend_contract;
+    demands.push(
+      ...backend.required_capabilities.map(
+        (capability) => ({
+          lane: "backend" as const,
+          lane_required: backend.required,
+          capability,
+          capability_required: true,
+        }),
+      ),
+    );
+  }
+  if (snapshot.ui_contract.enabled) {
+    const ui = snapshot.ui_contract;
+    demands.push(
+      ...ui.required_capabilities.map((capability) => ({
+        lane: "ui" as const,
+        lane_required: ui.required,
+        capability,
+        capability_required: true,
+      })),
+      ...ui.optional_capabilities.map((capability) => ({
+        lane: "ui" as const,
+        lane_required: ui.required,
+        capability,
+        capability_required: false,
+      })),
+    );
+  }
+  const reserved = await store.recordVerificationAttempt(runId, {
+    action_id: "state-store-readiness",
+    kind: "readiness",
+    lane: null,
+    check_id: null,
+    input_sha256: "e".repeat(64),
+    evidence_record_ids: [],
+  });
+  assert.equal(reserved.reserved, true);
+  run = reserved.run;
+  const evidenceIds: string[] = [];
+  for (const demand of demands) {
+    const existing = run.verification_records.find(
+      (record) =>
+        record.schema_version === 2 &&
+        record.payload.kind === "capability" &&
+        record.lane === demand.lane &&
+        record.payload.capability === demand.capability &&
+        record.payload.diagnostic !== undefined,
+    );
+    if (existing !== undefined) {
+      evidenceIds.push(existing.record_id);
+      continue;
+    }
+    const payload = {
+      kind: "capability" as const,
+      capability: demand.capability,
+      available: true,
+      version: "1.0.0",
+      diagnostic: "available",
+    };
+    const record: VerificationLinkedRecord = {
+      schema_version: 2,
+      contract_id: "verification_contract_v2",
+      record_id: `state-store-${demand.lane}-${demand.capability}`,
+      record_type: "capability",
+      run_id: run.run_id,
+      case_id: snapshot.case_id,
+      check_id: null,
+      snapshot_id: snapshot.snapshot_id,
+      lane: demand.lane,
+      stage: "capabilities",
+      timestamp_utc: "2026-07-27T20:00:00.000Z",
+      source_fingerprint: snapshot.source_fingerprint,
+      package_fingerprint: snapshot.package.package_fingerprint,
+      lane_required: demand.lane_required,
+      check_required: demand.capability_required,
+      previous_record_sha256: sha256CanonicalJson(
+        run.verification_records.at(-1),
+      ),
+      payload_sha256: sha256CanonicalJson(payload),
+      payload,
+      adapter: {
+        name: `${demand.capability}-probe`,
+        version: "1.0.0",
+      },
+      model: null,
+      artifact_references: [],
+    };
+    run = await store.appendVerificationRecord(runId, record);
+    evidenceIds.push(record.record_id);
+  }
+  return (
+    await store.completeVerificationAttempt(runId, {
+      action_id: "state-store-readiness",
+      evidence_record_ids: evidenceIds,
+      error_code: null,
+      message: null,
+    })
+  ).run;
+}
+
+async function createExecutingBackendRun(
+  store: RunStore,
+  objective: string,
+): Promise<string> {
+  const coordinator = validVerificationCoordinatorConfig();
+  coordinator.ui = { enabled: false };
+  if (!coordinator.backend.enabled) {
+    throw new Error("backend verification fixture must be enabled");
+  }
+  const homeProbe = coordinator.backend.api_probes[0];
+  if (homeProbe === undefined) {
+    throw new Error("backend verification probe is missing");
+  }
+  coordinator.backend.api_probes.push({
+    ...homeProbe,
+    id: "health-api",
+    path: "/health",
+  });
+  const config = structuredClone(DEFAULT_PROJECT_CONFIG);
+  config.verification.coordinator = coordinator;
+  const created = await store.createRun({
+    objective,
+    project_path: projectRoot,
+    project_config: config,
+  });
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "configured"))
+      .accepted,
+    true,
+  );
+  await store.recordVerificationSnapshot(created.run_id, {
+    package_fingerprint:
+      APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+    server_port: 10_001,
+  });
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "capabilities"))
+      .accepted,
+    true,
+  );
+  await completeCapabilityMatrix(store, created.run_id);
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "ready")).accepted,
+    true,
+  );
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "executing"))
+      .accepted,
+    true,
+  );
+  return created.run_id;
+}
 
 test("state root defaults to the Ark-owned home directory", () => {
   assert.equal(
@@ -120,6 +292,7 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
     capability: "server" as const,
     available: true,
     version: "1.0.0",
+    diagnostic: "available",
   };
   const errorRecord = {
     schema_version: 2 as const,
@@ -182,6 +355,19 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
     (error: unknown) =>
       error instanceof ArkTeamError && error.code === "INVALID_RECORD",
   );
+  const incompleteReady = await store.advanceVerificationState(
+    created.run_id,
+    "ready",
+  );
+  assert.equal(incompleteReady.accepted, false);
+  assert.equal(
+    incompleteReady.run.verification_state?.current_state,
+    "capabilities",
+  );
+  const withCapabilities = await completeCapabilityMatrix(
+    store,
+    created.run_id,
+  );
   assert.equal(
     (await store.advanceVerificationState(created.run_id, "ready")).accepted,
     true,
@@ -210,7 +396,7 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
     check_id: "home-api",
     check_required: true,
     previous_record_sha256: sha256CanonicalJson(
-      withEvidence.verification_records.at(-1),
+      withCapabilities.verification_records.at(-1),
     ),
     payload_sha256: sha256CanonicalJson(requestPayload),
     payload: requestPayload,
@@ -486,6 +672,159 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
   );
 });
 
+test("TEST-1716 settles concurrent attempts atomically at an approval boundary", async () => {
+  let sourceDrift = false;
+  const store = new RunStore({
+    root_path: stateRoot,
+    verification_source_loader: async () => ({
+      ...validVerificationSourceIdentity(projectRoot),
+      ...(sourceDrift ? { source_tree: "f".repeat(40) } : {}),
+    }),
+    verification_package_loader: loadApprovedVerificationPackage,
+  });
+  const directRunId = await createExecutingBackendRun(
+    store,
+    "Terminate concurrent local checks before an approval boundary",
+  );
+  for (const [actionId, checkId] of [
+    ["direct-home", "home-api"],
+    ["direct-health", "health-api"],
+  ] as const) {
+    assert.equal(
+      (
+        await store.recordVerificationAttempt(directRunId, {
+          action_id: actionId,
+          kind: "api",
+          lane: "backend",
+          check_id: checkId,
+          input_sha256: sha256CanonicalJson({ actionId, checkId }),
+          evidence_record_ids: [],
+        })
+      ).reserved,
+      true,
+    );
+  }
+  assert.equal(
+    (await store.assertCurrentVerification(directRunId)).run_id,
+    directRunId,
+  );
+  const beforeDrift = await store.getRun(directRunId);
+  sourceDrift = true;
+  await assert.rejects(
+    () => store.assertCurrentVerification(directRunId),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "SOURCE_DRIFT",
+  );
+  await assert.rejects(
+    () =>
+      store.terminateVerificationForApproval(directRunId, {
+        request_sha256: "a".repeat(64),
+        message: "dangerous local effect requires explicit approval",
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "SOURCE_DRIFT",
+  );
+  assert.deepEqual(await store.getRun(directRunId), beforeDrift);
+
+  sourceDrift = false;
+  const terminated = await store.terminateVerificationForApproval(
+    directRunId,
+    {
+      request_sha256: "a".repeat(64),
+      message: "dangerous local effect requires explicit approval",
+    },
+  );
+  assert.equal(terminated.run.verification_state?.terminal_outcome, "error");
+  assert.equal(
+    terminated.run.verification_state?.attempts.some(
+      (attempt) => attempt.status === "in_progress",
+    ),
+    false,
+  );
+  assert.deepEqual(
+    terminated.run.verification_state?.attempts
+      .filter((attempt) => attempt.kind === "api")
+      .map((attempt) => attempt.status),
+    ["aborted", "aborted"],
+  );
+  for (const actionId of ["direct-home", "direct-health"]) {
+    assert.equal(
+      terminated.run.verification_records.filter(
+        (record) =>
+          record.schema_version === 2 &&
+          record.payload.kind === "error" &&
+          record.payload.action_id === actionId &&
+          record.payload.code === "APPROVAL_REQUIRED",
+      ).length,
+      1,
+    );
+  }
+  const directRevision = terminated.run.revision;
+  const lateDirectCompletion = await store.completeVerificationAttempt(
+    directRunId,
+    {
+      action_id: "direct-health",
+      evidence_record_ids: [],
+      error_code: null,
+      message: null,
+    },
+  );
+  assert.equal(lateDirectCompletion.error_code, "APPROVAL_REQUIRED");
+  assert.equal(lateDirectCompletion.run.revision, directRevision);
+
+  const completionRunId = await createExecutingBackendRun(
+    store,
+    "Close concurrent checks when one completion reaches approval",
+  );
+  for (const [actionId, checkId] of [
+    ["completion-home", "home-api"],
+    ["completion-health", "health-api"],
+  ] as const) {
+    assert.equal(
+      (
+        await store.recordVerificationAttempt(completionRunId, {
+          action_id: actionId,
+          kind: "api",
+          lane: "backend",
+          check_id: checkId,
+          input_sha256: sha256CanonicalJson({ actionId, checkId }),
+          evidence_record_ids: [],
+        })
+      ).reserved,
+      true,
+    );
+  }
+  const completed = await store.completeVerificationAttempt(
+    completionRunId,
+    {
+      action_id: "completion-home",
+      evidence_record_ids: [],
+      error_code: "APPROVAL_REQUIRED",
+      message: "approval boundary reached during local execution",
+    },
+  );
+  assert.equal(completed.error_code, "APPROVAL_REQUIRED");
+  assert.equal(completed.run.verification_state?.terminal_outcome, "error");
+  assert.equal(
+    completed.run.verification_state?.attempts.some(
+      (attempt) => attempt.status === "in_progress",
+    ),
+    false,
+  );
+  const completionRevision = completed.run.revision;
+  const lateConcurrentCompletion = await store.completeVerificationAttempt(
+    completionRunId,
+    {
+      action_id: "completion-health",
+      evidence_record_ids: [],
+      error_code: null,
+      message: null,
+    },
+  );
+  assert.equal(lateConcurrentCompletion.error_code, "APPROVAL_REQUIRED");
+  assert.equal(lateConcurrentCompletion.run.revision, completionRevision);
+});
+
 test("TEST-1705 reopens pre-IS-1703 v4 runs without silently migrating coordinator state", async () => {
   const config = structuredClone(DEFAULT_PROJECT_CONFIG);
   config.verification.coordinator = validVerificationCoordinatorConfig();
@@ -523,14 +862,13 @@ test("TEST-1705 reopens pre-IS-1703 v4 runs without silently migrating coordinat
       verification_state: unknown;
       verification_records: Array<{
         record_type: string;
+        lane: "backend" | "ui" | null;
+        lane_required: boolean | null;
+        check_id: string | null;
         check_required: boolean;
         payload_sha256: string;
-        payload: {
+        payload: Record<string, unknown> & {
           kind: string;
-          attempt_count?: number;
-          evidence_record_ids?: string[];
-          outcome?: string;
-          integrity_failure?: boolean;
         };
       }>;
     };
@@ -544,6 +882,74 @@ test("TEST-1705 reopens pre-IS-1703 v4 runs without silently migrating coordinat
   ) {
     throw new Error("legacy global error fixture is missing");
   }
+  Object.assign(legacyGlobalError.payload, {
+    code: "APPROVAL_REQUIRED",
+    message: "legacy approval boundary",
+    attempt_count: 1,
+    evidence_record_ids: [],
+    outcome: "skipped",
+    integrity_failure: false,
+  });
+  delete legacyGlobalError.payload.action_id;
+  delete legacyGlobalError.payload.approval_id;
+  delete legacyGlobalError.payload.request_sha256;
+  delete legacyGlobalError.payload.capability;
+  legacyGlobalError.lane = null;
+  legacyGlobalError.lane_required = null;
+  legacyGlobalError.check_id = null;
+  legacyGlobalError.check_required = false;
+  legacyGlobalError.payload_sha256 = sha256CanonicalJson(
+    legacyGlobalError.payload,
+  );
+  await writeFile(
+    recordPath,
+    `${JSON.stringify(persisted, null, 2)}\n`,
+    "utf8",
+  );
+  const legacyApprovalReader = new RunStore({ root_path: stateRoot });
+  assert.equal(
+    (
+      await legacyApprovalReader.getRun(created.run_id)
+    ).verification_records.some(
+      (record) =>
+        record.payload.kind === "error" &&
+        record.payload.code === "APPROVAL_REQUIRED" &&
+        !("approval_id" in record.payload),
+    ),
+    true,
+  );
+
+  Object.assign(legacyGlobalError.payload, {
+    code: "CAPABILITY_UNAVAILABLE",
+    message: "legacy optional browser capability unavailable",
+    outcome: "unavailable",
+  });
+  legacyGlobalError.lane = "ui";
+  legacyGlobalError.lane_required = true;
+  legacyGlobalError.check_required = false;
+  legacyGlobalError.payload_sha256 = sha256CanonicalJson(
+    legacyGlobalError.payload,
+  );
+  await writeFile(
+    recordPath,
+    `${JSON.stringify(persisted, null, 2)}\n`,
+    "utf8",
+  );
+  const legacyCapabilityReader = new RunStore({ root_path: stateRoot });
+  assert.equal(
+    (
+      await legacyCapabilityReader.getRun(created.run_id)
+    ).verification_records.some(
+      (record) =>
+        record.payload.kind === "error" &&
+        record.payload.code === "CAPABILITY_UNAVAILABLE" &&
+        "outcome" in record.payload &&
+        record.payload.outcome === "unavailable" &&
+        !("capability" in record.payload),
+    ),
+    true,
+  );
+
   legacyGlobalError.check_required = true;
   delete legacyGlobalError.payload.attempt_count;
   delete legacyGlobalError.payload.evidence_record_ids;
