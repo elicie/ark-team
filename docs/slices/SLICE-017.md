@@ -1,9 +1,9 @@
-# Closed Contract — SLICE-017 — verification-spec-v3
+# Closed Contract — SLICE-017 — verification-spec-v4
 
-- Package identity: `verification-spec-v3`.
+- Package identity: `verification-spec-v4`.
 - Package status: `SPEC_APPROVED`.
 - Authority date: 2026-07-27 UTC.
-- Supersedes: `verification-spec-v2`.
+- Supersedes: `verification-spec-v3`.
 - Authority: the user-approved assignment, the authority/evidence review, the
   inspected repository source and configuration conventions, the role and
   approval contracts, the user-requested Backend/UI QA separation, and the
@@ -34,10 +34,14 @@ normative authority from observations and from checks that have not been run.
 | `EVID-1711` | `REFERENCE_OBSERVATION` | Stagehand official documentation separates `observe`/`act`/agent primitives from measurable evaluations and supports local or Browserbase environments | Corroborates plan-then-execute, structured validation, and repeated-evaluation constraints | Observed 2026-07-27 at server release `v3.7.4` (`6ff9490945e4ed762fa9ebca9dab6f46fa34bc4a`, MIT); cloud behavior is excluded |
 | `EVID-1712` | `SPEC_DELTA` | `verification-spec-v2` (`SLICE-017.md` SHA-256 `277fb413390f83f49fdf34fab4a42e3eca83d3f499fe5442e884f165a0128399`) fixed `retention_days = 30` but did not define the retention anchor or earliest cleanup time | Closes the retention ambiguity in `REQ-1706` and `TEST-1706` without claiming implementation | The v3 decision uses the terminal-report timestamp as the retention anchor |
 | `EVID-1713` | `SPEC_DELTA` | IS-1701 review showed that a record could carry unverified check requiredness and that the configuration example omitted already-required exact adapter/browser versions | Makes check linkage explicit in `REQ-1704` and repairs the configuration example without changing approved behavior | Schema-2 records use a check ID where applicable and reject requiredness that differs from the immutable snapshot |
+| `EVID-1714` | `SPEC_DELTA` | IS-1702 implementation review found no canonical approved-baseline manifest layout or unambiguous meaning for `baseline_identity.sha256`, and found that the single cleanup-attempt budget conflicted with the required pre-boundary `retention_active` record | Closes only the manifest, approval-routing, and cleanup-accounting ambiguity in `REQ-1706`, `REQ-1708`, `AC-1706`, `TEST-1706`, and `TEST-1708` | The user approved the minimal v4 resolution on 2026-07-27; it does not approve a baseline mutation or remote action |
 
-Repository evidence was captured from clean Git commit
+Initial repository evidence was captured from clean Git commit
 `150d81a4ebe97ce0aeb2046f8f1461a73fa91742`
 (`SOURCE_ID: GIT-COMMIT:150d81a4ebe97ce0aeb2046f8f1461a73fa91742`).
+The v4 delta was verified against clean Git commit
+`63473cf3836e050dd7728182f0d2706001538698`
+(`SOURCE_ID: GIT-COMMIT:63473cf3836e050dd7728182f0d2706001538698`).
 Mutable official-document URLs were retrieved on 2026-07-27 UTC:
 `https://github.com/browser-use/browser-use`,
 `https://github.com/browser-use/browser-use/blob/0.13.6/skills/qa/SKILL.md`,
@@ -63,7 +67,7 @@ Exploration coverage for this revision is:
 
 | Surface | Status | Evidence channel | Capabilities | Gaps |
 | --- | --- | --- | --- | --- |
-| Repository configuration, state records, and current verification schemas/tests | `EXPLORED` | `SOURCE` | contract-v1/schema-1 compatibility and schema-2 extension points | No schema-2 lane implementation exists |
+| Repository configuration, state records, and current verification schemas/tests | `EXPLORED` | `SOURCE` | contract-v1/schema-1 compatibility and merged schema-2 lane extension points | Artifact-store and later execution slices are not implemented |
 | `verification-spec-v2` requirements, acceptance, tests, and slice order | `EXPLORED` | `DOCUMENT` | lane/retention delta impact | Existing documentation tests remain future work |
 | Browser Use release, QA skill, output, browser, and sensitive-data contracts | `PARTIAL` | `DOCUMENT`, `SOURCE` | agentic QA, evidence, domain/tool controls | No local install, model call, or target run |
 | Playwright Test, Test Agents, CLI/MCP, assertions, traces, and snapshots | `PARTIAL` | `DOCUMENT`, `SOURCE` | deterministic gate and agentic authoring | Installed version and target compatibility unknown |
@@ -92,6 +96,9 @@ Unknown acceptance-relevant facts are handled by the structured
 | `DEC-1702` | `APPROVED` | Declared deterministic UI assertions are the only UI pass authority. |
 | `DEC-1703` | `APPROVED` | Browser Use-, Playwright agent-, or Stagehand-like exploration is local, bounded, advisory, and cannot modify a gate run. |
 | `DEC-1704` | `APPROVED` | Retention starts at the persisted terminal-report timestamp and expires after exactly `30 * 24 hours`. |
+| `DEC-1705` | `APPROVED` | One approved baseline set has one canonical manifest at `manifests/<baseline-id>/<baseline-set-sha256>.json`; its entries address immutable PNG bytes at `objects/sha256/<png-sha256>.png`. |
+| `DEC-1706` | `APPROVED` | IS-1702 only reads and verifies an already approved baseline manifest. Creating or updating a baseline remains approval-gated and its approval routing belongs to IS-1704. |
+| `DEC-1707` | `APPROVED` | One pre-expiry `retention_active` eligibility record does not consume the single destructive cleanup attempt; at or after expiry exactly one `cleaned` or `cleanup_error` result consumes it. |
 
 The exact installed adapters, project routes, selectors, accounts, baselines,
 and repeatability thresholds are non-blocking package questions. They must be
@@ -130,7 +137,7 @@ Sol/Terra/Luna hierarchy, sandbox rules, or approval rules.
   `SLICE-017.md` bytes together with its package identity and authority date.
 - **Contract version**: the executable coordinator contract ID. This package
   defines `verification_contract_v2`; it is distinct from package identity
-  `verification-spec-v3` and record `schema_version: 2`.
+  `verification-spec-v4` and record `schema_version: 2`.
 - **Run snapshot**: the immutable, resolved configuration and environment
   record created before the first server, API, or browser action.
 - **Artifact root**: the registered absolute per-run directory
@@ -170,10 +177,11 @@ Sol/Terra/Luna hierarchy, sandbox rules, or approval rules.
 The only verification terminal outcomes are `passed`, `failed`,
 `unavailable`, `skipped`, and `error`. `SPEC_DELTA_REQUIRED` is a structured
 package/contract disposition and is never a passed outcome.
-Post-terminal cleanup emits exactly one append-only operational disposition in
-`retention_active`, `cleaned`, or `cleanup_error`, not a second verification
-terminal outcome. `cleanup_error` carries a closed error code and bounded
-diagnostic without changing the run.
+Post-terminal cleanup emits append-only operational dispositions, not a second
+verification terminal outcome. A run may have at most one non-destructive
+`retention_active` eligibility record and then exactly one destructive
+`cleaned` or `cleanup_error` result. `cleanup_error` carries a closed error
+code and bounded diagnostic without changing the run.
 
 The coordinator lifecycle is closed:
 
@@ -338,15 +346,20 @@ that any future verification passed.
   beneath their registered root, and free of symlink traversal. Per-run
   artifacts are non-empty, type-checked, SHA-256 hashed, size-bounded, and
   linked to the snapshot. Approved baselines are separate, read-only,
-  content-addressed, retain their approval manifest, and cannot be replaced or
-  deleted by comparison or ordinary cleanup. Per-run artifacts remain
-  ineligible for cleanup until exactly 30 periods of 24 hours after the
-  terminal report's persisted UTC timestamp. Earlier cleanup appends a
-  `retention_active` operational disposition without deleting bytes; eligible
-  cleanup returns `cleaned` and affects only the registered run root after the
-  report, manifest, hashes, and cleanup audit have been committed to durable
-  coordinator state outside that root. A failed cleanup returns
-  `cleanup_error`; no cleanup disposition changes the run's terminal outcome.
+  content-addressed, retain their canonical approval manifest, and cannot be
+  replaced or deleted by comparison or ordinary cleanup. IS-1702 reads and
+  verifies an already approved manifest but cannot create or update one;
+  baseline mutation remains `APPROVAL_REQUIRED` until IS-1704 routes the exact
+  one-time user approval. Per-run artifacts remain ineligible for cleanup until
+  exactly 30 periods of 24 hours after the terminal report's persisted UTC
+  timestamp. One pre-expiry eligibility check appends `retention_active`
+  without deleting bytes or consuming the destructive cleanup-attempt budget;
+  repeated checks return that existing record without another append. At or
+  after expiry, exactly one destructive attempt returns either `cleaned` or
+  `cleanup_error` and affects only the registered run root after the report,
+  manifest, hashes, and cleanup audit have been committed to durable
+  coordinator state outside that root. No cleanup disposition changes the
+  run's terminal outcome.
 - Acceptance: `AC-1706`
 - Verification: `TEST-1706`
 - Implementation slice: `IS-1702`
@@ -376,12 +389,15 @@ that any future verification passed.
 - Trigger: an action fails, times out, or returns an unexpected result.
 - Observable result: API, deterministic browser, and readiness actions have two
   total attempts; each agentic exploration task, screenshot, artifact write,
-  semantic review, comparison, and cleanup has one. Retry never changes the
+  semantic review, comparison, and destructive cleanup has one. The optional
+  pre-expiry cleanup eligibility check is not a destructive attempt and may
+  append at most one `retention_active` record. Retry never changes the
   snapshot, lane requiredness, task/assertion bytes, adapter/model identity,
   baseline, or input. The coordinator persists the exact closed error code,
   bounded diagnostic, attempt count, evidence references, and exactly one
-  terminal outcome per run. A post-terminal cleanup attempt instead appends
-  one operational cleanup record and never changes that terminal outcome.
+  terminal outcome per run. A destructive post-terminal cleanup attempt
+  instead appends exactly one `cleaned` or `cleanup_error` operational record
+  and never changes that terminal outcome.
 - Acceptance: `AC-1708`
 - Verification: `TEST-1708`
 - Implementation slice: `IS-1703`
@@ -665,7 +681,7 @@ that any future verification passed.
   missing evidence, `APPROVAL_REQUIRED`, safety violation, or
   `SPEC_DELTA_REQUIRED` blocks PM success and remains a recorded non-pass.
   Optional agentic findings remain visible but cannot turn deterministic
-  failure into pass. `IS-1701` is closed for v3 only when its requirements
+  failure into pass. `IS-1701` is closed for v4 only when its requirements
   `REQ-1701`, `REQ-1702`, `REQ-1704`, and `REQ-1705`, their mapped acceptance
   criteria/tests, dynamic baseline, resolved config hash, immutable snapshot,
   and rollback record all have observable evidence; no later slice starts
@@ -813,7 +829,7 @@ The normative path is:
 OBJ-17xx → REQ-17xx → AC-17xx → TEST-17xx → IS-170x → SLICE-017
 ```
 
-### First vertical slice — IS-1701 v3 reopening and closure
+### First vertical slice — IS-1701 v4 package refresh and closure
 
 `IS-1701 — Dynamic source baseline, strict configuration, record schemas, and
 immutable run snapshot` is the first complete vertical slice. It includes
@@ -823,7 +839,7 @@ exactly `REQ-1701`, `REQ-1702`, `REQ-1704`, and `REQ-1705`, with
 
 Its implementation inputs are the selected worktree, approved package bytes,
 the existing TOML loader, the existing persisted run-record mechanism, and a
-registered state root. Its v3 outputs are a dynamic implementation-baseline
+registered state root. Its v4 outputs are a dynamic implementation-baseline
 record, validated canonical schema-2 lane configuration plus hash,
 schema-versioned record definitions, and an immutable pre-action run snapshot.
 It does not
@@ -832,24 +848,25 @@ invoke agentic or semantic review, or compare images.
 
 The implementation produced under `verification-spec-v2` and merged at
 `391d13b78e6de5999c55649a1227c63c3b353510` remains readable compatibility
-evidence for `verification_contract_v1` and schema 1, but its single combined
-coordinator schema does not close v3. `IS-1701` is reopened only for package
-identity, `schema_version: 2`, conditional Backend/UI lane configuration, and
-snapshot/record linkage. It is closed again when all four mapped tests pass
-with observable records and hashes, the schema-2 snapshot is reopened
-byte-equivalently, and rollback disables new contract-v2 starts while
-preserving schema-1 and schema-2 evidence. `IS-1702` cannot begin before this
-closure. A missing prerequisite or contradiction emits
+evidence for `verification_contract_v1` and schema 1. The v3 implementation
+merged at `63473cf3836e050dd7728182f0d2706001538698` closes the schema-2
+Backend/UI lane behavior. IS-1702 refreshes only the approved package bytes,
+identity, and fingerprint to v4 before adding artifact behavior; it does not
+reopen the already accepted lane behavior. Closure still requires all four
+mapped tests to pass with observable records and hashes, the schema-2 snapshot
+to reopen byte-equivalently, and rollback to disable new contract-v2 starts
+while preserving schema-1 and schema-2 evidence. `IS-1702` cannot begin before
+this package refresh. A missing prerequisite or contradiction emits
 `SPEC_DELTA_REQUIRED` with `runtime_status: not_started`.
 
 ### Ordered implementation slices
 
-1. `IS-1701`: reopen the dynamic source baseline/configuration slice for
+1. `IS-1701`: closed dynamic source baseline/configuration slice for
    `verification_contract_v2`, conditional Backend/UI lanes, record schemas,
-   and immutable run snapshot while preserving contract-v1/schema-1
-   readability.
-2. `IS-1702`: registered artifact roots, hashes, PNG metadata, immutable
-   approved baselines, diff artifacts, retention, and safe cleanup records.
+   and immutable run snapshot with contract-v1/schema-1 readability preserved.
+2. `IS-1702`: refresh the approved v4 package bytes and fingerprint, then add
+   registered artifact roots, hashes, PNG metadata, immutable approved
+   baselines, diff artifacts, retention, and safe cleanup records.
 3. `IS-1703`: coordinator ownership, lifecycle, independent Backend/UI lane
    summaries and aggregation, typed adapter records, bounded timeout/retry
    handling, and one terminal outcome.
@@ -999,17 +1016,45 @@ unknown values or missing provenance/input/artifact hashes are `INVALID_RECORD`.
 No target-project runtime artifact, conversation transcript, model thought, or
 unrestricted DOM is used as a per-run output.
 
-An approved baseline manifest contains approval ID, approver, exact baseline
-identity/hash, source/environment tuple, dimensions, viewport, browser/adapter
-versions, path, and UTC time. Creating or updating one requires an explicit
-one-time user approval naming that identity; comparison cannot create or
+One approved baseline set has exactly one canonical JSON manifest at
+`manifests/<baseline-id>/<baseline-set-sha256>.json` beneath the registered
+baseline root. The manifest is strict schema version 1 and contains:
+
+- `schema_version: 1`, `baseline_id`, `approval_id`, `approver`, and
+  `approved_at_utc`;
+- the exact source commit, source tree, and browser environment tuple;
+- `adapter: { name, version }` with the deterministic adapter name and exact
+  version, plus exact `browser_build`;
+- a duplicate-free `entries` array sorted bytewise by `case_id` and then by
+  the snapshotted viewport order, with exactly one entry for every snapshotted
+  UI browser case and required viewport. Each entry contains `case_id`,
+  `viewport`, integer `width` and `height`, canonical
+  `objects/sha256/<png-sha256>.png` path, and the PNG byte SHA-256.
+
+`baseline_identity.sha256` is the SHA-256 of canonical JSON bytes for exactly
+`{source_commit, source_tree, environment, adapter, browser_build, entries}`;
+approval metadata, `baseline_id`, and the manifest path are excluded from that
+content identity. The manifest path's `<baseline-set-sha256>` and its
+`baseline_id` must equal the snapshotted baseline identity. Every object path
+hash must equal the non-empty PNG bytes, dimensions must equal the declared
+viewport, and manifest plus objects must be regular, non-symlink, read-only
+files beneath the registered baseline root. Unknown manifest fields, missing
+entries, hash/path/dimension drift, writable files, or replacement are
+`BASELINE_NOT_APPROVED`.
+
+IS-1702 only reads and verifies this already provisioned manifest. Creating or
+updating it requires a later explicit one-time user approval naming the exact
+identity through the IS-1704 approval route; comparison cannot create or
 replace it. The persisted terminal-report timestamp is the sole retention
-anchor. Cleanup before `terminal_report_at + 30 * 24 hours` appends
-`retention_active` without mutation. At or after that instant, cleanup first
-persists the report, manifest/hash, and cleanup audit in durable coordinator
-state outside the run root, then operates only on the registered canonical run
-root and appends `cleaned`; failure appends `cleanup_error`. It never changes
-the verification terminal outcome or deletes a baseline or unregistered path.
+anchor. A cleanup eligibility check before
+`terminal_report_at + 30 * 24 hours` appends at most one `retention_active`
+record without mutation and without consuming the destructive cleanup attempt;
+later pre-expiry checks return the existing record. At or after that instant,
+exactly one destructive cleanup attempt first persists the report,
+manifest/hash, and cleanup audit in durable coordinator state outside the
+artifact root, then operates only on the registered canonical artifact root
+and appends `cleaned`; failure appends `cleanup_error`. It never changes the
+verification terminal outcome or deletes a baseline or unregistered path.
 
 Browser and child-adapter network access is restricted to
 `http://dev:<recorded-port>`. Every command is literal argv and runs only in
@@ -1127,12 +1172,16 @@ reopen. Unknown fields and implicit required defaults return `CONFIG_INVALID`.
 Traversal, non-canonical roots, symlink escape, primary-checkout output, empty
 files, missing hashes, unsupported extensions, and baseline replacement are
 rejected. Valid per-run artifacts are contained, bounded, typed, SHA-256
-hashed, and linked; approved baselines remain immutable and recoverable.
-Cleanup before the terminal-report timestamp plus exactly 30 periods of 24
-hours appends `retention_active` without mutation. Eligible cleanup deletes
-only the registered run root after durable report/manifest/hash/audit records
-exist outside that root and appends `cleaned`; failure appends
-`cleanup_error`. No cleanup disposition changes the run terminal outcome.
+hashed, and linked. A canonical manifest resolves every required case/viewport
+to one read-only content-addressed PNG and matches the exact snapshotted
+identity; IS-1702 cannot create or update it, and approved baselines remain
+immutable and recoverable. A pre-expiry eligibility check appends at most one
+`retention_active` record without mutation or consuming the destructive
+cleanup attempt. Eligible cleanup performs exactly one destructive attempt,
+deletes only the registered artifact root after durable
+report/manifest/hash/audit records exist outside that root, and appends
+`cleaned`; failure appends `cleanup_error`. No cleanup disposition changes the
+run terminal outcome.
 
 ### AC-1707 — Coordinator owns state
 
@@ -1143,11 +1192,12 @@ terminal outcomes.
 ### AC-1708 — Retries converge
 
 Readiness/API/deterministic-browser have at most two total attempts; each
-agentic task, artifact, screenshot/review/comparison, and cleanup has one. A
-preterminal timeout or failure contributes to one bounded terminal record with
-exact code, attempts, and evidence, without changing immutable inputs. A
-post-terminal cleanup result is operational evidence and cannot add or replace
-a terminal outcome.
+agentic task, artifact, screenshot/review/comparison, and destructive cleanup
+has one. One non-destructive pre-expiry eligibility record does not consume
+that cleanup budget. A preterminal timeout or failure contributes to one
+bounded terminal record with exact code, attempts, and evidence, without
+changing immutable inputs. A destructive post-terminal cleanup result is
+operational evidence and cannot add or replace a terminal outcome.
 
 ### AC-1709 — API contract is literal and local
 
@@ -1254,7 +1304,7 @@ documentation handoff makes no claim that the procedure ran.
 
 Only a complete report in which every effectively required check and its
 required lane passed reaches `pm_review_pending` and the original PM final
-review. `IS-1701` must close again for v3 with its four mapped requirements,
+review. `IS-1701` must remain closed for v4 with its four mapped requirements,
 acceptance/tests, dynamic baseline, schema-2 lane config hash, immutable run
 snapshot, legacy contract-v1/schema-1 readability, and rollback record before
 `IS-1702` begins.
@@ -1348,13 +1398,22 @@ Attempt traversal, non-canonical root, symlink escape, checkout output, empty
 file, unsupported/arbitrary archive type, missing hash, oversize file, trace
 archive extraction, and baseline replacement. Then write valid
 PNG/JSON/JSONL/TXT and opaque `.playwright-trace.zip` records and verify
-containment, limits, hashes, metadata, approval manifest, and preservation.
-Attempt cleanup immediately before and exactly at
-`terminal_report_at + 30 * 24 hours`; assert a `retention_active` operational
-record with no mutation before the boundary and registered-root-only cleanup
-after report/manifest/hash/audit persistence outside that root at the boundary.
-Assert exact `cleaned` and `cleanup_error` records and that no cleanup path
-changes the existing terminal outcome. Expected: `AC-1706`.
+containment, limits, hashes, metadata, and preservation. Provision one strict
+read-only `schema_version: 1` manifest at
+`manifests/<baseline-id>/<baseline-set-sha256>.json` with the complete
+case/viewport matrix and content-addressed PNG objects; verify its canonical
+set hash, approval/source/environment/adapter/browser fields, dimensions,
+paths, hashes, and preservation. Reject unknown/missing/duplicate entries,
+identity or object drift, writable/symlinked files, replacement, and any
+IS-1702 baseline creation/update attempt with `BASELINE_NOT_APPROVED` or
+`APPROVAL_REQUIRED` as applicable. Attempt cleanup immediately before and
+exactly at `terminal_report_at + 30 * 24 hours`; assert one idempotent
+`retention_active` eligibility record with no mutation or attempt consumption
+before the boundary and exactly one registered-root-only destructive attempt
+after report/manifest/hash/audit persistence outside that root at the
+boundary. In separate run fixtures, assert the exact `cleaned` success record
+and exact `cleanup_error` failure record; no cleanup path changes the existing
+terminal outcome. Expected: `AC-1706`.
 
 ### TEST-1707 — Coordinator ownership
 
@@ -1365,11 +1424,14 @@ only persistence. Expected: `AC-1707`.
 ### TEST-1708 — Timeout and retry convergence
 
 Exercise timeout/failure for readiness/API/deterministic browser and for
-single-attempt agentic/screenshot/review/comparison/artifact/cleanup. Assert
-attempt ceilings, immutable lane/task/adapter/model inputs, exact error,
-evidence references, and exactly one terminal outcome. Run cleanup after that
-outcome and assert its one operational record cannot add or change a terminal
-outcome. Expected: `AC-1708`.
+single-attempt agentic/screenshot/review/comparison/artifact/destructive
+cleanup. Assert attempt ceilings, immutable lane/task/adapter/model inputs,
+exact error, evidence references, and exactly one terminal outcome. Before
+expiry, request cleanup eligibility twice and assert only one
+`retention_active` record and no consumed destructive attempt. At expiry, run
+the single destructive cleanup attempt and assert exactly one `cleaned` or
+`cleanup_error` operational result cannot add or change a terminal outcome.
+Expected: `AC-1708`.
 
 ### TEST-1709 — API contract positives and negatives
 
@@ -1445,7 +1507,7 @@ evidence, and cleanup state. Expected: `AC-1716`.
 
 ### TEST-1717 — Versioned rollout compatibility
 
-Enable each stage in order, inspect the announced contract-v2/package-v3/
+Enable each stage in order, inspect the announced contract-v2/package-v4/
 schema-2/source identities, and reopen an existing contract-v1/schema-1 run
 after the version change. Assert legacy evidence remains readable but cannot
 resume as contract v2, no reinterpretation occurs, and no later stage begins
