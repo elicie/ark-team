@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 
-import type { Usage } from "@openai/codex-sdk";
 import { z } from "zod/v4";
 
 import {
@@ -13,10 +12,12 @@ import { ArkTeamError } from "./errors.js";
 import {
   assertManagedWorkspace,
   buildManagedPrompt,
+  isManagedRole,
   managedCodexConfig,
   managedRoleProfiles,
   type ManagedRole,
-} from "./managed-session.js";
+  type Usage,
+} from "./managed-role.js";
 import {
   assertManagedOutputContractRole,
   managedOutputJsonSchemas,
@@ -62,12 +63,12 @@ export interface ApprovalCompletedUpdate {
   status: "completed";
   session_id: string;
   turn_id: string;
-  role: Exclude<ManagedRole, "pm">;
-  agent_name: "ark_pl" | "ark_worker";
-  model: "gpt-5.6-terra" | "gpt-5.6-luna";
+  role: ManagedRole;
+  agent_name: "ark_pm" | "ark_pl" | "ark_worker";
+  model: "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna";
   model_reasoning_effort: "xhigh";
-  sandbox_mode: "workspace-write";
-  approval_policy: "on-request";
+  sandbox_mode: "read-only" | "workspace-write";
+  approval_policy: "never" | "on-request";
   final_report: string;
   structured_report?: ManagedOutput;
   usage: Usage;
@@ -121,13 +122,19 @@ const threadStartResponseSchema = z.object({
   model: z.string().min(1),
   cwd: z.string().min(1),
   runtimeWorkspaceRoots: z.array(z.string()).optional(),
-  approvalPolicy: z.literal("on-request"),
+  approvalPolicy: z.union([z.literal("never"), z.literal("on-request")]),
   approvalsReviewer: z.literal("user"),
-  sandbox: z.object({
-    type: z.literal("workspaceWrite"),
-    writableRoots: z.array(z.string()),
-    networkAccess: z.literal(false),
-  }),
+  sandbox: z.discriminatedUnion("type", [
+    z.object({
+      type: z.literal("readOnly"),
+      networkAccess: z.literal(false),
+    }),
+    z.object({
+      type: z.literal("workspaceWrite"),
+      writableRoots: z.array(z.string()),
+      networkAccess: z.literal(false),
+    }),
+  ]),
   reasoningEffort: z.literal("xhigh"),
 });
 
@@ -241,7 +248,7 @@ export class AppServerApprovalSession {
   private readonly codexPath: string;
   private readonly timeoutMs: number;
   private client: AppServerProtocolClient | null = null;
-  private role: Exclude<ManagedRole, "pm"> | null = null;
+  private role: ManagedRole | null = null;
   private outputContract: ManagedOutputContract | null = null;
   private sessionId: string | null = null;
   private turnId: string | null = null;
@@ -274,14 +281,8 @@ export class AppServerApprovalSession {
       throw new ArkTeamError("INVALID_INPUT", "approval session has already started");
     }
     this.started = true;
-    if (request.role === "pm") {
-      throw new ArkTeamError(
-        "INVALID_INPUT",
-        "PM remains on the read-only SDK backend and cannot use the writer approval gateway",
-      );
-    }
-    if (request.role !== "pl" && request.role !== "worker") {
-      throw new ArkTeamError("INVALID_INPUT", "role must be pl or worker");
+    if (!isManagedRole(request.role)) {
+      throw new ArkTeamError("INVALID_INPUT", "role must be pm, pl, or worker");
     }
     const assignment = request.assignment.trim();
     if (!assignment) {
@@ -290,7 +291,7 @@ export class AppServerApprovalSession {
     if (request.signal?.aborted) {
       throw new ArkTeamError(
         "AGENT_SESSION_FAILED",
-        "Approval-gated Codex session was cancelled before it started",
+        "Managed Codex app-server session was cancelled before it started",
       );
     }
     const workingDirectory = await assertManagedWorkspace(
@@ -331,16 +332,20 @@ export class AppServerApprovalSession {
       const threadParams = {
         model: profile.model,
         cwd: workingDirectory,
-        approvalPolicy: "on-request",
+        approvalPolicy: profile.approval_policy,
         approvalsReviewer: "user",
-        sandbox: "workspace-write",
+        sandbox: profile.sandbox_mode,
         config: {
           ...managedCodexConfig,
           model_reasoning_effort: profile.model_reasoning_effort,
           web_search: "disabled",
-          sandbox_workspace_write: {
-            network_access: false,
-          },
+          ...(profile.sandbox_mode === "workspace-write"
+            ? {
+                sandbox_workspace_write: {
+                  network_access: false,
+                },
+              }
+            : {}),
         },
         developerInstructions: profile.instructions,
       };
@@ -367,15 +372,36 @@ export class AppServerApprovalSession {
           `app-server selected a different working directory: ${threadResponse.cwd}`,
         );
       }
-      const writableRoots = [
-        ...threadResponse.sandbox.writableRoots,
-        ...(threadResponse.runtimeWorkspaceRoots ?? []),
-      ];
-      if (!writableRoots.includes(workingDirectory)) {
+      if (threadResponse.approvalPolicy !== profile.approval_policy) {
         throw new ArkTeamError(
           "AGENT_SESSION_PROTOCOL_ERROR",
-          "app-server workspace-write sandbox does not include the assigned worktree",
+          `app-server selected ${threadResponse.approvalPolicy} approval instead of ${profile.approval_policy}`,
         );
+      }
+      if (profile.sandbox_mode === "read-only") {
+        if (threadResponse.sandbox.type !== "readOnly") {
+          throw new ArkTeamError(
+            "AGENT_SESSION_PROTOCOL_ERROR",
+            "app-server did not preserve the PM read-only sandbox",
+          );
+        }
+      } else {
+        if (threadResponse.sandbox.type !== "workspaceWrite") {
+          throw new ArkTeamError(
+            "AGENT_SESSION_PROTOCOL_ERROR",
+            "app-server did not preserve the writer workspace-write sandbox",
+          );
+        }
+        const writableRoots = [
+          ...threadResponse.sandbox.writableRoots,
+          ...(threadResponse.runtimeWorkspaceRoots ?? []),
+        ];
+        if (!writableRoots.includes(workingDirectory)) {
+          throw new ArkTeamError(
+            "AGENT_SESSION_PROTOCOL_ERROR",
+            "app-server workspace-write sandbox does not include the assigned worktree",
+          );
+        }
       }
       if (
         resumeSessionId !== undefined &&
@@ -403,7 +429,7 @@ export class AppServerApprovalSession {
             },
           ],
           cwd: workingDirectory,
-          approvalPolicy: "on-request",
+          approvalPolicy: profile.approval_policy,
           approvalsReviewer: "user",
           model: profile.model,
           effort: profile.model_reasoning_effort,
@@ -418,7 +444,7 @@ export class AppServerApprovalSession {
       this.turnId = turnResponse.turn.id;
       this.flushPreTurnMessages(resumeSessionId !== undefined);
     } catch (error) {
-      await this.closeAfterFailure("Unable to start approval-gated Codex session", error);
+      await this.closeAfterFailure("Unable to start managed Codex app-server session", error);
     }
 
     return this.nextUpdate();
@@ -467,7 +493,7 @@ export class AppServerApprovalSession {
     if (client && threadId && turnId) {
       await boundedInterrupt(client, threadId, turnId);
     }
-    this.fail("Approval-gated Codex session was cancelled");
+    this.fail("Managed Codex app-server session was cancelled");
     await this.cleanup();
   }
 
@@ -540,6 +566,12 @@ export class AppServerApprovalSession {
   }
 
   private handleApprovalRequest(message: AppServerMessage): void {
+    if (this.requireRole() === "pm") {
+      throw new ArkTeamError(
+        "AGENT_SESSION_PROTOCOL_ERROR",
+        "read-only PM session emitted an unexpected approval request",
+      );
+    }
     if (this.pendingApproval) {
       throw new ArkTeamError(
         "AGENT_SESSION_PROTOCOL_ERROR",
@@ -604,7 +636,7 @@ export class AppServerApprovalSession {
       status: "waiting_user",
       session_id: this.requireSessionId(),
       turn_id: this.requireTurnId(),
-      role: this.requireRole(),
+      role: this.requireWriterRole(),
       approval,
     });
   }
@@ -688,11 +720,11 @@ export class AppServerApprovalSession {
       session_id: this.requireSessionId(),
       turn_id: this.requireTurnId(),
       role,
-      agent_name: profile.agent_name as "ark_pl" | "ark_worker",
-      model: profile.model as "gpt-5.6-terra" | "gpt-5.6-luna",
-      model_reasoning_effort: "xhigh",
-      sandbox_mode: "workspace-write",
-      approval_policy: "on-request",
+      agent_name: profile.agent_name,
+      model: profile.model,
+      model_reasoning_effort: profile.model_reasoning_effort,
+      sandbox_mode: profile.sandbox_mode,
+      approval_policy: profile.approval_policy,
       final_report: this.finalReport,
       ...(structuredReport === undefined
         ? {}
@@ -713,7 +745,7 @@ export class AppServerApprovalSession {
 
   private startDeadline(signal?: AbortSignal): void {
     const abort = (): void => {
-      void this.interruptAndFail("Approval-gated Codex session was cancelled");
+      void this.interruptAndFail("Managed Codex app-server session was cancelled");
     };
     if (signal?.aborted) {
       abort();
@@ -722,7 +754,7 @@ export class AppServerApprovalSession {
       this.removeAbortListener = () => signal?.removeEventListener("abort", abort);
     }
     this.timeout = setTimeout(() => {
-      void this.interruptAndFail("Approval-gated Codex session timed out");
+      void this.interruptAndFail("Managed Codex app-server session timed out");
     }, this.timeoutMs);
   }
 
@@ -822,11 +854,22 @@ export class AppServerApprovalSession {
     return this.turnId;
   }
 
-  private requireRole(): Exclude<ManagedRole, "pm"> {
+  private requireRole(): ManagedRole {
     if (!this.role) {
-      throw new ArkTeamError("AGENT_SESSION_PROTOCOL_ERROR", "writer role is unavailable");
+      throw new ArkTeamError("AGENT_SESSION_PROTOCOL_ERROR", "managed role is unavailable");
     }
     return this.role;
+  }
+
+  private requireWriterRole(): Exclude<ManagedRole, "pm"> {
+    const role = this.requireRole();
+    if (role === "pm") {
+      throw new ArkTeamError(
+        "AGENT_SESSION_PROTOCOL_ERROR",
+        "writer role is unavailable for the PM session",
+      );
+    }
+    return role;
   }
 }
 

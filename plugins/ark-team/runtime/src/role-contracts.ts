@@ -1,7 +1,7 @@
 import { z } from "zod/v4";
 
 import { ArkTeamError } from "./errors.js";
-import type { ManagedRole } from "./managed-session.js";
+import type { ManagedRole } from "./managed-role.js";
 
 const identifierSchema = z
   .string()

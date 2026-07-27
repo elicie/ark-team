@@ -262,27 +262,28 @@ node plugins/ark-team/runtime/dist/session-cli.js
   (--assignment <text> | --assignment-file <absolute-file>)
 ```
 
-It uses the official TypeScript Codex SDK. Each invocation starts a new thread
-and returns the session ID, final role report, configured role metadata, and
-token usage. It never returns raw reasoning items. PM accepts an existing
-directory and is launched read-only. PL and worker invocations require a linked
-Git worktree root and are rejected in the primary checkout.
+It uses `codex app-server` over local stdio. Each invocation starts or resumes
+one thread and returns the session ID, final role report, configured role
+metadata, and token usage. It never returns raw reasoning items. PM accepts an
+existing directory and verifies a read-only/never profile. PL and worker
+invocations require a linked Git worktree root, verify
+workspace-write/on-request, and are rejected in the primary checkout.
 
 This CLI is an execution primitive, not the persistent team scheduler. Do not
 manually claim that it has staffed teams, created worktrees, routed reports, or
 persisted assignments.
 
-The SDK currently uses non-interactive `codex exec`. Local live verification
-showed that a requested `on-request` writer policy became `never` in the actual
-turn context. Never send work that may need an interactive decision to the
-managed-session CLI.
+The managed-session CLI cannot present an approval. If a writer returns
+`waiting_user`, the CLI interrupts that turn and fails closed. Send work that
+may need an interactive decision through the persistent assignment scheduler.
 
-For managed PL and worker assignments that may need approval, use the bundled
+For low-level managed role sessions, use the bundled
 `AppServerApprovalSession` library from
 `plugins/ark-team/runtime/dist/approval-session.js`. It launches
-`codex app-server` over local stdio, requires a linked Git worktree, and verifies
-the returned model, `xhigh` effort, `workspace-write` sandbox,
-`on-request` policy, and user reviewer before beginning the turn.
+`codex app-server` over local stdio and verifies the returned model, `xhigh`
+effort, sandbox, approval policy, and user reviewer before beginning the turn.
+PM uses read-only/never. PL and worker use workspace-write/on-request and
+require a linked Git worktree.
 
 The low-level gateway returns `waiting_user` for command, file-change, and
 permission requests without answering them. The persistent scheduler may

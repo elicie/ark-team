@@ -6,14 +6,18 @@ import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 
-import type { ThreadOptions, Usage } from "@openai/codex-sdk";
-
+import type {
+  ApprovalSessionOptions,
+  ApprovalSessionRequest,
+  ApprovalSessionUpdate,
+} from "../src/approval-session.js";
 import { ArkTeamError } from "../src/errors.js";
 import {
   ManagedCodexSessionLauncher,
   managedCodexConfig,
   managedRoleProfiles,
-  type CodexSessionClient,
+  type ManagedAppServerSession,
+  type Usage,
 } from "../src/managed-session.js";
 
 const usage: Usage = {
@@ -78,12 +82,17 @@ test("TEST-301 managed role profiles enforce the approved model and permission s
   );
 });
 
-test("TEST-302 starts independent PM and worker threads and returns report plus usage only", async () => {
+test("TEST-302 starts independent app-server PM and worker sessions", async () => {
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "ark-team-managed-test-"));
   try {
     const workerDirectory = await createLinkedWorktreeFixture(temporaryRoot);
-    const client = new FakeCodexClient();
-    const launcher = new ManagedCodexSessionLauncher({ client });
+    const factory = new ScriptedSessionFactory([
+      (request, sequence) => completedUpdate(request, sequence),
+      (request, sequence) => completedUpdate(request, sequence),
+    ]);
+    const launcher = new ManagedCodexSessionLauncher({
+      session_factory: factory.create,
+    });
 
     const pm = await launcher.run({
       role: "pm",
@@ -97,32 +106,30 @@ test("TEST-302 starts independent PM and worker threads and returns report plus 
     });
 
     assert.notEqual(pm.session_id, worker.session_id);
-    assert.deepEqual(client.options, [
-      {
-        model: "gpt-5.6-sol",
-        modelReasoningEffort: "xhigh",
-        sandboxMode: "read-only",
-        approvalPolicy: "never",
-        workingDirectory: temporaryRoot,
-        skipGitRepoCheck: true,
-        networkAccessEnabled: false,
-        webSearchMode: "disabled",
-      },
-      {
-        model: "gpt-5.6-luna",
-        modelReasoningEffort: "xhigh",
-        sandboxMode: "workspace-write",
-        approvalPolicy: "on-request",
-        workingDirectory: workerDirectory,
-        skipGitRepoCheck: false,
-        networkAccessEnabled: false,
-        webSearchMode: "disabled",
-      },
-    ]);
-    assert.match(client.prompts[0] ?? "", /Role: ark_pm/);
-    assert.match(client.prompts[0] ?? "", /Do not spawn native subagents/);
-    assert.match(client.prompts[1] ?? "", /Role: ark_worker/);
+    assert.deepEqual(
+      factory.requests.map((request) => ({
+        role: request.role,
+        assignment: request.assignment,
+        working_directory: request.working_directory,
+      })),
+      [
+        {
+          role: "pm",
+          assignment: "Plan a bounded change.",
+          working_directory: temporaryRoot,
+        },
+        {
+          role: "worker",
+          assignment: "Implement the bounded change.",
+          working_directory: workerDirectory,
+        },
+      ],
+    );
     assert.deepEqual(pm.usage, usage);
+    assert.equal(pm.sandbox_mode, "read-only");
+    assert.equal(pm.requested_approval_policy, "never");
+    assert.equal(worker.sandbox_mode, "workspace-write");
+    assert.equal(worker.requested_approval_policy, "on-request");
     assert.deepEqual(
       Object.keys(pm).sort(),
       [
@@ -146,8 +153,10 @@ test("TEST-303 refuses to launch a writing role in a primary checkout", async ()
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "ark-team-primary-test-"));
   try {
     await mkdir(path.join(temporaryRoot, ".git"));
-    const client = new FakeCodexClient();
-    const launcher = new ManagedCodexSessionLauncher({ client });
+    const factory = new ScriptedSessionFactory([]);
+    const launcher = new ManagedCodexSessionLauncher({
+      session_factory: factory.create,
+    });
 
     await assert.rejects(
       launcher.run({
@@ -158,7 +167,6 @@ test("TEST-303 refuses to launch a writing role in a primary checkout", async ()
       (error: unknown) =>
         error instanceof ArkTeamError && error.code === "UNSAFE_AGENT_WORKSPACE",
     );
-    assert.equal(client.options.length, 0);
 
     const missingPointer = path.join(temporaryRoot, "missing-pointer");
     const malformedPointer = path.join(temporaryRoot, "malformed-pointer");
@@ -188,83 +196,112 @@ test("TEST-303 refuses to launch a writing role in a primary checkout", async ()
           error instanceof ArkTeamError && error.code === "UNSAFE_AGENT_WORKSPACE",
       );
     }
-    assert.equal(client.options.length, 0);
+    assert.equal(factory.sessions.length, 0);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
 });
 
-test("TEST-304 fails closed when the SDK omits required session evidence", async () => {
+test("TEST-304 fails closed on malformed app-server evidence and unexpected approval", async () => {
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "ark-team-protocol-test-"));
   try {
-    const client: CodexSessionClient = {
-      startThread: () => ({
-        id: null,
-        async run() {
-          return {
-            finalResponse: "",
-            usage: null,
-          };
-        },
+    const malformedFactory = new ScriptedSessionFactory([
+      (request, sequence) => ({
+        ...completedUpdate(request, sequence),
+        sandbox_mode: "workspace-write",
       }),
-      resumeThread: () => {
-        throw new Error("not used");
-      },
-    };
-    const launcher = new ManagedCodexSessionLauncher({ client });
-
+    ]);
+    const malformedLauncher = new ManagedCodexSessionLauncher({
+      session_factory: malformedFactory.create,
+    });
     await assert.rejects(
-      launcher.run({
+      malformedLauncher.run({
         role: "pm",
         assignment: "Return a report.",
         working_directory: temporaryRoot,
       }),
       (error: unknown) =>
-        error instanceof ArkTeamError && error.code === "AGENT_SESSION_PROTOCOL_ERROR",
+        error instanceof ArkTeamError &&
+        error.code === "AGENT_SESSION_PROTOCOL_ERROR",
     );
+
+    const workerDirectory = await createLinkedWorktreeFixture(temporaryRoot);
+    const approvalFactory = new ScriptedSessionFactory([
+      () => ({
+        status: "waiting_user",
+        session_id: "worker-thread",
+        turn_id: "worker-turn",
+        role: "worker",
+        approval: {
+          approval_id: "approval-1",
+          kind: "command",
+          reason: "interactive approval required",
+        },
+      }),
+    ]);
+    const approvalLauncher = new ManagedCodexSessionLauncher({
+      session_factory: approvalFactory.create,
+    });
+    await assert.rejects(
+      approvalLauncher.run({
+        role: "worker",
+        assignment: "Request an interactive action.",
+        working_directory: workerDirectory,
+      }),
+      (error: unknown) =>
+        error instanceof ArkTeamError && error.code === "AGENT_SESSION_FAILED",
+    );
+    assert.equal(approvalFactory.sessions[0]?.closed, 1);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
 });
 
-test("TEST-305 aborts an over-time session and reports a closed failure", async () => {
+test("TEST-305 forwards timeout and cancellation to the app-server session", async () => {
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "ark-team-timeout-test-"));
   try {
-    const client: CodexSessionClient = {
-      startThread: () => ({
-        id: "session-timeout",
-        run: async (_prompt, options) =>
-          await new Promise((_resolve, reject) => {
-            options.signal.addEventListener(
-              "abort",
-              () => reject(options.signal.reason),
-              { once: true },
-            );
-          }),
-      }),
-      resumeThread: () => {
-        throw new Error("not used");
+    const timeoutFactory = new ScriptedSessionFactory([
+      async () => {
+        throw new ArkTeamError(
+          "AGENT_SESSION_FAILED",
+          "Managed Codex app-server session timed out",
+        );
       },
-    };
-    const launcher = new ManagedCodexSessionLauncher({
-      client,
+    ]);
+    const timeoutLauncher = new ManagedCodexSessionLauncher({
+      session_factory: timeoutFactory.create,
       timeout_ms: 5,
     });
-
     await assert.rejects(
-      launcher.run({
+      timeoutLauncher.run({
         role: "pm",
-        assignment: "This fake session never completes.",
+        assignment: "This fake session times out.",
         working_directory: temporaryRoot,
       }),
       (error: unknown) =>
         error instanceof ArkTeamError && error.code === "AGENT_SESSION_FAILED",
     );
+    assert.equal(timeoutFactory.options[0]?.timeout_ms, 5);
 
     const callerAbort = new AbortController();
+    const cancellationFactory = new ScriptedSessionFactory([
+      async (request) =>
+        await new Promise<ApprovalSessionUpdate>((_resolve, reject) => {
+          request.signal?.addEventListener(
+            "abort",
+            () =>
+              reject(
+                new ArkTeamError(
+                  "AGENT_SESSION_FAILED",
+                  "Managed Codex app-server session was cancelled",
+                ),
+              ),
+            { once: true },
+          );
+        }),
+    ]);
     const cancellableLauncher = new ManagedCodexSessionLauncher({
-      client,
-      timeout_ms: 1000,
+      session_factory: cancellationFactory.create,
     });
     const cancellation = cancellableLauncher.run({
       role: "pm",
@@ -283,14 +320,28 @@ test("TEST-305 aborts an over-time session and reports a closed failure", async 
   }
 });
 
-test("TEST-603 starts and resumes structured PM turns on the same SDK thread", async () => {
+test("TEST-603 starts and resumes structured PM turns on the same app-server thread", async () => {
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "ark-team-resume-test-"));
   try {
-    const client = new StructuredCodexClient([
-      JSON.stringify(validPmPlan()),
-      JSON.stringify(validPmReport()),
+    const factory = new ScriptedSessionFactory([
+      (request) =>
+        completedUpdate(
+          request,
+          1,
+          JSON.stringify(validPmPlan()),
+          "pm-thread-1",
+        ),
+      (request) =>
+        completedUpdate(
+          request,
+          2,
+          JSON.stringify(validPmReport()),
+          "pm-thread-1",
+        ),
     ]);
-    const launcher = new ManagedCodexSessionLauncher({ client });
+    const launcher = new ManagedCodexSessionLauncher({
+      session_factory: factory.create,
+    });
 
     const planned = await launcher.run({
       role: "pm",
@@ -309,31 +360,21 @@ test("TEST-603 starts and resumes structured PM turns on the same SDK thread", a
     assert.equal(planned.structured_report?.kind, "pm_plan");
     assert.equal(reported.structured_report?.kind, "pm_report");
     assert.equal(reported.session_id, planned.session_id);
-    assert.equal(client.starts.length, 1);
-    assert.deepEqual(client.resumes, [
-      {
-        id: planned.session_id,
-        options: client.starts[0],
-      },
-    ]);
-    assert.equal(client.turnOptions.length, 2);
-    assert.equal(
-      client.turnOptions[0]?.outputSchema?.additionalProperties,
-      false,
-    );
-    assert.match(client.prompts[0] ?? "", /pm_plan output contract/);
-    assert.match(client.prompts[1] ?? "", /pm_report output contract/);
+    assert.equal(factory.requests[0]?.resume_session_id, undefined);
+    assert.equal(factory.requests[1]?.resume_session_id, planned.session_id);
+    assert.equal(factory.requests[0]?.output_contract, "pm_plan");
+    assert.equal(factory.requests[1]?.output_contract, "pm_report");
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
 });
 
-test("TEST-604 fails closed on invalid structured or mismatched resumed SDK output", async () => {
+test("TEST-604 fails closed on invalid structured or mismatched resumed app-server output", async () => {
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "ark-team-structured-fail-"));
   try {
-    const wrongRoleClient = new StructuredCodexClient([JSON.stringify(validPmPlan())]);
+    const unusedFactory = new ScriptedSessionFactory([]);
     const wrongRoleLauncher = new ManagedCodexSessionLauncher({
-      client: wrongRoleClient,
+      session_factory: unusedFactory.create,
     });
     await assert.rejects(
       wrongRoleLauncher.run({
@@ -345,10 +386,13 @@ test("TEST-604 fails closed on invalid structured or mismatched resumed SDK outp
       (error: unknown) =>
         error instanceof ArkTeamError && error.code === "INVALID_INPUT",
     );
-    assert.equal(wrongRoleClient.starts.length, 0);
+    assert.equal(unusedFactory.sessions.length, 0);
 
+    const malformedFactory = new ScriptedSessionFactory([
+      (request, sequence) => completedUpdate(request, sequence, "not-json"),
+    ]);
     const malformedLauncher = new ManagedCodexSessionLauncher({
-      client: new StructuredCodexClient(["not-json"]),
+      session_factory: malformedFactory.create,
     });
     await assert.rejects(
       malformedLauncher.run({
@@ -362,12 +406,17 @@ test("TEST-604 fails closed on invalid structured or mismatched resumed SDK outp
         error.code === "AGENT_SESSION_PROTOCOL_ERROR",
     );
 
-    const mismatchedClient = new StructuredCodexClient(
-      [JSON.stringify(validPmReport())],
-      "different-thread",
-    );
+    const mismatchedFactory = new ScriptedSessionFactory([
+      (request, sequence) =>
+        completedUpdate(
+          request,
+          sequence,
+          JSON.stringify(validPmReport()),
+          "different-thread",
+        ),
+    ]);
     const mismatchedLauncher = new ManagedCodexSessionLauncher({
-      client: mismatchedClient,
+      session_factory: mismatchedFactory.create,
     });
     await assert.rejects(
       mismatchedLauncher.run({
@@ -386,9 +435,81 @@ test("TEST-604 fails closed on invalid structured or mismatched resumed SDK outp
   }
 });
 
+type SessionScript = (
+  request: ApprovalSessionRequest,
+  sequence: number,
+) => ApprovalSessionUpdate | Promise<ApprovalSessionUpdate>;
+
+class ScriptedSessionFactory {
+  readonly options: ApprovalSessionOptions[] = [];
+  readonly requests: ApprovalSessionRequest[] = [];
+  readonly sessions: ScriptedSession[] = [];
+  private sequence = 0;
+
+  constructor(private readonly scripts: SessionScript[]) {}
+
+  readonly create = (options: ApprovalSessionOptions): ManagedAppServerSession => {
+    const script = this.scripts[this.sequence];
+    if (!script) {
+      throw new Error("No scripted app-server session");
+    }
+    const session = new ScriptedSession(
+      options,
+      ++this.sequence,
+      script,
+      this.requests,
+    );
+    this.options.push(options);
+    this.sessions.push(session);
+    return session;
+  };
+}
+
+class ScriptedSession implements ManagedAppServerSession {
+  closed = 0;
+
+  constructor(
+    readonly options: ApprovalSessionOptions,
+    private readonly sequence: number,
+    private readonly script: SessionScript,
+    private readonly requests: ApprovalSessionRequest[],
+  ) {}
+
+  async start(request: ApprovalSessionRequest): Promise<ApprovalSessionUpdate> {
+    this.requests.push(request);
+    return await this.script(request, this.sequence);
+  }
+
+  async close(): Promise<void> {
+    this.closed += 1;
+  }
+}
+
+function completedUpdate(
+  request: ApprovalSessionRequest,
+  sequence: number,
+  finalReport = `REPORT_session-${sequence}`,
+  sessionId = request.resume_session_id ?? `session-${sequence}`,
+): ApprovalSessionUpdate {
+  const profile = managedRoleProfiles[request.role];
+  return {
+    status: "completed",
+    session_id: sessionId,
+    turn_id: `turn-${sequence}`,
+    role: request.role,
+    agent_name: profile.agent_name,
+    model: profile.model,
+    model_reasoning_effort: profile.model_reasoning_effort,
+    sandbox_mode: profile.sandbox_mode,
+    approval_policy: profile.approval_policy,
+    final_report: finalReport,
+    usage,
+  };
+}
+
 async function createLinkedWorktreeFixture(root: string): Promise<string> {
-  const repository = path.join(root, "repository");
-  const worktree = path.join(root, "worker");
+  const repository = path.join(root, `repository-${Date.now()}`);
+  const worktree = path.join(root, `worker-${Date.now()}`);
   await execFileAsync("git", ["init", "-b", "main", repository]);
   await execFileAsync("git", ["-C", repository, "config", "user.name", "Ark Team Test"]);
   await execFileAsync("git", [
@@ -416,82 +537,6 @@ async function createLinkedWorktreeFixture(root: string): Promise<string> {
     worktree,
   ]);
   return worktree;
-}
-
-class FakeCodexClient implements CodexSessionClient {
-  readonly options: ThreadOptions[] = [];
-  readonly prompts: string[] = [];
-  private sequence = 0;
-
-  startThread(options: ThreadOptions) {
-    this.options.push(options);
-    const sessionId = `session-${++this.sequence}`;
-    return {
-      id: sessionId,
-      run: async (prompt: string) => {
-        this.prompts.push(prompt);
-        return {
-          finalResponse: `REPORT_${sessionId}`,
-          usage,
-          items: [{ type: "reasoning", text: "must not escape" }],
-        };
-      },
-    };
-  }
-
-  resumeThread(_id: string, _options: ThreadOptions): never {
-    throw new Error("not used");
-  }
-}
-
-class StructuredCodexClient implements CodexSessionClient {
-  readonly starts: ThreadOptions[] = [];
-  readonly resumes: Array<{ id: string; options: ThreadOptions }> = [];
-  readonly prompts: string[] = [];
-  readonly turnOptions: Array<{
-    signal: AbortSignal;
-    outputSchema?: Record<string, unknown>;
-  }> = [];
-  private sequence = 0;
-
-  constructor(
-    private readonly responses: string[],
-    private readonly resumedIdOverride?: string,
-  ) {}
-
-  startThread(options: ThreadOptions) {
-    this.starts.push(options);
-    return this.thread(`pm-thread-${++this.sequence}`);
-  }
-
-  resumeThread(id: string, options: ThreadOptions) {
-    this.resumes.push({ id, options });
-    return this.thread(this.resumedIdOverride ?? id);
-  }
-
-  private thread(id: string) {
-    return {
-      id,
-      run: async (
-        prompt: string,
-        options: {
-          signal: AbortSignal;
-          outputSchema?: Record<string, unknown>;
-        },
-      ) => {
-        this.prompts.push(prompt);
-        this.turnOptions.push(options);
-        const finalResponse = this.responses.shift();
-        if (finalResponse === undefined) {
-          throw new Error("No scripted response");
-        }
-        return {
-          finalResponse,
-          usage,
-        };
-      },
-    };
-  }
 }
 
 function validPmPlan() {

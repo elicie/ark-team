@@ -52,10 +52,9 @@ plugins/ark-team/
 - 네이티브 폴백은 호스트의 동시 실행 제한을 따릅니다.
 - 네이티브 커스텀 에이전트는 PM을 Sol/xhigh, PL을 Terra/xhigh, worker를
   Luna/xhigh로 고정합니다.
-- 관리형 세션 런처는 공식 TypeScript Codex SDK를 사용하며,
-  `PATH`에 인증된 `codex` 실행 파일이 있어야 합니다.
-- 승인 절차가 적용되는 작성자 백엔드는 로컬 stdio를 통해
-  `codex app-server`를 사용하며, 호환되는 자동 생성 stable protocol 스키마가 필요합니다.
+- 관리형 역할 백엔드는 로컬 stdio를 통해 `codex app-server`를 사용하며,
+  `PATH`에 인증된 `codex` 실행 파일과 호환되는 자동 생성 stable protocol
+  스키마가 필요합니다.
 - Pull Request 모드는 `github.com` 원격 저장소를 지원하며, 인증된
   GitHub CLI(`gh`)가 `PATH`에 있어야 합니다. 경로를 재정의하려면
   `ARK_TEAM_GH_PATH`를 설정합니다.
@@ -211,9 +210,8 @@ npm test
 중복 ID, 알 수 없는 의존성, 의존성 순환이 있으면 거부됩니다.
 
 완료된 역할 스레드를 이어가려면 이전 `session_id`를
-`resume_session_id`로 전달합니다. PM 이어가기는 SDK의 영속화된
-스레드를 사용하고, PL/worker 이어가기는 app-server의 `thread/resume`을
-사용합니다. 두 경로 모두 정확한 관리형 역할 프로필을 다시 적용하며,
+`resume_session_id`로 전달합니다. 모든 역할은 app-server의
+`thread/resume`을 사용하고 정확한 관리형 역할 프로필을 다시 적용하며,
 다른 스레드 ID는 거부합니다. 작성자 경로는 새 턴을 시작하기 전에
 worktree cwd, workspace-write 루트, 비활성화된 네트워크, 사용자 승인
 라우팅, 모델, xhigh effort도 다시 검사합니다.
@@ -246,17 +244,17 @@ node plugins/ark-team/runtime/dist/session-cli.js \
 npm run verify:managed-sessions
 ```
 
-공식 TypeScript SDK 백엔드는 여전히 비대화형 `codex exec`를 사용합니다.
-로컬에서 검증한 Codex 릴리스에서는 대화형 승인 채널을 사용할 수 없어서
-요청한 작성자 `on-request` 정책이 해당 턴 컨텍스트에서 `never`로
-나타났습니다. 읽기 전용 PM과 대화형 승인이 필요 없는 작성자 할당에는
-계속 사용할 수 있습니다.
+관리형 런처는 모든 역할을 `codex app-server`로 실행합니다. PM은
+`read-only`/`never`, 작성자는 `workspace-write`/`on-request`가 실제
+스레드 응답에 유지되는지 검증합니다. 비대화형 CLI에서 작성자 승인이
+발생하면 우회하지 않고 실패하며, 대화형 할당은 영속적인 할당
+스케줄러를 통해 처리해야 합니다.
 
-승인이 필요할 수 있는 PL 및 worker 할당에는
+저수준 역할 세션에는
 `plugins/ark-team/runtime/dist/approval-session.js`에서
 `AppServerApprovalSession`을 가져와 사용합니다. 이 세션은 stdio를 통해
-`codex app-server`를 시작하고 선택한 작성자 프로필을 검증한 뒤, 다음
-중 하나를 반환합니다.
+`codex app-server`를 시작하고 선택한 역할 프로필을 검증합니다. PM은
+완료 결과만 반환하며, PL 및 worker는 다음 중 하나를 반환합니다.
 
 - 하나의 불투명 명령, 파일 변경 또는 권한 승인과 함께 `waiting_user`
 - 최종 역할 보고서 및 토큰 사용량과 함께 `completed`
@@ -270,9 +268,9 @@ npm run verify:managed-sessions
 Push, reset, clean, deploy, 권한, 파일 변경, 그 밖의 모든 셸 조합과
 일치하지 않는 모든 요청은 여전히 `decide()`를 통한 명시적인 사용자
 결정이 필요합니다. 객체는 같은 스레드와 턴에서 대기를 계속합니다.
-PM 세션 및 연결된 Git worktree 루트가 아닌 작성자 디렉터리는
-거부합니다. 컨트롤러 프로세스가 종료된 뒤에는 대기 중인 승인을
-영속화하지 않습니다.
+PM은 read-only로 제한하고, 연결된 Git worktree 루트가 아닌 작성자
+디렉터리는 거부합니다. 컨트롤러 프로세스가 종료된 뒤에는 대기 중인
+승인을 영속화하지 않습니다.
 
 모델 사용량 없이 프로토콜 호환성을 검사합니다.
 
@@ -390,8 +388,8 @@ and its references, then create a project-specific variant without modifying the
 
 현재 이 저장소는 검증된 스킬 계약, 프로젝트 기본값, 플러그인 패키지,
 영속적인 실행 레코드, MCP 수명 주기/상태 도구, 프로젝트 범위 네이티브
-커스텀 에이전트, 공식 SDK 역할 런처, 테스트된 app-server 승인
-게이트웨이, 명시적으로 정의된 PL 및 worker 할당을 위한 영속적인 MCP
+커스텀 에이전트, 통합 app-server 역할 런처와 승인 게이트웨이,
+명시적으로 정의된 PL 및 worker 할당을 위한 영속적인 MCP
 스케줄러를 제공합니다. 이제 역할 세션은 엄격한 계획 및 보고서 JSON
 계약을 제공하며, 완료된 PM, PL, worker 스레드를 이어갈 수 있습니다.
 제어 평면은 검증된 PM 계획을 영속적인 연결 팀 worktree와 보존되는
