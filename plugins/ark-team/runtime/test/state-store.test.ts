@@ -87,6 +87,11 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
   });
   assert.match(created.project_config_sha256 ?? "", /^[a-f0-9]{64}$/);
   assert.equal(created.verification_snapshot, null);
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "configured"))
+      .accepted,
+    true,
+  );
 
   const recorded = await store.recordVerificationSnapshot(created.run_id, {
     package_fingerprint:
@@ -111,24 +116,25 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
   }
   assert.equal(snapshot.schema_version, 2);
   const errorPayload = {
-    kind: "error" as const,
-    code: "SOURCE_DRIFT" as const,
-    message: "bounded test diagnostic",
+    kind: "capability" as const,
+    capability: "server" as const,
+    available: true,
+    version: "1.0.0",
   };
   const errorRecord = {
     schema_version: 2 as const,
     contract_id: "verification_contract_v2" as const,
-    record_id: `${created.run_id}-error`,
-    record_type: "error" as const,
+    record_id: `${created.run_id}-capability`,
+    record_type: "capability" as const,
     run_id: created.run_id,
     case_id: snapshot.case_id,
     snapshot_id: snapshot.snapshot_id,
-    lane: null,
-    stage: "snapshotted" as const,
+    lane: "backend" as const,
+    stage: "capabilities" as const,
     timestamp_utc: "2026-07-26T18:00:01.000Z",
     source_fingerprint: snapshot.source_fingerprint,
     package_fingerprint: snapshot.package.package_fingerprint,
-    lane_required: null,
+    lane_required: true,
     check_id: null,
     check_required: true,
     previous_record_sha256: sha256CanonicalJson(
@@ -136,10 +142,15 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
     ),
     payload_sha256: sha256CanonicalJson(errorPayload),
     payload: errorPayload,
-    adapter: null,
+    adapter: { name: "server-probe", version: "1.0.0" },
     model: null,
     artifact_references: [],
   };
+  const capabilityStage = await store.advanceVerificationState(
+    created.run_id,
+    "capabilities",
+  );
+  assert.equal(capabilityStage.accepted, true);
   const withEvidence = await store.appendVerificationRecord(
     created.run_id,
     errorRecord,
@@ -163,7 +174,6 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
       store.appendVerificationRecord(created.run_id, {
         ...errorRecord,
         record_id: `${created.run_id}-lane-downgrade`,
-        lane: "backend",
         lane_required: false,
         previous_record_sha256: sha256CanonicalJson(
           withEvidence.verification_records.at(-1),
@@ -171,6 +181,15 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
       }),
     (error: unknown) =>
       error instanceof ArkTeamError && error.code === "INVALID_RECORD",
+  );
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "ready")).accepted,
+    true,
+  );
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "executing"))
+      .accepted,
+    true,
   );
   const requestPayload = {
     kind: "request" as const,
@@ -185,6 +204,7 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
     ...errorRecord,
     record_id: `${created.run_id}-request`,
     record_type: "request" as const,
+    stage: "executing" as const,
     lane: "backend" as const,
     lane_required: true,
     check_id: "home-api",
@@ -252,6 +272,7 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
     ...errorRecord,
     record_id: `${created.run_id}-browser`,
     record_type: "browser" as const,
+    stage: "executing" as const,
     lane: "ui" as const,
     lane_required: true,
     check_id: browserCase.id,
@@ -465,6 +486,108 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
   );
 });
 
+test("TEST-1705 reopens pre-IS-1703 v4 runs without silently migrating coordinator state", async () => {
+  const config = structuredClone(DEFAULT_PROJECT_CONFIG);
+  config.verification.coordinator = validVerificationCoordinatorConfig();
+  const store = new RunStore({
+    root_path: stateRoot,
+    suffix: () => "170501",
+    verification_source_loader: async () =>
+      validVerificationSourceIdentity(projectRoot),
+    verification_package_loader: loadApprovedVerificationPackage,
+  });
+  const created = await store.createRun({
+    objective: "Reopen an existing verification-spec-v4 run",
+    project_path: projectRoot,
+    project_config: config,
+  });
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "configured"))
+      .accepted,
+    true,
+  );
+  await store.recordVerificationSnapshot(created.run_id, {
+    package_fingerprint:
+      APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+    server_port: 10_001,
+  });
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "configured"))
+      .accepted,
+    false,
+  );
+
+  const recordPath = path.join(stateRoot, created.run_id, "run.json");
+  const persisted = JSON.parse(await readFile(recordPath, "utf8")) as {
+    run: {
+      verification_state: unknown;
+      verification_records: Array<{
+        record_type: string;
+        check_required: boolean;
+        payload_sha256: string;
+        payload: {
+          kind: string;
+          attempt_count?: number;
+          evidence_record_ids?: string[];
+          outcome?: string;
+          integrity_failure?: boolean;
+        };
+      }>;
+    };
+  };
+  const legacyGlobalError = persisted.run.verification_records.find(
+    (record) => record.record_type === "error",
+  );
+  if (
+    legacyGlobalError === undefined ||
+    legacyGlobalError.payload.kind !== "error"
+  ) {
+    throw new Error("legacy global error fixture is missing");
+  }
+  legacyGlobalError.check_required = true;
+  delete legacyGlobalError.payload.attempt_count;
+  delete legacyGlobalError.payload.evidence_record_ids;
+  delete legacyGlobalError.payload.outcome;
+  delete legacyGlobalError.payload.integrity_failure;
+  legacyGlobalError.payload_sha256 = sha256CanonicalJson(
+    legacyGlobalError.payload,
+  );
+  persisted.run.verification_state = null;
+  await writeFile(
+    recordPath,
+    `${JSON.stringify(persisted, null, 2)}\n`,
+    "utf8",
+  );
+
+  const reopened = new RunStore({
+    root_path: stateRoot,
+    verification_source_loader: async () =>
+      validVerificationSourceIdentity(projectRoot),
+    verification_package_loader: loadApprovedVerificationPackage,
+  });
+  const legacyV4 = await reopened.getRun(created.run_id);
+  assert.equal(legacyV4.verification_state, null);
+  const reopenedLegacyError = legacyV4.verification_records.find(
+    (record) => record.record_type === "error",
+  );
+  assert.equal(
+    reopenedLegacyError?.schema_version === 2
+      ? reopenedLegacyError.check_required
+      : undefined,
+    true,
+  );
+  assert.equal(
+    legacyV4.verification_snapshot?.package.package_id,
+    "verification-spec-v4",
+  );
+  await assert.rejects(
+    () => reopened.advanceVerificationState(created.run_id, "capabilities"),
+    (error: unknown) =>
+      error instanceof ArkTeamError &&
+      error.code === "CONTRACT_VERSION_MISMATCH",
+  );
+});
+
 test("TEST-1705 rollback disables new snapshots and preserves existing evidence", async () => {
   const config = structuredClone(DEFAULT_PROJECT_CONFIG);
   config.verification.coordinator = validVerificationCoordinatorConfig();
@@ -479,6 +602,11 @@ test("TEST-1705 rollback disables new snapshots and preserves existing evidence"
     project_path: projectRoot,
     project_config: config,
   });
+  assert.equal(
+    (await store.advanceVerificationState(existing.run_id, "configured"))
+      .accepted,
+    true,
+  );
   const snapshotted = await store.recordVerificationSnapshot(existing.run_id, {
     package_fingerprint:
       APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
@@ -497,6 +625,11 @@ test("TEST-1705 rollback disables new snapshots and preserves existing evidence"
     project_path: projectRoot,
     project_config: config,
   });
+  assert.equal(
+    (await store.advanceVerificationState(blocked.run_id, "configured"))
+      .accepted,
+    true,
+  );
   await assert.rejects(
     () =>
       store.recordVerificationSnapshot(blocked.run_id, {

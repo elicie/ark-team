@@ -21,10 +21,16 @@ import {
 import {
   sha256CanonicalJson,
   verificationCleanupAuditSchema,
+  verificationCoordinatorStateSchema,
+  verificationErrorDisposition,
+  verificationEvidenceDisposition,
   verificationLinkedRecordSchema,
   verificationRecordMatchesSnapshot,
   verificationRunSnapshotSchema,
   verificationRunSnapshotSha256,
+  type VerificationActionKind,
+  type VerificationLinkedRecord,
+  type VerificationOutcome,
 } from "./verification-contract.js";
 
 export const RUN_ID_PATTERN = /^ark-\d{8}t\d{6}z-[a-z0-9]{6}$/;
@@ -506,6 +512,139 @@ export const pmSessionRecordSchema = z.object({
 
 export type PmSessionRecord = z.infer<typeof pmSessionRecordSchema>;
 
+function aggregatePersistedVerificationOutcomes(
+  outcomes: VerificationOutcome[],
+): VerificationOutcome {
+  for (const outcome of [
+    "error",
+    "unavailable",
+    "failed",
+    "skipped",
+  ] as const) {
+    if (outcomes.includes(outcome)) {
+      return outcome;
+    }
+  }
+  return "passed";
+}
+
+type VerificationRecordV2 = Extract<
+  VerificationLinkedRecord,
+  { schema_version: 2 }
+>;
+type VerificationRecordPayloadV2 = VerificationRecordV2["payload"];
+type VerificationRecordPayloadKind = VerificationRecordPayloadV2["kind"];
+type VerificationRunSnapshotV2 = Extract<
+  z.infer<typeof verificationRunSnapshotSchema>,
+  { schema_version: 2 }
+>;
+
+function isVerificationRecordV2Kind<
+  Kind extends VerificationRecordPayloadKind,
+>(
+  record: VerificationLinkedRecord,
+  kind: Kind,
+): record is VerificationRecordV2 & {
+  payload: Extract<VerificationRecordPayloadV2, { kind: Kind }>;
+} {
+  return record.schema_version === 2 && record.payload.kind === kind;
+}
+
+function expectedVerificationCheckRequired(
+  snapshot: VerificationRunSnapshotV2,
+  lane: "backend" | "ui" | null,
+  checkId: string,
+): boolean | null {
+  if (lane === "backend" && snapshot.backend_contract.enabled) {
+    return (
+      snapshot.backend_contract.api_probes.find(
+        (probe) => probe.id === checkId,
+      )?.required ?? null
+    );
+  }
+  if (lane === "ui" && snapshot.ui_contract.enabled) {
+    return (
+      snapshot.ui_contract.browser_cases.find(
+        (browserCase) => browserCase.id === checkId,
+      )?.required ??
+      snapshot.ui_contract.agentic_tasks.find(
+        (task) => task.id === checkId,
+      )?.required ??
+      null
+    );
+  }
+  return null;
+}
+
+function verificationRecordMatchesAttempt(
+  kind: VerificationActionKind,
+  lane: "backend" | "ui" | null,
+  checkId: string | null,
+  record: VerificationRecordV2,
+): boolean {
+  if (kind === "readiness") {
+    return (
+      record.record_type === "capability" &&
+      record.lane !== null &&
+      record.check_id === null
+    );
+  }
+  const expectedRecordType =
+    kind === "api"
+      ? "request"
+      : kind === "browser"
+        ? "browser"
+        : kind === "agentic_browser"
+          ? "agentic_browser"
+          : kind === "screenshot"
+            ? "screenshot"
+            : kind === "semantic_review"
+              ? "review"
+              : kind === "comparison"
+                ? "comparison"
+                : null;
+  return (
+    expectedRecordType !== null &&
+    record.record_type === expectedRecordType &&
+    record.lane === lane &&
+    record.check_id === checkId
+  );
+}
+
+function coordinatorErrorRecordMatchesSnapshot(
+  snapshot: VerificationRunSnapshotV2,
+  record: VerificationRecordV2 & {
+    payload: Extract<VerificationRecordPayloadV2, { kind: "error" }>;
+  },
+): boolean {
+  if (record.lane === null) {
+    return (
+      record.lane_required === null &&
+      record.check_id === null &&
+      !record.check_required
+    );
+  }
+  const laneContract =
+    record.lane === "backend"
+      ? snapshot.backend_contract
+      : snapshot.ui_contract;
+  if (
+    !laneContract.enabled ||
+    record.lane_required !== laneContract.required
+  ) {
+    return false;
+  }
+  if (record.check_id === null) {
+    return !record.check_required;
+  }
+  const required = expectedVerificationCheckRequired(
+    snapshot,
+    record.lane,
+    record.check_id,
+  );
+  return required !== null && record.check_required === required;
+}
+
 export const runRecordSchema = z
   .object({
     schema_version: z.literal(1),
@@ -537,6 +676,9 @@ export const runRecordSchema = z
       .array(verificationLinkedRecordSchema)
       .max(10_000)
       .default([]),
+    verification_state: verificationCoordinatorStateSchema
+      .nullable()
+      .default(null),
     model_bindings: z
       .object({
         worker: resolvedModelBindingV1Schema,
@@ -633,6 +775,200 @@ export const runRecordSchema = z
         });
       }
       const snapshot = run.verification_snapshot;
+      const reports = run.verification_records.filter(
+        (record) => record.payload.kind === "report",
+      );
+      const usesCoordinatorStateContract = run.verification_state !== null;
+      if (usesCoordinatorStateContract && reports.length > 1) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_records"],
+          message: "verification runs allow at most one terminal report",
+        });
+      }
+      if (run.verification_state !== null) {
+        const terminalOutcome = run.verification_state.terminal_outcome;
+        if (terminalOutcome === null) {
+          if (reports.length !== 0) {
+            context.addIssue({
+              code: "custom",
+              path: ["verification_records"],
+              message: "a terminal report requires terminal coordinator state",
+            });
+          }
+        } else if (
+          reports.length !== 1 ||
+          reports[0]?.payload.kind !== "report" ||
+          reports[0].payload.outcome !== terminalOutcome
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_records"],
+            message:
+              "terminal coordinator state requires exactly one matching report",
+          });
+        }
+      }
+      if (
+        usesCoordinatorStateContract &&
+        snapshot.schema_version === 2 &&
+        reports.length === 1 &&
+        reports[0] !== undefined &&
+        isVerificationRecordV2Kind(reports[0], "report")
+      ) {
+        const report = reports[0];
+        const reportPayload = report.payload;
+        const laneSummaries = run.verification_records.filter(
+          (record) => isVerificationRecordV2Kind(record, "lane_summary"),
+        );
+        const enabledLanes: Array<"backend" | "ui"> = [];
+        if (snapshot.backend_contract.enabled) {
+          enabledLanes.push("backend");
+        }
+        if (snapshot.ui_contract.enabled) {
+          enabledLanes.push("ui");
+        }
+        for (const lane of ["backend", "ui"] as const) {
+          const expectedCount = enabledLanes.includes(lane) ? 1 : 0;
+          const actualCount = laneSummaries.filter(
+            (record) => record.payload.lane === lane,
+          ).length;
+          if (actualCount !== expectedCount) {
+            context.addIssue({
+              code: "custom",
+              path: ["verification_records"],
+              message: `verification report requires ${expectedCount} ${lane} lane summaries`,
+            });
+          }
+        }
+        const summaryRecordIds = laneSummaries.map(
+          (record) => record.record_id,
+        );
+        const reportEvidenceIds = reportPayload.evidence_record_ids;
+        if (
+          reportEvidenceIds.length !== summaryRecordIds.length ||
+          new Set(reportEvidenceIds).size !== reportEvidenceIds.length ||
+          summaryRecordIds.some(
+            (recordId) => !reportEvidenceIds.includes(recordId),
+          )
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: [
+              "verification_records",
+              run.verification_records.indexOf(report),
+              "payload",
+              "evidence_record_ids",
+            ],
+            message:
+              "terminal report evidence must contain exactly the enabled lane summaries",
+          });
+        }
+        let integrityFailure = run.verification_records.some(
+          (record) =>
+            isVerificationRecordV2Kind(record, "error") &&
+            record.payload.integrity_failure === true,
+        );
+        const requiredLaneOutcomes: VerificationOutcome[] = [];
+        for (const summary of laneSummaries) {
+          const checks = summary.payload.checks;
+          if (checks === undefined) {
+            context.addIssue({
+              code: "custom",
+              path: [
+                "verification_records",
+                run.verification_records.indexOf(summary),
+                "payload",
+                "checks",
+              ],
+              message:
+                "coordinator lane summaries require complete check decisions",
+            });
+            continue;
+          }
+          const laneRequired =
+            summary.payload.lane === "backend"
+              ? snapshot.backend_contract.enabled &&
+                snapshot.backend_contract.required
+              : snapshot.ui_contract.enabled &&
+                snapshot.ui_contract.required;
+          const expectedChecks =
+            summary.payload.lane === "backend" &&
+            snapshot.backend_contract.enabled
+              ? snapshot.backend_contract.api_probes.map((probe) => ({
+                  id: probe.id,
+                  required: probe.required,
+                }))
+              : summary.payload.lane === "ui" &&
+                  snapshot.ui_contract.enabled
+                ? [
+                    ...snapshot.ui_contract.browser_cases.map(
+                      (browserCase) => ({
+                        id: browserCase.id,
+                        required: browserCase.required,
+                      }),
+                    ),
+                    ...snapshot.ui_contract.agentic_tasks.map((task) => ({
+                      id: task.id,
+                      required: task.required,
+                    })),
+                  ]
+                : [];
+          if (
+            expectedChecks.length !== checks.length ||
+            expectedChecks.some(
+              (expected) =>
+                !checks.some(
+                  (check) =>
+                    check.check_id === expected.id &&
+                    check.required === expected.required,
+                ),
+            )
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: ["verification_records"],
+              message:
+                "lane summary checks do not match the snapshotted lane contract",
+            });
+          }
+          const laneIntegrityFailure = checks.some(
+            (check) => check.integrity_failure,
+          );
+          integrityFailure ||= laneIntegrityFailure;
+          const expectedOutcome = laneIntegrityFailure
+            ? "error"
+            : aggregatePersistedVerificationOutcomes(
+                checks.flatMap((check) =>
+                  check.required ? [check.outcome] : [],
+                ),
+              );
+          if (summary.payload.outcome !== expectedOutcome) {
+            context.addIssue({
+              code: "custom",
+              path: ["verification_records"],
+              message:
+                "lane summary outcome does not match its required checks",
+            });
+          }
+          if (laneRequired) {
+            requiredLaneOutcomes.push(summary.payload.outcome);
+          }
+        }
+        const expectedReportOutcome = integrityFailure
+          ? "error"
+          : aggregatePersistedVerificationOutcomes(
+              requiredLaneOutcomes,
+            );
+        if (reportPayload.outcome !== expectedReportOutcome) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_records"],
+            message:
+              "terminal report outcome does not match required lane summaries",
+          });
+        }
+      }
       if (
         run.verification_records.length < 3 ||
         run.verification_records[0]?.record_type !== "source" ||
@@ -664,6 +1000,20 @@ export const runRecordSchema = z
       }
       const recordIds = new Set(
         run.verification_records.map((record) => record.record_id),
+      );
+      const recordById = new Map(
+        run.verification_records.map((record) => [
+          record.record_id,
+          record,
+        ]),
+      );
+      const supersededEvidenceRecordIds = new Set(
+        run.verification_state?.attempts.flatMap((attempt) =>
+          attempt.evidence_record_ids.filter(
+            (recordId) =>
+              !attempt.decisive_evidence_record_ids.includes(recordId),
+          ),
+        ) ?? [],
       );
       if (recordIds.size !== run.verification_records.length) {
         context.addIssue({
@@ -710,6 +1060,94 @@ export const runRecordSchema = z
       );
       let previousRecordHash: string | null = null;
       run.verification_records.forEach((record, index) => {
+        if (usesCoordinatorStateContract) {
+          if (record.schema_version !== 2) {
+            context.addIssue({
+              code: "custom",
+              path: ["verification_records", index, "schema_version"],
+              message: "coordinator state requires schema-2 verification records",
+            });
+          } else if (
+            record.payload.kind === "lane_summary" &&
+            record.payload.checks === undefined
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: [
+                "verification_records",
+                index,
+                "payload",
+                "checks",
+              ],
+              message:
+                "coordinator lane summaries require complete check decisions",
+            });
+          } else if (record.payload.kind === "error") {
+            const payload = record.payload;
+            if (
+              payload.attempt_count === undefined ||
+              payload.evidence_record_ids === undefined ||
+              payload.outcome === undefined ||
+              payload.integrity_failure === undefined
+            ) {
+              context.addIssue({
+                code: "custom",
+                path: ["verification_records", index, "payload"],
+                message:
+                  "coordinator errors require attempt, evidence, outcome, and integrity disposition",
+              });
+            } else {
+              const expectedDisposition = verificationErrorDisposition(
+                payload.code,
+              );
+              if (
+                payload.outcome !== expectedDisposition.outcome ||
+                payload.integrity_failure !==
+                  expectedDisposition.integrity_failure
+              ) {
+                context.addIssue({
+                  code: "custom",
+                  path: ["verification_records", index, "payload"],
+                  message:
+                    "verification error disposition does not match its closed error code",
+                });
+              }
+              if (payload.action_id !== undefined) {
+                const attempt = run.verification_state?.attempts.find(
+                  (candidate) =>
+                    candidate.action_id === payload.action_id,
+                );
+                if (
+                  attempt === undefined ||
+                  attempt.lane !== record.lane ||
+                  attempt.check_id !== record.check_id ||
+                  attempt.attempt_count !== payload.attempt_count ||
+                  attempt.last_error_code !== payload.code ||
+                  attempt.evidence_record_ids.length !==
+                    payload.evidence_record_ids.length ||
+                  attempt.evidence_record_ids.some(
+                    (recordId) =>
+                      !payload.evidence_record_ids?.includes(recordId),
+                  )
+                ) {
+                  context.addIssue({
+                    code: "custom",
+                    path: ["verification_records", index, "payload"],
+                    message:
+                      "verification action error does not match its durable attempt",
+                  });
+                }
+              } else if (record.check_id !== null) {
+                context.addIssue({
+                  code: "custom",
+                  path: ["verification_records", index, "payload", "action_id"],
+                  message:
+                    "check-scoped verification errors require an action ID",
+                });
+              }
+            }
+          }
+        }
         if (
           record.schema_version !== snapshot.schema_version ||
           record.run_id !== run.run_id ||
@@ -724,7 +1162,13 @@ export const runRecordSchema = z
             message: "verification record linkage does not match the run snapshot",
           });
         }
-        if (!verificationRecordMatchesSnapshot(snapshot, record)) {
+        const recordMatchesSnapshot =
+          usesCoordinatorStateContract &&
+          snapshot.schema_version === 2 &&
+          isVerificationRecordV2Kind(record, "error")
+            ? coordinatorErrorRecordMatchesSnapshot(snapshot, record)
+            : verificationRecordMatchesSnapshot(snapshot, record);
+        if (!recordMatchesSnapshot) {
           context.addIssue({
             code: "custom",
             path: ["verification_records", index],
@@ -754,10 +1198,17 @@ export const runRecordSchema = z
             });
           }
         }
+        let payloadEvidenceRecordIds: readonly string[] = [];
+        if (record.payload.kind === "report") {
+          payloadEvidenceRecordIds = record.payload.evidence_record_ids;
+        } else if (isVerificationRecordV2Kind(record, "lane_summary")) {
+          payloadEvidenceRecordIds = record.payload.evidence_record_ids;
+        } else if (isVerificationRecordV2Kind(record, "error")) {
+          payloadEvidenceRecordIds =
+            record.payload.evidence_record_ids ?? [];
+        }
         if (
-          (record.payload.kind === "report" ||
-            record.payload.kind === "lane_summary") &&
-          record.payload.evidence_record_ids.some(
+          payloadEvidenceRecordIds.some(
             (recordId) =>
               recordId === record.record_id || !recordIds.has(recordId),
           )
@@ -773,7 +1224,254 @@ export const runRecordSchema = z
             message: "verification report contains a broken evidence link",
           });
         }
+        if (isVerificationRecordV2Kind(record, "lane_summary")) {
+          const checks = record.payload.checks;
+          if (checks === undefined) {
+            return;
+          }
+          const checkEvidenceIds = [
+            ...new Set(
+              checks.flatMap((check) => check.evidence_record_ids),
+            ),
+          ];
+          if (
+            checkEvidenceIds.length !==
+              record.payload.evidence_record_ids.length ||
+            checkEvidenceIds.some(
+              (recordId) =>
+                !record.payload.evidence_record_ids.includes(recordId),
+            )
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: [
+                "verification_records",
+                index,
+                "payload",
+                "checks",
+              ],
+              message:
+                "lane summary checks must link exactly the summary evidence",
+            });
+          }
+          for (const check of checks) {
+            const evidence = check.evidence_record_ids.map((recordId) =>
+              recordById.get(recordId),
+            );
+            const allEvidenceRecordIds = run.verification_records
+              .filter(
+                (candidate) =>
+                  candidate.schema_version === 2 &&
+                  candidate.lane === record.payload.lane &&
+                  candidate.check_id === check.check_id &&
+                  !supersededEvidenceRecordIds.has(candidate.record_id) &&
+                  verificationEvidenceDisposition(candidate) !== null,
+              )
+              .map((candidate) => candidate.record_id);
+            const dispositions = evidence.flatMap((candidate) => {
+              if (
+                candidate === undefined ||
+                candidate.schema_version !== 2
+              ) {
+                return [];
+              }
+              const disposition = verificationEvidenceDisposition(candidate);
+              return disposition === null ? [] : [disposition];
+            });
+            const expectedIntegrityFailure = dispositions.some(
+              (disposition) => disposition.integrity_failure,
+            );
+            const expectedCheckOutcome = expectedIntegrityFailure
+              ? "error"
+              : aggregatePersistedVerificationOutcomes(
+                  dispositions.map((disposition) => disposition.outcome),
+                );
+            if (
+              evidence.some(
+                (candidate) =>
+                  candidate === undefined ||
+                  candidate.schema_version !== 2 ||
+                  candidate.lane !== record.payload.lane ||
+                  candidate.check_id !== check.check_id ||
+                  candidate.check_required !== check.required ||
+                  verificationEvidenceDisposition(candidate) === null,
+              ) ||
+              dispositions.length !== evidence.length ||
+              allEvidenceRecordIds.length !==
+                check.evidence_record_ids.length ||
+              allEvidenceRecordIds.some(
+                (recordId) =>
+                  !check.evidence_record_ids.includes(recordId),
+              ) ||
+              check.integrity_failure !== expectedIntegrityFailure ||
+              check.outcome !== expectedCheckOutcome
+            ) {
+              context.addIssue({
+                code: "custom",
+                path: [
+                  "verification_records",
+                  index,
+                  "payload",
+                  "checks",
+                ],
+                message:
+                  "lane summary check evidence has invalid provenance",
+              });
+            }
+          }
+        }
       });
+      if (run.verification_state !== null) {
+        const attempts = run.verification_state.attempts;
+        const attemptScopes = attempts.map((attempt) =>
+          [
+            attempt.kind,
+            attempt.lane ?? "",
+            attempt.check_id ?? "",
+            attempt.kind === "artifact_write"
+              ? attempt.input_sha256
+              : "",
+          ].join("\0"),
+        );
+        if (new Set(attemptScopes).size !== attemptScopes.length) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_state", "attempts"],
+            message:
+              "verification attempts must have unique immutable action scopes",
+          });
+        }
+        attempts.forEach((attempt, attemptIndex) => {
+          const evidence = attempt.evidence_record_ids.map((recordId) =>
+            recordById.get(recordId),
+          );
+          const decisiveEvidence =
+            attempt.decisive_evidence_record_ids.map((recordId) =>
+              recordById.get(recordId),
+            );
+          if (
+            evidence.some(
+              (record) =>
+                record === undefined ||
+                record.schema_version !== 2 ||
+                !verificationRecordMatchesAttempt(
+                  attempt.kind,
+                  attempt.lane,
+                  attempt.check_id,
+                  record,
+                ),
+            )
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: [
+                "verification_state",
+                "attempts",
+                attemptIndex,
+                "evidence_record_ids",
+              ],
+              message:
+                "verification attempt contains broken or mismatched evidence links",
+            });
+          }
+          if (
+            decisiveEvidence.some(
+              (record) =>
+                record === undefined ||
+                record.schema_version !== 2 ||
+                !verificationRecordMatchesAttempt(
+                  attempt.kind,
+                  attempt.lane,
+                  attempt.check_id,
+                  record,
+                ),
+            )
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: [
+                "verification_state",
+                "attempts",
+                attemptIndex,
+                "decisive_evidence_record_ids",
+              ],
+              message:
+                "verification attempt contains broken or mismatched decisive evidence links",
+            });
+          }
+          if (
+            (attempt.status === "in_progress" &&
+              attempt.decisive_evidence_record_ids.length !== 0) ||
+            (attempt.status === "failed" &&
+              attempt.attempt_count >= attempt.max_attempts) ||
+            (run.verification_state?.terminal_outcome !== null &&
+              attempt.status === "in_progress")
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: [
+                "verification_state",
+                "attempts",
+                attemptIndex,
+                "status",
+              ],
+              message:
+                "verification attempt status does not match its count, evidence, or run state",
+            });
+          }
+          const actionErrorCount = run.verification_records.filter(
+            (record) =>
+              isVerificationRecordV2Kind(record, "error") &&
+              record.payload.action_id === attempt.action_id,
+          ).length;
+          const requiresActionError =
+            attempt.status === "aborted" ||
+            attempt.status === "exhausted";
+          if (actionErrorCount !== (requiresActionError ? 1 : 0)) {
+            context.addIssue({
+              code: "custom",
+              path: [
+                "verification_state",
+                "attempts",
+                attemptIndex,
+                "status",
+              ],
+              message:
+                "terminal failed attempts require exactly one linked action error",
+            });
+          }
+        });
+
+        run.verification_records.forEach((record, recordIndex) => {
+          if (
+            !isVerificationRecordV2Kind(record, "error") ||
+            record.check_id === null ||
+            record.payload.attempt_count === undefined ||
+            record.payload.evidence_record_ids === undefined
+          ) {
+            return;
+          }
+          const errorEvidenceIds = record.payload.evidence_record_ids;
+          const errorAttemptCount = record.payload.attempt_count;
+          const matchingAttempt = attempts.find(
+            (attempt) =>
+              attempt.lane === record.lane &&
+              attempt.check_id === record.check_id &&
+              attempt.attempt_count >= errorAttemptCount &&
+              errorEvidenceIds.every((recordId) =>
+                attempt.evidence_record_ids.includes(recordId),
+              ),
+          );
+          if (matchingAttempt === undefined) {
+            context.addIssue({
+              code: "custom",
+              path: ["verification_records", recordIndex],
+              message:
+                "check-scoped verification error does not match its durable attempt",
+            });
+          }
+        });
+      }
       const cleanupRecords = run.verification_records.filter(
         (record) => record.payload.kind === "cleanup",
       );
@@ -899,15 +1597,31 @@ export const runRecordSchema = z
           });
         }
       }
-    } else if (
-      run.verification_records.length !== 0 ||
-      run.verification_cleanup_audit !== null
-    ) {
-      context.addIssue({
-        code: "custom",
-        path: ["verification_records"],
-        message: "verification records and cleanup audit require a run snapshot",
-      });
+    } else {
+      if (
+        run.verification_records.length !== 0 ||
+        run.verification_cleanup_audit !== null
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_records"],
+          message: "verification records and cleanup audit require a run snapshot",
+        });
+      }
+      if (
+        run.verification_state !== null &&
+        ((run.verification_state.current_state !== "integrated" &&
+          run.verification_state.current_state !== "configured") ||
+          run.verification_state.terminal_outcome !== null ||
+          run.verification_state.attempts.length !== 0)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_state"],
+          message:
+            "coordinator state without a snapshot must be integrated or configured with no terminal outcome or attempts",
+        });
+      }
     }
   });
 

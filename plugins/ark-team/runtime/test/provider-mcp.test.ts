@@ -347,6 +347,7 @@ class FakeProviderStore extends RunStore {
       verification_snapshot: null,
       verification_snapshot_sha256: null,
       verification_records: [],
+      verification_state: null,
       verification_cleanup_audit: null,
       model_bindings: {
         worker: workerBinding,

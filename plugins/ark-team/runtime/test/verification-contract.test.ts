@@ -291,6 +291,15 @@ test("TEST-1704 validates schema-2 records, legacy readability, and chain isolat
         lane: "backend",
         outcome: "passed",
         evidence_record_ids: ["record-request"],
+        checks: [
+          {
+            check_id: "home-api",
+            required: true,
+            outcome: "passed",
+            evidence_record_ids: ["record-request"],
+            integrity_failure: false,
+          },
+        ],
       },
       "backend",
     ),
@@ -298,6 +307,8 @@ test("TEST-1704 validates schema-2 records, legacy readability, and chain isolat
       kind: "error",
       code: "CONTRACT_VERSION_MISMATCH",
       message: "legacy evidence is read-only",
+      attempt_count: 1,
+      evidence_record_ids: [],
     }),
     recordCase("report", {
       kind: "report",
