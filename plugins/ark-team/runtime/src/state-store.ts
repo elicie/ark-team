@@ -3,6 +3,7 @@ import {
   access,
   link,
   mkdir,
+  open,
   readFile,
   readdir,
   rename,
@@ -76,6 +77,8 @@ import {
   buildVerificationRunSnapshot,
   captureVerificationSource,
   sha256CanonicalJson,
+  type VerificationApprovedBaselineManifest,
+  type VerificationCleanupAudit,
   type VerificationLinkedRecord,
   type VerificationRollbackRecord,
   type VerificationSourceIdentity,
@@ -83,6 +86,7 @@ import {
   verificationRollbackRecordSchema,
   verificationRunSnapshotSha256,
 } from "./verification-contract.js";
+import { VerificationArtifactStore } from "./verification-artifact-store.js";
 import type { PreparedTeamWorkspace } from "./worktree-manager.js";
 
 export interface RunStoreOptions {
@@ -114,6 +118,37 @@ export interface RecordVerificationSnapshotInput {
 
 export interface RecordVerificationRollbackInput {
   reason: string;
+}
+
+export interface WriteVerificationArtifactInput {
+  artifact_id: string;
+  relative_path: string;
+  media_type:
+    | "image/png"
+    | "application/json"
+    | "application/x-ndjson"
+    | "application/zip"
+    | "text/plain";
+  bytes: Uint8Array;
+  sha256: string;
+  lane: "backend" | "ui" | null;
+}
+
+export interface WriteVerificationArtifactResult {
+  run: RunRecord;
+  record: VerificationLinkedRecord;
+}
+
+export interface VerificationApprovedBaselineResult {
+  manifest: VerificationApprovedBaselineManifest;
+  manifest_sha256: string;
+  baseline_set_sha256: string;
+}
+
+export interface CleanupVerificationArtifactsResult {
+  run: RunRecord;
+  record: VerificationLinkedRecord;
+  audit: VerificationCleanupAudit | null;
 }
 
 export interface ListRunsInput {
@@ -411,6 +446,7 @@ export class RunStore {
         model_bindings: {
           worker: workerBinding,
         },
+        verification_cleanup_audit: null,
       };
       const event: RunEvent = {
         schema_version: 1,
@@ -520,6 +556,12 @@ export class RunStore {
         source,
         config: coordinator,
       });
+      const artifactStore = new VerificationArtifactStore({
+        state_root: this.root_path,
+        project_root: persisted.run.project_path,
+        snapshot,
+      });
+      await artifactStore.registerRoot();
       const snapshotSha256 = verificationRunSnapshotSha256(snapshot);
       const commonRecord = {
         schema_version: 2 as const,
@@ -629,6 +671,15 @@ export class RunStore {
           "contract-v1 verification evidence is read-only",
         );
       }
+      if (
+        input.record_type === "artifact" ||
+        input.record_type === "cleanup"
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "artifact and cleanup records are coordinator-owned",
+        );
+      }
       await this.assertApprovedVerificationPackage(
         persisted.run.project_path,
       );
@@ -675,6 +726,381 @@ export class RunStore {
         integration: persisted.integration,
       });
       return run;
+    });
+  }
+
+  async writeVerificationArtifact(
+    runId: string,
+    input: WriteVerificationArtifactInput,
+  ): Promise<WriteVerificationArtifactResult> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      const snapshot = persisted.run.verification_snapshot;
+      if (snapshot === null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification artifacts require an immutable run snapshot",
+        );
+      }
+      if (snapshot.schema_version !== 2) {
+        throw new ArkTeamError(
+          "CONTRACT_VERSION_MISMATCH",
+          "contract-v1 verification artifacts are read-only",
+        );
+      }
+      await this.assertApprovedVerificationPackage(
+        persisted.run.project_path,
+      );
+      const currentSource = await this.verificationSourceLoader(
+        persisted.run.project_path,
+      );
+      assertVerificationSourceIdentity(currentSource, snapshot.source);
+      const laneRequired =
+        input.lane === null
+          ? null
+          : input.lane === "backend"
+            ? snapshot.backend_contract.enabled
+              ? snapshot.backend_contract.required
+              : null
+            : snapshot.ui_contract.enabled
+              ? snapshot.ui_contract.required
+              : null;
+      if (input.lane !== null && laneRequired === null) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "verification artifact cannot target a disabled QA lane",
+        );
+      }
+
+      const artifactStore = new VerificationArtifactStore({
+        state_root: this.root_path,
+        project_root: persisted.run.project_path,
+        snapshot,
+      });
+      const existingArtifacts = persisted.run.verification_records.flatMap(
+        (record) =>
+          record.payload.kind === "artifact" ? [record.payload] : [],
+      );
+      const payload = await artifactStore.write(
+        {
+          artifact_id: input.artifact_id,
+          relative_path: input.relative_path,
+          media_type: input.media_type,
+          bytes: input.bytes,
+          sha256: input.sha256,
+        },
+        existingArtifacts,
+      );
+      const reference = {
+        artifact_id: payload.artifact_id,
+        relative_path: payload.relative_path,
+        sha256: payload.sha256,
+      };
+      const timestamp = this.now().toISOString();
+      const record: VerificationLinkedRecord = {
+        schema_version: 2,
+        contract_id: "verification_contract_v2",
+        record_id: `artifact-${sha256CanonicalJson(reference).slice(0, 24)}`,
+        record_type: "artifact",
+        run_id: persisted.run.run_id,
+        case_id: snapshot.case_id,
+        check_id: null,
+        snapshot_id: snapshot.snapshot_id,
+        lane: input.lane,
+        stage: "collecting",
+        timestamp_utc: timestamp,
+        source_fingerprint: snapshot.source_fingerprint,
+        package_fingerprint: snapshot.package.package_fingerprint,
+        lane_required: laneRequired,
+        check_required: false,
+        previous_record_sha256: sha256CanonicalJson(
+          persisted.run.verification_records.at(-1)!,
+        ),
+        payload_sha256: sha256CanonicalJson(payload),
+        payload,
+        adapter: null,
+        model: null,
+        artifact_references: [reference],
+      };
+      try {
+        const verificationRecords = appendVerificationLinkedRecord(
+          persisted.run.verification_records,
+          record,
+        );
+        const run: RunRecord = {
+          ...persisted.run,
+          updated_at: timestamp,
+          revision: persisted.run.revision + 1,
+          verification_records: [...verificationRecords],
+        };
+        await this.writePersistedRun({
+          ...persisted,
+          run,
+        });
+        return { run, record };
+      } catch (error) {
+        try {
+          await artifactStore.removeWrittenArtifact(payload);
+        } catch (rollbackError) {
+          throw new ArkTeamError(
+            "ARTIFACT_ROOT_INVALID",
+            "artifact state persistence failed and physical rollback was incomplete",
+            { cause: new AggregateError([error, rollbackError]) },
+          );
+        }
+        throw error;
+      }
+    });
+  }
+
+  async verifyApprovedBaseline(
+    runId: string,
+  ): Promise<VerificationApprovedBaselineResult> {
+    const persisted = await this.readPersistedRun(runId);
+    const snapshot = persisted.run.verification_snapshot;
+    if (
+      snapshot === null ||
+      snapshot.schema_version !== 2 ||
+      !snapshot.ui_contract.enabled
+    ) {
+      throw new ArkTeamError(
+        "BASELINE_NOT_APPROVED",
+        "an enabled UI snapshot is required to verify an approved baseline",
+      );
+    }
+    await this.assertApprovedVerificationPackage(persisted.run.project_path);
+    const currentSource = await this.verificationSourceLoader(
+      persisted.run.project_path,
+    );
+    assertVerificationSourceIdentity(currentSource, snapshot.source);
+    return new VerificationArtifactStore({
+      state_root: this.root_path,
+      project_root: persisted.run.project_path,
+      snapshot,
+    }).verifyApprovedBaseline();
+  }
+
+  async cleanupVerificationArtifacts(
+    runId: string,
+  ): Promise<CleanupVerificationArtifactsResult> {
+    return this.withMutation(async () => {
+      const persisted = await this.readPersistedRun(runId);
+      let run = persisted.run;
+      const snapshot = run.verification_snapshot;
+      if (snapshot === null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "artifact cleanup requires an immutable run snapshot",
+        );
+      }
+      if (snapshot.schema_version !== 2) {
+        throw new ArkTeamError(
+          "CONTRACT_VERSION_MISMATCH",
+          "contract-v1 verification cleanup is read-only",
+        );
+      }
+      const reports = run.verification_records.filter(
+        (record) => record.payload.kind === "report",
+      );
+      if (reports.length !== 1 || reports[0]?.payload.kind !== "report") {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "artifact cleanup requires exactly one persisted terminal report",
+        );
+      }
+      const report = reports[0];
+      if (report.payload.kind !== "report") {
+        throw new ArkTeamError(
+          "CORRUPT_STATE",
+          "terminal report record payload is invalid",
+        );
+      }
+      const reportPayload = report.payload;
+      const artifactRecords = run.verification_records.filter(
+        (record) => record.payload.kind === "artifact",
+      );
+      const artifactPayloads = artifactRecords.flatMap((record) =>
+        record.payload.kind === "artifact" ? [record.payload] : [],
+      );
+      if (artifactPayloads.length === 0) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "artifact cleanup requires persisted artifact hashes",
+        );
+      }
+      const existingTerminalRecord = run.verification_records.find(
+        (record) =>
+          record.payload.kind === "cleanup" &&
+          record.payload.disposition !== "retention_active",
+      );
+      if (existingTerminalRecord !== undefined) {
+        if (run.verification_cleanup_audit === null) {
+          throw new ArkTeamError(
+            "CORRUPT_STATE",
+            "terminal cleanup record is missing its durable audit",
+          );
+        }
+        return {
+          run,
+          record: existingTerminalRecord,
+          audit: run.verification_cleanup_audit,
+        };
+      }
+
+      const now = this.now();
+      const retentionBoundary =
+        Date.parse(report.timestamp_utc) +
+        snapshot.evidence_policy.retention_days * 24 * 60 * 60 * 1_000;
+      if (!Number.isFinite(retentionBoundary)) {
+        throw new ArkTeamError(
+          "CORRUPT_STATE",
+          "terminal report timestamp is invalid",
+        );
+      }
+      if (now.getTime() < retentionBoundary) {
+        const existingRetentionRecord = run.verification_records.find(
+          (record) =>
+            record.payload.kind === "cleanup" &&
+            record.payload.disposition === "retention_active",
+        );
+        if (existingRetentionRecord !== undefined) {
+          return {
+            run,
+            record: existingRetentionRecord,
+            audit: run.verification_cleanup_audit,
+          };
+        }
+        const timestamp = now.toISOString();
+        const record = createVerificationCleanupRecord(
+          run,
+          "retention_active",
+          timestamp,
+        );
+        const verificationRecords = appendVerificationLinkedRecord(
+          run.verification_records,
+          record,
+        );
+        run = {
+          ...run,
+          updated_at: timestamp,
+          revision: run.revision + 1,
+          verification_records: [...verificationRecords],
+        };
+        await this.writePersistedRun({
+          ...persisted,
+          run,
+        });
+        return { run, record, audit: run.verification_cleanup_audit };
+      }
+
+      const artifactStore = new VerificationArtifactStore({
+        state_root: this.root_path,
+        project_root: run.project_path,
+        snapshot,
+      });
+      let audit = run.verification_cleanup_audit;
+      const resumingPendingAudit = audit?.status === "pending";
+      if (audit === null) {
+        const baselineManifestSha256 = snapshot.ui_contract.enabled
+          ? (await artifactStore.verifyApprovedBaseline()).manifest_sha256
+          : null;
+        const requestedAt = now.toISOString();
+        audit = {
+          schema_version: 1,
+          run_id: run.run_id,
+          snapshot_id: snapshot.snapshot_id,
+          artifact_root: snapshot.artifact_root,
+          terminal_report_record_id: report.record_id,
+          terminal_report_at: report.timestamp_utc,
+          terminal_outcome: reportPayload.outcome,
+          terminal_report_sha256: sha256CanonicalJson(report),
+          artifact_record_ids: artifactRecords.map(
+            (record) => record.record_id,
+          ),
+          artifact_manifest_sha256:
+            sha256CanonicalJson(artifactPayloads),
+          artifact_count: artifactPayloads.length,
+          total_bytes: artifactPayloads.reduce(
+            (total, artifact) => total + artifact.byte_length,
+            0,
+          ),
+          baseline_manifest_sha256: baselineManifestSha256,
+          requested_at_utc: requestedAt,
+          destructive_attempt: 1,
+          status: "pending",
+          completed_at_utc: null,
+          error_code: null,
+          error_message: null,
+        };
+        run = {
+          ...run,
+          updated_at: requestedAt,
+          revision: run.revision + 1,
+          verification_cleanup_audit: audit,
+        };
+        await this.writePersistedRun({
+          ...persisted,
+          run,
+        });
+      }
+
+      let disposition: "cleaned" | "cleanup_error" = "cleaned";
+      let cleanupMessage: string | null = null;
+      try {
+        if (resumingPendingAudit) {
+          throw new ArkTeamError(
+            "ARTIFACT_ROOT_INVALID",
+            "a prior destructive cleanup attempt has an indeterminate result",
+          );
+        }
+        const rootExists = await artifactStore.artifactRootExists();
+        const cleanupResidueExists =
+          await artifactStore.cleanupResidueExists();
+        if (!rootExists || cleanupResidueExists) {
+          throw new ArkTeamError(
+            "ARTIFACT_ROOT_INVALID",
+            "registered artifact root is missing or has cleanup residue",
+          );
+        }
+        if (rootExists) {
+          await artifactStore.cleanupRegisteredRoot(artifactPayloads);
+        }
+      } catch {
+        disposition = "cleanup_error";
+        cleanupMessage = "registered artifact cleanup failed closed";
+      }
+
+      const completedAt = this.now().toISOString();
+      const completedAudit: VerificationCleanupAudit = {
+        ...audit,
+        status: disposition,
+        completed_at_utc: completedAt,
+        error_code:
+          disposition === "cleanup_error" ? "ARTIFACT_ROOT_INVALID" : null,
+        error_message: cleanupMessage,
+      };
+      const record = createVerificationCleanupRecord(
+        run,
+        disposition,
+        completedAt,
+        cleanupMessage,
+      );
+      const verificationRecords = appendVerificationLinkedRecord(
+        run.verification_records,
+        record,
+      );
+      run = {
+        ...run,
+        updated_at: completedAt,
+        revision: run.revision + 1,
+        verification_records: [...verificationRecords],
+        verification_cleanup_audit: completedAudit,
+      };
+      await this.writePersistedRun({
+        ...persisted,
+        run,
+      });
+      return { run, record, audit: completedAudit };
     });
   }
 
@@ -3785,12 +4211,26 @@ export class RunStore {
     );
 
     try {
-      await writeFile(temporaryPath, `${JSON.stringify(validated, null, 2)}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
+      const handle = await open(temporaryPath, "wx", 0o600);
+      try {
+        await handle.writeFile(
+          `${JSON.stringify(validated, null, 2)}\n`,
+          "utf8",
+        );
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
       await rename(temporaryPath, finalPath);
+      const directory = await open(
+        runDirectory,
+        constants.O_RDONLY | constants.O_DIRECTORY,
+      );
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
     } catch (error) {
       await rm(temporaryPath, { force: true });
       throw new ArkTeamError(
@@ -3818,6 +4258,76 @@ export class RunStore {
     );
     return result;
   }
+}
+
+function createVerificationCleanupRecord(
+  run: RunRecord,
+  disposition: "retention_active" | "cleaned" | "cleanup_error",
+  timestamp: string,
+  message: string | null = null,
+): VerificationLinkedRecord {
+  const snapshot = run.verification_snapshot;
+  if (snapshot === null || snapshot.schema_version !== 2) {
+    throw new ArkTeamError(
+      "INVALID_TRANSITION",
+      "cleanup records require a contract-v2 run snapshot",
+    );
+  }
+  const payload =
+    disposition === "cleanup_error"
+      ? {
+          kind: "cleanup" as const,
+          disposition,
+          code: "ARTIFACT_ROOT_INVALID" as const,
+          message:
+            message?.trim().slice(0, 1_000) ||
+            "registered artifact cleanup failed closed",
+        }
+      : {
+          kind: "cleanup" as const,
+          disposition,
+          code: null,
+          message: null,
+        };
+  const artifactReferences = run.verification_records.flatMap((record) =>
+    record.payload.kind === "artifact"
+      ? [
+          {
+            artifact_id: record.payload.artifact_id,
+            relative_path: record.payload.relative_path,
+            sha256: record.payload.sha256,
+          },
+        ]
+      : [],
+  );
+  return {
+    schema_version: 2,
+    contract_id: "verification_contract_v2",
+    record_id:
+      disposition === "retention_active"
+        ? "cleanup-retention"
+        : "cleanup-terminal",
+    record_type: "cleanup",
+    run_id: run.run_id,
+    case_id: snapshot.case_id,
+    check_id: null,
+    snapshot_id: snapshot.snapshot_id,
+    lane: null,
+    stage: "deciding",
+    timestamp_utc: timestamp,
+    source_fingerprint: snapshot.source_fingerprint,
+    package_fingerprint: snapshot.package.package_fingerprint,
+    lane_required: null,
+    check_required: false,
+    previous_record_sha256: sha256CanonicalJson(
+      run.verification_records.at(-1)!,
+    ),
+    payload_sha256: sha256CanonicalJson(payload),
+    payload,
+    adapter: null,
+    model: null,
+    artifact_references: artifactReferences,
+  };
 }
 
 function retryAttemptEvents(input: {

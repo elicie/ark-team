@@ -20,6 +20,7 @@ import {
 } from "./provider-types.js";
 import {
   sha256CanonicalJson,
+  verificationCleanupAuditSchema,
   verificationLinkedRecordSchema,
   verificationRecordMatchesSnapshot,
   verificationRunSnapshotSchema,
@@ -544,6 +545,9 @@ export const runRecordSchema = z
       .default({
         worker: NATIVE_WORKER_MODEL_BINDING,
       }),
+    verification_cleanup_audit: verificationCleanupAuditSchema
+      .nullable()
+      .default(null),
   })
   .strict()
   .superRefine((run, context) => {
@@ -668,8 +672,10 @@ export const runRecordSchema = z
           message: "verification record IDs must be unique",
         });
       }
-      const artifactIds = run.verification_records
-        .filter((record) => record.payload.kind === "artifact")
+      const artifactRecords = run.verification_records.filter(
+        (record) => record.payload.kind === "artifact",
+      );
+      const artifactIds = artifactRecords
         .map((record) =>
           record.payload.kind === "artifact"
             ? record.payload.artifact_id
@@ -682,10 +688,20 @@ export const runRecordSchema = z
           message: "verification artifact IDs must be unique",
         });
       }
+      const artifactPaths = artifactRecords.flatMap((record) =>
+        record.payload.kind === "artifact"
+          ? [record.payload.relative_path]
+          : [],
+      );
+      if (new Set(artifactPaths).size !== artifactPaths.length) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_records"],
+          message: "verification artifact paths must be unique",
+        });
+      }
       const artifacts = new Map(
-        run.verification_records
-          .filter((record) => record.payload.kind === "artifact")
-          .map((record) => [
+        artifactRecords.map((record) => [
             record.payload.kind === "artifact"
               ? record.payload.artifact_id
               : "",
@@ -758,11 +774,139 @@ export const runRecordSchema = z
           });
         }
       });
-    } else if (run.verification_records.length !== 0) {
+      const cleanupRecords = run.verification_records.filter(
+        (record) => record.payload.kind === "cleanup",
+      );
+      const retentionRecords = cleanupRecords.filter(
+        (record) =>
+          record.payload.kind === "cleanup" &&
+          record.payload.disposition === "retention_active",
+      );
+      const terminalCleanupRecords = cleanupRecords.filter(
+        (record) =>
+          record.payload.kind === "cleanup" &&
+          record.payload.disposition !== "retention_active",
+      );
+      if (
+        retentionRecords.length > 1 ||
+        terminalCleanupRecords.length > 1 ||
+        (retentionRecords.length === 1 &&
+          terminalCleanupRecords.length === 1 &&
+          run.verification_records.indexOf(retentionRecords[0]!) >
+            run.verification_records.indexOf(terminalCleanupRecords[0]!))
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["verification_records"],
+          message:
+            "verification cleanup allows at most one retention record before one terminal disposition",
+        });
+      }
+      const expectedCleanupArtifactReferences = artifactRecords.flatMap(
+        (record) =>
+          record.payload.kind === "artifact"
+            ? [
+                {
+                  artifact_id: record.payload.artifact_id,
+                  relative_path: record.payload.relative_path,
+                  sha256: record.payload.sha256,
+                },
+              ]
+            : [],
+      );
+      cleanupRecords.forEach((record) => {
+        if (
+          sha256CanonicalJson(record.artifact_references) !==
+          sha256CanonicalJson(expectedCleanupArtifactReferences)
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_records"],
+            message:
+              "verification cleanup must reference the exact artifact manifest",
+          });
+        }
+      });
+
+      const cleanupAudit = run.verification_cleanup_audit;
+      if (cleanupAudit === null) {
+        if (terminalCleanupRecords.length !== 0) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_cleanup_audit"],
+            message: "terminal cleanup requires a durable pre-cleanup audit",
+          });
+        }
+      } else {
+        const terminalReport = run.verification_records.find(
+          (record) =>
+            record.record_id === cleanupAudit.terminal_report_record_id &&
+            record.payload.kind === "report",
+        );
+        const artifactManifest = artifactRecords.map((record) => record.payload);
+        const artifactRecordIds = artifactRecords.map(
+          (record) => record.record_id,
+        );
+        const artifactTotalBytes = artifactManifest.reduce(
+          (total, payload) =>
+            payload.kind === "artifact"
+              ? total + payload.byte_length
+              : total,
+          0,
+        );
+        if (
+          snapshot.schema_version !== 2 ||
+          cleanupAudit.run_id !== run.run_id ||
+          cleanupAudit.snapshot_id !== snapshot.snapshot_id ||
+          cleanupAudit.artifact_root !== snapshot.artifact_root ||
+          terminalReport === undefined ||
+          terminalReport.payload.kind !== "report" ||
+          cleanupAudit.terminal_report_at !== terminalReport.timestamp_utc ||
+          cleanupAudit.terminal_outcome !== terminalReport.payload.outcome ||
+          cleanupAudit.terminal_report_sha256 !==
+            sha256CanonicalJson(terminalReport) ||
+          cleanupAudit.artifact_manifest_sha256 !==
+            sha256CanonicalJson(artifactManifest) ||
+          cleanupAudit.artifact_count !== artifactRecords.length ||
+          cleanupAudit.total_bytes !== artifactTotalBytes ||
+          cleanupAudit.artifact_record_ids.join("\0") !==
+            artifactRecordIds.join("\0") ||
+          (snapshot.ui_contract.enabled
+            ? cleanupAudit.baseline_manifest_sha256 === null
+            : cleanupAudit.baseline_manifest_sha256 !== null)
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_cleanup_audit"],
+            message:
+              "verification cleanup audit does not match durable report and artifact records",
+          });
+        }
+        const terminalCleanup = terminalCleanupRecords[0];
+        if (
+          (cleanupAudit.status === "pending" &&
+            terminalCleanup !== undefined) ||
+          (cleanupAudit.status !== "pending" &&
+            (terminalCleanup === undefined ||
+              terminalCleanup.payload.kind !== "cleanup" ||
+              terminalCleanup.payload.disposition !== cleanupAudit.status))
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_cleanup_audit", "status"],
+            message:
+              "verification cleanup audit status does not match its terminal disposition",
+          });
+        }
+      }
+    } else if (
+      run.verification_records.length !== 0 ||
+      run.verification_cleanup_audit !== null
+    ) {
       context.addIssue({
         code: "custom",
         path: ["verification_records"],
-        message: "verification records require a run snapshot",
+        message: "verification records and cleanup audit require a run snapshot",
       });
     }
   });

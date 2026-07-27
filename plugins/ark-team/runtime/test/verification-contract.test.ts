@@ -10,6 +10,7 @@ import { ArkTeamError } from "../src/errors.js";
 import {
   APPROVED_VERIFICATION_PACKAGE,
   APPROVED_VERIFICATION_SPEC_SHA256,
+  LEGACY_APPROVED_VERIFICATION_PACKAGE_V3,
   appendVerificationLinkedRecord,
   assertVerificationPackageBytes,
   assertVerificationPackageFingerprint,
@@ -19,6 +20,9 @@ import {
   captureVerificationSource,
   legacyVerificationCoordinatorConfigSchema,
   sha256CanonicalJson,
+  verificationApprovedBaselineManifestSchema,
+  verificationBaselineSetSha256,
+  verificationCleanupAuditSchema,
   verificationCoordinatorConfigSchema,
   verificationLinkedRecordSchema,
   verificationRunSnapshotSchema,
@@ -140,7 +144,7 @@ test("TEST-1702 rejects source, package, scenario, and baseline drift", async ()
 });
 
 test("TEST-1704 validates schema-2 records, legacy readability, and chain isolation", () => {
-  assert.equal(APPROVED_VERIFICATION_PACKAGE.package_id, "verification-spec-v3");
+  assert.equal(APPROVED_VERIFICATION_PACKAGE.package_id, "verification-spec-v4");
   assert.notEqual(
     APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
     APPROVED_VERIFICATION_SPEC_SHA256,
@@ -259,6 +263,7 @@ test("TEST-1704 validates schema-2 records, legacy readability, and chain isolat
         media_type: "image/png",
         byte_length: 1,
         sha256: SHA,
+        image_metadata: { width: 375, height: 812 },
       },
       "ui",
       null,
@@ -454,7 +459,7 @@ test("TEST-1705 enforces the lane matrix and immutable schema-2 snapshot", () =>
   const snapshot = buildSnapshot(uiOnly);
   assert.equal(snapshot.schema_version, 2);
   assert.equal(snapshot.contract_id, "verification_contract_v2");
-  assert.equal(snapshot.package.package_id, "verification-spec-v3");
+  assert.equal(snapshot.package.package_id, "verification-spec-v4");
   assert.equal(snapshot.backend_contract.enabled, false);
   assert.match(verificationRunSnapshotSha256(snapshot), /^[a-f0-9]{64}$/);
 
@@ -573,6 +578,291 @@ test("TEST-1705 enforces the lane matrix and immutable schema-2 snapshot", () =>
       .success,
     true,
   );
+});
+
+test("TEST-1706 closes baseline, artifact, cleanup, and v3-read contracts", () => {
+  assert.equal(
+    APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+    "9bb79af8c03d4d9c9c5dc3e815c5784a7f4861e90c89667a40160ffee1b2b2c0",
+  );
+  assert.equal(
+    APPROVED_VERIFICATION_SPEC_SHA256,
+    "8be56f57500ab15ada7bd42b5a6da34c08df8ed27dbced0b7ef70b66d3c18827",
+  );
+
+  const config = validVerificationCoordinatorConfig();
+  assert.equal(config.ui.enabled, true);
+  if (!config.ui.enabled) {
+    assert.fail("fixture UI lane must be enabled");
+  }
+  const imageHashes = ["d".repeat(64), "e".repeat(64), "f".repeat(64)];
+  const entries = config.ui.viewports.map((viewport, index) => {
+    const [width, height] = viewport.split("x").map(Number) as [number, number];
+    const sha256 = imageHashes[index]!;
+    return {
+      case_id: "home-browser",
+      viewport,
+      width,
+      height,
+      path: `objects/sha256/${sha256}.png`,
+      sha256,
+    };
+  });
+  const manifest = verificationApprovedBaselineManifestSchema.parse({
+    schema_version: 1,
+    baseline_id: "baseline-home-v2",
+    approval_id: "11111111-1111-4111-8111-111111111111",
+    approver: "local-user",
+    approved_at_utc: CREATED_AT,
+    source_commit: config.ui.baseline_identity.source_commit,
+    source_tree: config.ui.baseline_identity.source_tree,
+    environment: config.ui.baseline_identity.environment,
+    adapter: {
+      name: config.ui.deterministic_adapter,
+      version: config.ui.deterministic_adapter_version,
+    },
+    browser_build: config.ui.browser_build,
+    entries,
+  });
+  const expectedSetHash = sha256CanonicalJson({
+    source_commit: manifest.source_commit,
+    source_tree: manifest.source_tree,
+    environment: manifest.environment,
+    adapter: manifest.adapter,
+    browser_build: manifest.browser_build,
+    entries: manifest.entries,
+  });
+  assert.equal(verificationBaselineSetSha256(manifest), expectedSetHash);
+  assert.equal(
+    verificationBaselineSetSha256({
+      ...manifest,
+      baseline_id: "renamed-baseline",
+      approval_id: "22222222-2222-4222-8222-222222222222",
+      approver: "other-user",
+      approved_at_utc: "2026-07-27T19:00:00.000Z",
+    }),
+    expectedSetHash,
+  );
+  for (const invalidManifest of [
+    { ...manifest, entries: [...manifest.entries].reverse() },
+    { ...manifest, entries: [manifest.entries[0], manifest.entries[0]] },
+    {
+      ...manifest,
+      entries: [
+        { ...manifest.entries[0]!, width: 376 },
+        ...manifest.entries.slice(1),
+      ],
+    },
+    {
+      ...manifest,
+      entries: [
+        {
+          ...manifest.entries[0]!,
+          path: `objects/sha256/${"0".repeat(64)}.png`,
+        },
+        ...manifest.entries.slice(1),
+      ],
+    },
+    { ...manifest, unexpected: true },
+  ]) {
+    assert.equal(
+      verificationApprovedBaselineManifestSchema.safeParse(invalidManifest)
+        .success,
+      false,
+    );
+  }
+
+  const artifactReference = {
+    artifact_id: "artifact-1706",
+    relative_path: "screenshots/home-browser/375x812.actual.png",
+    sha256: SHA,
+  };
+  const validArtifacts = [
+    {
+      relative_path: artifactReference.relative_path,
+      media_type: "image/png",
+      image_metadata: { width: 375, height: 812 },
+    },
+    {
+      relative_path: "agentic/home-agentic/result.json",
+      media_type: "application/json",
+      image_metadata: null,
+    },
+    {
+      relative_path: "agentic/home-agentic/actions.jsonl",
+      media_type: "application/x-ndjson",
+      image_metadata: null,
+    },
+    {
+      relative_path: "notes/result.txt",
+      media_type: "text/plain",
+      image_metadata: null,
+    },
+    {
+      relative_path: "traces/home-browser/attempt-1.playwright-trace.zip",
+      media_type: "application/zip",
+      image_metadata: null,
+    },
+  ] as const;
+  for (const [index, artifact] of validArtifacts.entries()) {
+    const payload = {
+      kind: "artifact",
+      artifact_id: `artifact-1706-${index}`,
+      ...artifact,
+      byte_length: 1,
+      sha256: SHA,
+    };
+    assert.equal(
+      verificationLinkedRecordSchema.safeParse(
+        recordCase(
+          "artifact",
+          payload,
+          "ui",
+          null,
+          null,
+          [artifactReference],
+        ),
+      ).success,
+      true,
+      artifact.relative_path,
+    );
+  }
+  const validPngPayload = {
+    kind: "artifact",
+    artifact_id: "artifact-current",
+    relative_path: artifactReference.relative_path,
+    media_type: "image/png",
+    byte_length: 1,
+    sha256: SHA,
+    image_metadata: { width: 375, height: 812 },
+  };
+  const invalidArtifacts: Array<Record<string, unknown>> = [
+    { ...validPngPayload, image_metadata: null },
+    { ...validPngPayload, media_type: "application/json" },
+    {
+      ...validPngPayload,
+      relative_path: "traces/home-browser/arbitrary.zip",
+      media_type: "application/zip",
+      image_metadata: null,
+    },
+    {
+      ...validPngPayload,
+      relative_path: "output.bin",
+      media_type: "application/json",
+      image_metadata: null,
+    },
+  ];
+  const missingImageMetadata = { ...validPngPayload };
+  delete (missingImageMetadata as Partial<typeof validPngPayload>).image_metadata;
+  invalidArtifacts.push(missingImageMetadata);
+  for (const payload of invalidArtifacts) {
+    assert.equal(
+      verificationLinkedRecordSchema.safeParse(
+        recordCase(
+          "artifact",
+          payload,
+          "ui",
+          null,
+          null,
+          [artifactReference],
+        ),
+      ).success,
+      false,
+    );
+  }
+
+  const v3Payload = {
+    kind: "artifact",
+    artifact_id: "artifact-v3",
+    relative_path: artifactReference.relative_path,
+    media_type: "image/png",
+    byte_length: 1,
+    sha256: SHA,
+  };
+  assert.equal(
+    verificationLinkedRecordSchema.safeParse({
+      ...recordCase(
+        "artifact",
+        v3Payload,
+        "ui",
+        null,
+        null,
+        [artifactReference],
+      ),
+      package_fingerprint:
+        LEGACY_APPROVED_VERIFICATION_PACKAGE_V3.package_fingerprint,
+    }).success,
+    true,
+  );
+  const v3Snapshot = {
+    ...buildSnapshot(config),
+    package: LEGACY_APPROVED_VERIFICATION_PACKAGE_V3,
+  };
+  assert.equal(verificationRunSnapshotSchema.safeParse(v3Snapshot).success, true);
+  assert.equal(
+    verificationRunSnapshotSchema.safeParse({
+      ...v3Snapshot,
+      package: {
+        ...LEGACY_APPROVED_VERIFICATION_PACKAGE_V3,
+        package_fingerprint: "0".repeat(64),
+      },
+    }).success,
+    false,
+  );
+
+  const pendingAudit = {
+    schema_version: 1,
+    run_id: RUN_ID,
+    snapshot_id: `${RUN_ID}-verification-v2`,
+    artifact_root: `/tmp/ark-team-state/${RUN_ID}/verification`,
+    terminal_report_record_id: "record-report",
+    terminal_report_at: CREATED_AT,
+    terminal_outcome: "passed",
+    terminal_report_sha256: SHA,
+    artifact_record_ids: ["record-artifact"],
+    artifact_manifest_sha256: SHA,
+    artifact_count: 1,
+    total_bytes: 1,
+    baseline_manifest_sha256: expectedSetHash,
+    requested_at_utc: CREATED_AT,
+    destructive_attempt: 1,
+    status: "pending",
+    completed_at_utc: null,
+    error_code: null,
+    error_message: null,
+  } as const;
+  assert.equal(verificationCleanupAuditSchema.safeParse(pendingAudit).success, true);
+  assert.equal(
+    verificationCleanupAuditSchema.safeParse({
+      ...pendingAudit,
+      status: "cleaned",
+      completed_at_utc: "2026-08-26T18:00:00.000Z",
+    }).success,
+    true,
+  );
+  assert.equal(
+    verificationCleanupAuditSchema.safeParse({
+      ...pendingAudit,
+      status: "cleanup_error",
+      completed_at_utc: "2026-08-26T18:00:00.000Z",
+      error_code: "ARTIFACT_ROOT_INVALID",
+      error_message: "registered artifact root could not be removed",
+    }).success,
+    true,
+  );
+  for (const invalidAudit of [
+    { ...pendingAudit, completed_at_utc: CREATED_AT },
+    { ...pendingAudit, status: "cleaned", completed_at_utc: CREATED_AT, error_code: "ARTIFACT_ROOT_INVALID", error_message: "unexpected" },
+    { ...pendingAudit, status: "cleaned", completed_at_utc: CREATED_AT, error_code: "ARTIFACT_ROOT_INVALID" },
+    { ...pendingAudit, status: "cleanup_error", completed_at_utc: CREATED_AT, error_code: "ARTIFACT_ROOT_INVALID" },
+    { ...pendingAudit, artifact_count: 2 },
+    { ...pendingAudit, artifact_record_ids: ["record-artifact", "record-artifact"], artifact_count: 2 },
+  ]) {
+    assert.equal(
+      verificationCleanupAuditSchema.safeParse(invalidAudit).success,
+      false,
+    );
+  }
 });
 
 function buildSnapshot(config: unknown) {

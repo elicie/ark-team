@@ -605,6 +605,124 @@ const exactVersionSchema = z
     "version must be exact",
   );
 
+const BASELINE_VIEWPORT_DIMENSIONS = Object.freeze({
+  "375x812": Object.freeze({ width: 375, height: 812 }),
+  "768x1024": Object.freeze({ width: 768, height: 1_024 }),
+  "1440x900": Object.freeze({ width: 1_440, height: 900 }),
+});
+const BASELINE_VIEWPORT_ORDER = new Map(
+  ["375x812", "768x1024", "1440x900"].map((viewport, index) => [
+    viewport,
+    index,
+  ]),
+);
+
+export const verificationApprovedBaselineEntrySchema = z
+  .object({
+    case_id: identifierSchema,
+    viewport: z.enum(["375x812", "768x1024", "1440x900"]),
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+    path: z
+      .string()
+      .regex(/^objects\/sha256\/[a-f0-9]{64}\.png$/),
+    sha256: sha256Schema,
+  })
+  .strict()
+  .superRefine((entry, context) => {
+    const expectedDimensions = BASELINE_VIEWPORT_DIMENSIONS[entry.viewport];
+    if (
+      entry.width !== expectedDimensions.width ||
+      entry.height !== expectedDimensions.height
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["width"],
+        message: "baseline image dimensions do not match the viewport",
+      });
+    }
+    if (entry.path !== `objects/sha256/${entry.sha256}.png`) {
+      context.addIssue({
+        code: "custom",
+        path: ["path"],
+        message: "baseline object path does not match its PNG hash",
+      });
+    }
+  });
+
+export type VerificationApprovedBaselineEntry = z.infer<
+  typeof verificationApprovedBaselineEntrySchema
+>;
+
+export const verificationApprovedBaselineManifestSchema = z
+  .object({
+    schema_version: z.literal(1),
+    baseline_id: identifierSchema,
+    approval_id: identifierSchema,
+    approver: boundedStringSchema,
+    approved_at_utc: z.string().datetime({ offset: true }),
+    source_commit: shaSchema,
+    source_tree: shaSchema,
+    environment: browserEnvironmentSchema,
+    adapter: z
+      .object({
+        name: identifierSchema,
+        version: exactVersionSchema,
+      })
+      .strict(),
+    browser_build: exactVersionSchema,
+    entries: z
+      .array(verificationApprovedBaselineEntrySchema)
+      .min(1)
+      .max(150),
+  })
+  .strict()
+  .superRefine((manifest, context) => {
+    addDuplicateIssues(
+      manifest.entries.map((entry) => `${entry.case_id}\0${entry.viewport}`),
+      context,
+      ["entries"],
+    );
+    for (let index = 1; index < manifest.entries.length; index += 1) {
+      const previous = manifest.entries[index - 1]!;
+      const current = manifest.entries[index]!;
+      const caseOrder = Buffer.compare(
+        Buffer.from(previous.case_id, "utf8"),
+        Buffer.from(current.case_id, "utf8"),
+      );
+      const viewportOrder =
+        (BASELINE_VIEWPORT_ORDER.get(previous.viewport) ?? -1) -
+        (BASELINE_VIEWPORT_ORDER.get(current.viewport) ?? -1);
+      if (caseOrder > 0 || (caseOrder === 0 && viewportOrder >= 0)) {
+        context.addIssue({
+          code: "custom",
+          path: ["entries", index],
+          message:
+            "baseline entries must be sorted bytewise by case and then by viewport order",
+        });
+        break;
+      }
+    }
+  });
+
+export type VerificationApprovedBaselineManifest = z.infer<
+  typeof verificationApprovedBaselineManifestSchema
+>;
+
+export function verificationBaselineSetSha256(
+  input: VerificationApprovedBaselineManifest,
+): string {
+  const manifest = verificationApprovedBaselineManifestSchema.parse(input);
+  return sha256CanonicalJson({
+    source_commit: manifest.source_commit,
+    source_tree: manifest.source_tree,
+    environment: manifest.environment,
+    adapter: manifest.adapter,
+    browser_build: manifest.browser_build,
+    entries: manifest.entries,
+  });
+}
+
 const modelIdentitySchema = exactVersionSchema.refine(
   (value) => !/^(?:auto|default|fallback)$/i.test(value),
   "model identity must be explicit",
@@ -1246,6 +1364,80 @@ const verificationErrorCodeSchema = z.enum([
   "INVALID_RECORD",
 ]);
 
+export const verificationCleanupAuditSchema = z
+  .object({
+    schema_version: z.literal(1),
+    run_id: z.string().regex(RUN_ID_PATTERN),
+    snapshot_id: identifierSchema,
+    artifact_root: z
+      .string()
+      .min(1)
+      .refine(
+        (value) =>
+          path.isAbsolute(value) &&
+          path.normalize(value) === value &&
+          path.resolve(value) === value,
+        "artifact_root must be absolute and canonical",
+      ),
+    terminal_report_record_id: identifierSchema,
+    terminal_report_at: z.string().datetime({ offset: true }),
+    terminal_outcome: verificationOutcomeSchema,
+    terminal_report_sha256: sha256Schema,
+    artifact_record_ids: z.array(identifierSchema).max(500),
+    artifact_manifest_sha256: sha256Schema,
+    artifact_count: z.number().int().nonnegative().max(500),
+    total_bytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(500 * 1_024 * 1_024),
+    baseline_manifest_sha256: sha256Schema.nullable(),
+    requested_at_utc: z.string().datetime({ offset: true }),
+    destructive_attempt: z.literal(1),
+    status: z.enum(["pending", "cleaned", "cleanup_error"]),
+    completed_at_utc: z.string().datetime({ offset: true }).nullable(),
+    error_code: z.literal("ARTIFACT_ROOT_INVALID").nullable(),
+    error_message: boundedStringSchema.nullable(),
+  })
+  .strict()
+  .superRefine((audit, context) => {
+    addDuplicateIssues(audit.artifact_record_ids, context, [
+      "artifact_record_ids",
+    ]);
+    if (audit.artifact_count !== audit.artifact_record_ids.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifact_count"],
+        message: "artifact count does not match artifact record IDs",
+      });
+    }
+    const isPending = audit.status === "pending";
+    const isError = audit.status === "cleanup_error";
+    if (isPending !== (audit.completed_at_utc === null)) {
+      context.addIssue({
+        code: "custom",
+        path: ["completed_at_utc"],
+        message: "cleanup completion time does not match audit status",
+      });
+    }
+    if (
+      (isError &&
+        (audit.error_code === null || audit.error_message === null)) ||
+      (!isError &&
+        (audit.error_code !== null || audit.error_message !== null))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["error_code"],
+        message: "cleanup error provenance does not match audit status",
+      });
+    }
+  });
+
+export type VerificationCleanupAudit = z.infer<
+  typeof verificationCleanupAuditSchema
+>;
+
 const closedAgenticVerdictSchema = z.enum([
   "achieved",
   "not_achieved",
@@ -1372,6 +1564,14 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
       ]),
       byte_length: z.number().int().positive().max(50 * 1_024 * 1_024),
       sha256: sha256Schema,
+      image_metadata: z
+        .object({
+          width: z.number().int().positive(),
+          height: z.number().int().positive(),
+        })
+        .strict()
+        .nullable()
+        .optional(),
     })
     .strict()
     .superRefine((artifact, context) => {
@@ -1655,6 +1855,57 @@ export const verificationLinkedRecordV2Schema = z
         message: "artifact-linked record has no artifact reference",
       });
     }
+    if (
+      record.package_fingerprint !==
+        LEGACY_APPROVED_VERIFICATION_PACKAGE_V3.package_fingerprint &&
+      record.payload.kind === "artifact"
+    ) {
+      const artifact = record.payload;
+      if (artifact.image_metadata === undefined) {
+        context.addIssue({
+          code: "custom",
+          path: ["payload", "image_metadata"],
+          message: "schema-2 v4 artifact records require image metadata",
+        });
+        return;
+      }
+      const expectedMediaType = artifact.relative_path.endsWith(
+        ".playwright-trace.zip",
+      )
+        ? "application/zip"
+        : artifact.relative_path.endsWith(".png")
+          ? "image/png"
+          : artifact.relative_path.endsWith(".jsonl")
+            ? "application/x-ndjson"
+            : artifact.relative_path.endsWith(".json")
+              ? "application/json"
+              : artifact.relative_path.endsWith(".txt")
+                ? "text/plain"
+                : null;
+      if (expectedMediaType === null) {
+        context.addIssue({
+          code: "custom",
+          path: ["payload", "relative_path"],
+          message: "artifact suffix is not supported",
+        });
+      } else if (artifact.media_type !== expectedMediaType) {
+        context.addIssue({
+          code: "custom",
+          path: ["payload", "media_type"],
+          message: "artifact media type does not match its exact suffix",
+        });
+      }
+      if (
+        (artifact.media_type === "image/png") !==
+        (artifact.image_metadata !== null)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["payload", "image_metadata"],
+          message: "PNG artifacts require dimensions and other artifacts forbid them",
+        });
+      }
+    }
   });
 
 export const verificationLinkedRecordSchema = z.union([
@@ -1794,29 +2045,64 @@ const LEGACY_APPROVED_VERIFICATION_PACKAGE = Object.freeze({
     "277fb413390f83f49fdf34fab4a42e3eca83d3f499fe5442e884f165a0128399",
 }) satisfies z.infer<typeof legacyVerificationPackageIdentitySchema>;
 
-export const verificationPackageIdentitySchema = z
+export const verificationPackageIdentityV3Schema = z
   .object({
     package_id: z.literal("verification-spec-v3"),
     package_status: z.literal("SPEC_APPROVED"),
-    package_fingerprint: sha256Schema,
+    package_fingerprint: z.literal(
+      "af32edde6b11335892ad1f7777f80fd30b66bb239c1a82e95fd3f4bbcfc5e58c",
+    ),
     authority_date: z.literal("2026-07-27"),
     reference_boundary: z.literal("NONE"),
-    spec_sha256: sha256Schema,
+    spec_sha256: z.literal(
+      "1392eb7604eb6d3f2dedc50d2810070f7467d1bad1c8dc9bd05471b83828441c",
+    ),
   })
   .strict();
 
-export const APPROVED_VERIFICATION_SPEC_SHA256 =
-  "1392eb7604eb6d3f2dedc50d2810070f7467d1bad1c8dc9bd05471b83828441c";
-
-export const APPROVED_VERIFICATION_PACKAGE = Object.freeze({
+export const LEGACY_APPROVED_VERIFICATION_PACKAGE_V3 = Object.freeze({
   package_id: "verification-spec-v3",
   package_status: "SPEC_APPROVED",
   package_fingerprint:
     "af32edde6b11335892ad1f7777f80fd30b66bb239c1a82e95fd3f4bbcfc5e58c",
   authority_date: "2026-07-27",
   reference_boundary: "NONE",
+  spec_sha256:
+    "1392eb7604eb6d3f2dedc50d2810070f7467d1bad1c8dc9bd05471b83828441c",
+}) satisfies z.infer<typeof verificationPackageIdentityV3Schema>;
+
+export const verificationPackageIdentityV4Schema = z
+  .object({
+    package_id: z.literal("verification-spec-v4"),
+    package_status: z.literal("SPEC_APPROVED"),
+    package_fingerprint: z.literal(
+      "9bb79af8c03d4d9c9c5dc3e815c5784a7f4861e90c89667a40160ffee1b2b2c0",
+    ),
+    authority_date: z.literal("2026-07-27"),
+    reference_boundary: z.literal("NONE"),
+    spec_sha256: z.literal(
+      "8be56f57500ab15ada7bd42b5a6da34c08df8ed27dbced0b7ef70b66d3c18827",
+    ),
+  })
+  .strict();
+
+export const verificationPackageIdentitySchema = z.union([
+  verificationPackageIdentityV3Schema,
+  verificationPackageIdentityV4Schema,
+]);
+
+export const APPROVED_VERIFICATION_SPEC_SHA256 =
+  "8be56f57500ab15ada7bd42b5a6da34c08df8ed27dbced0b7ef70b66d3c18827";
+
+export const APPROVED_VERIFICATION_PACKAGE = Object.freeze({
+  package_id: "verification-spec-v4",
+  package_status: "SPEC_APPROVED",
+  package_fingerprint:
+    "9bb79af8c03d4d9c9c5dc3e815c5784a7f4861e90c89667a40160ffee1b2b2c0",
+  authority_date: "2026-07-27",
+  reference_boundary: "NONE",
   spec_sha256: APPROVED_VERIFICATION_SPEC_SHA256,
-}) satisfies z.infer<typeof verificationPackageIdentitySchema>;
+}) satisfies z.infer<typeof verificationPackageIdentityV4Schema>;
 
 const verificationServerSnapshotSchema = z
   .object({
@@ -2048,14 +2334,17 @@ export const verificationRunSnapshotV2Schema = z
   })
   .strict()
   .superRefine((snapshot, context) => {
+    const packageIdentity = canonicalJson(snapshot.package);
     if (
-      canonicalJson(snapshot.package) !==
-      canonicalJson(APPROVED_VERIFICATION_PACKAGE)
+      packageIdentity !== canonicalJson(APPROVED_VERIFICATION_PACKAGE) &&
+      packageIdentity !==
+        canonicalJson(LEGACY_APPROVED_VERIFICATION_PACKAGE_V3)
     ) {
       context.addIssue({
         code: "custom",
         path: ["package"],
-        message: "snapshot package does not match the approved package",
+        message:
+          "snapshot package does not match an exact approved compatibility identity",
       });
     }
     if (
