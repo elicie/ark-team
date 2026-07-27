@@ -109,29 +109,35 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
   if (snapshot === null) {
     throw new Error("verification snapshot was not persisted");
   }
+  assert.equal(snapshot.schema_version, 2);
   const errorPayload = {
     kind: "error" as const,
     code: "SOURCE_DRIFT" as const,
     message: "bounded test diagnostic",
   };
   const errorRecord = {
-    schema_version: 1 as const,
+    schema_version: 2 as const,
+    contract_id: "verification_contract_v2" as const,
     record_id: `${created.run_id}-error`,
     record_type: "error" as const,
     run_id: created.run_id,
     case_id: snapshot.case_id,
     snapshot_id: snapshot.snapshot_id,
+    lane: null,
     stage: "snapshotted" as const,
     timestamp_utc: "2026-07-26T18:00:01.000Z",
     source_fingerprint: snapshot.source_fingerprint,
     package_fingerprint: snapshot.package.package_fingerprint,
-    required: true,
+    lane_required: null,
+    check_id: null,
+    check_required: true,
     previous_record_sha256: sha256CanonicalJson(
       recorded.verification_records.at(-1),
     ),
     payload_sha256: sha256CanonicalJson(errorPayload),
     payload: errorPayload,
     adapter: null,
+    model: null,
     artifact_references: [],
   };
   const withEvidence = await store.appendVerificationRecord(
@@ -151,6 +157,134 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
       }),
     (error: unknown) =>
       error instanceof ArkTeamError && error.code === "INVALID_RECORD",
+  );
+  await assert.rejects(
+    () =>
+      store.appendVerificationRecord(created.run_id, {
+        ...errorRecord,
+        record_id: `${created.run_id}-lane-downgrade`,
+        lane: "backend",
+        lane_required: false,
+        previous_record_sha256: sha256CanonicalJson(
+          withEvidence.verification_records.at(-1),
+        ),
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_RECORD",
+  );
+  const requestPayload = {
+    kind: "request" as const,
+    method: "GET" as const,
+    path: "/",
+    expected_status: 200,
+    actual_status: 200,
+    request_sha256: "c".repeat(64),
+    response_sha256: "d".repeat(64),
+  };
+  const requestRecord = {
+    ...errorRecord,
+    record_id: `${created.run_id}-request`,
+    record_type: "request" as const,
+    lane: "backend" as const,
+    lane_required: true,
+    check_id: "home-api",
+    check_required: true,
+    previous_record_sha256: sha256CanonicalJson(
+      withEvidence.verification_records.at(-1),
+    ),
+    payload_sha256: sha256CanonicalJson(requestPayload),
+    payload: requestPayload,
+    adapter: { name: "curl", version: "8.14.1" },
+  };
+  await assert.rejects(
+    () =>
+      store.appendVerificationRecord(created.run_id, {
+        ...requestRecord,
+        record_id: `${created.run_id}-required-downgrade`,
+        check_required: false,
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_RECORD",
+  );
+  await assert.rejects(
+    () =>
+      store.appendVerificationRecord(created.run_id, {
+        ...requestRecord,
+        record_id: `${created.run_id}-unknown-check`,
+        check_id: "unknown-api",
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_RECORD",
+  );
+  await assert.rejects(
+    () =>
+      store.appendVerificationRecord(created.run_id, {
+        ...requestRecord,
+        record_id: `${created.run_id}-adapter-drift`,
+        adapter: { name: "curl", version: "8.14.2" },
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_RECORD",
+  );
+  const withRequestEvidence = await store.appendVerificationRecord(
+    created.run_id,
+    requestRecord,
+  );
+  assert.equal(
+    withRequestEvidence.verification_records.at(-1)?.record_id,
+    requestRecord.record_id,
+  );
+  assert.equal(snapshot.ui_contract.enabled, true);
+  if (!snapshot.ui_contract.enabled) {
+    throw new Error("UI verification contract was not enabled");
+  }
+  const browserCase = snapshot.ui_contract.browser_cases[0];
+  if (browserCase === undefined) {
+    throw new Error("browser verification case was not snapshotted");
+  }
+  const browserPayload = {
+    kind: "browser" as const,
+    case_sha256: sha256CanonicalJson(browserCase),
+    action_count: 0,
+    assertion_count: 1,
+  };
+  const browserRecord = {
+    ...errorRecord,
+    record_id: `${created.run_id}-browser`,
+    record_type: "browser" as const,
+    lane: "ui" as const,
+    lane_required: true,
+    check_id: browserCase.id,
+    check_required: browserCase.required,
+    previous_record_sha256: sha256CanonicalJson(
+      withRequestEvidence.verification_records.at(-1),
+    ),
+    payload_sha256: sha256CanonicalJson(browserPayload),
+    payload: browserPayload,
+    adapter: { name: "playwright-cli", version: "1.62.0" },
+  };
+  const wrongBrowserPayload = {
+    ...browserPayload,
+    case_sha256: "f".repeat(64),
+  };
+  await assert.rejects(
+    () =>
+      store.appendVerificationRecord(created.run_id, {
+        ...browserRecord,
+        record_id: `${created.run_id}-browser-case-drift`,
+        payload: wrongBrowserPayload,
+        payload_sha256: sha256CanonicalJson(wrongBrowserPayload),
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_RECORD",
+  );
+  const withBrowserEvidence = await store.appendVerificationRecord(
+    created.run_id,
+    browserRecord,
+  );
+  assert.equal(
+    withBrowserEvidence.verification_records.at(-1)?.record_id,
+    browserRecord.record_id,
   );
   const packageDrift = new RunStore({
     root_path: stateRoot,
@@ -188,7 +322,10 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
       error instanceof ArkTeamError && error.code === "SOURCE_DRIFT",
   );
 
-  config.verification.coordinator.baseline_identity.id = "mutated-input";
+  assert.equal(config.verification.coordinator.ui.enabled, true);
+  if (config.verification.coordinator.ui.enabled) {
+    config.verification.coordinator.ui.baseline_identity.id = "mutated-input";
+  }
   let replaySourceReads = 0;
   const reopened = new RunStore({
     root_path: stateRoot,
@@ -200,8 +337,8 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
   });
   const beforeReplay = await reopened.getRun(created.run_id);
   assert.equal(
-    beforeReplay.verification_snapshot?.baseline_identity.id,
-    "baseline-home-v1",
+    beforeReplay.verification_snapshot?.baseline_identity?.id,
+    "baseline-home-v2",
   );
   const replayed = await reopened.recordVerificationSnapshot(created.run_id, {
     package_fingerprint:
@@ -223,12 +360,45 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
         server_port: 10_002,
       }),
     (error: unknown) =>
-      error instanceof ArkTeamError &&
-      error.code === "SCENARIO_SNAPSHOT_MISMATCH",
+      error instanceof ArkTeamError && error.code === "SOURCE_DRIFT",
   );
 
   const recordPath = path.join(stateRoot, created.run_id, "run.json");
   const validRecord = await readFile(recordPath, "utf8");
+  const requirednessDrift = JSON.parse(validRecord) as {
+    run: {
+      verification_records: Array<{
+        record_type: string;
+        check_required: boolean;
+        previous_record_sha256: string | null;
+      }>;
+    };
+  };
+  const persistedRequest = requirednessDrift.run.verification_records.find(
+    (record) => record.record_type === "request",
+  );
+  if (persistedRequest === undefined) {
+    throw new Error("request verification record was not persisted");
+  }
+  persistedRequest.check_required = false;
+  requirednessDrift.run.verification_records.forEach(
+    (record, index, records) => {
+      record.previous_record_sha256 =
+        index === 0 ? null : sha256CanonicalJson(records[index - 1]);
+    },
+  );
+  await writeFile(
+    recordPath,
+    `${JSON.stringify(requirednessDrift, null, 2)}\n`,
+    "utf8",
+  );
+  await assert.rejects(
+    () => reopened.getRun(created.run_id),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "CORRUPT_STATE",
+  );
+  await writeFile(recordPath, validRecord, "utf8");
+
   const linkDrift = JSON.parse(validRecord) as {
     run: {
       verification_records: Array<{
@@ -317,6 +487,8 @@ test("TEST-1705 rollback disables new snapshots and preserves existing evidence"
   const rollback = await store.recordVerificationRollback({
     reason: "operator disabled new verification starts",
   });
+  assert.equal(rollback.schema_version, 2);
+  assert.equal(rollback.contract_id, "verification_contract_v2");
   assert.equal(rollback.new_starts_enabled, false);
   assert.equal(rollback.preserves_existing_records, true);
 

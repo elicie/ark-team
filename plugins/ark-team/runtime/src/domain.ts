@@ -21,6 +21,7 @@ import {
 import {
   sha256CanonicalJson,
   verificationLinkedRecordSchema,
+  verificationRecordMatchesSnapshot,
   verificationRunSnapshotSchema,
   verificationRunSnapshotSha256,
 } from "./verification-contract.js";
@@ -581,13 +582,19 @@ export const runRecordSchema = z
           message: "verification snapshot belongs to another run",
         });
       }
-      if (
-        run.verification_snapshot.baseline_root !==
-        path.resolve(
-          run.project_path,
-          run.verification_snapshot.resolved_config.baseline_root,
-        )
-      ) {
+      const expectedBaselineRoot =
+        run.verification_snapshot.schema_version === 1
+          ? path.resolve(
+              run.project_path,
+              run.verification_snapshot.resolved_config.baseline_root,
+            )
+          : run.verification_snapshot.resolved_config.ui.enabled
+            ? path.resolve(
+                run.project_path,
+                run.verification_snapshot.resolved_config.ui.baseline_root,
+              )
+            : null;
+      if (run.verification_snapshot.baseline_root !== expectedBaselineRoot) {
         context.addIssue({
           code: "custom",
           path: ["verification_snapshot", "baseline_root"],
@@ -688,6 +695,7 @@ export const runRecordSchema = z
       let previousRecordHash: string | null = null;
       run.verification_records.forEach((record, index) => {
         if (
+          record.schema_version !== snapshot.schema_version ||
           record.run_id !== run.run_id ||
           record.case_id !== snapshot.case_id ||
           record.snapshot_id !== snapshot.snapshot_id ||
@@ -698,6 +706,14 @@ export const runRecordSchema = z
             code: "custom",
             path: ["verification_records", index],
             message: "verification record linkage does not match the run snapshot",
+          });
+        }
+        if (!verificationRecordMatchesSnapshot(snapshot, record)) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_records", index],
+            message:
+              "verification record check provenance does not match the run snapshot",
           });
         }
         if (record.previous_record_sha256 !== previousRecordHash) {
@@ -723,7 +739,8 @@ export const runRecordSchema = z
           }
         }
         if (
-          record.payload.kind === "report" &&
+          (record.payload.kind === "report" ||
+            record.payload.kind === "lane_summary") &&
           record.payload.evidence_record_ids.some(
             (recordId) =>
               recordId === record.record_id || !recordIds.has(recordId),
