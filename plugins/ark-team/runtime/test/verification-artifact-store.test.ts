@@ -831,17 +831,105 @@ async function createCleanupRun(
     },
   );
   const snapshot = requireV2Snapshot(written.run);
-  for (const stage of ["capabilities", "ready", "executing"] as const) {
-    const advanced = await fixture.store.advanceVerificationState(
-      written.run.run_id,
-      stage,
-    );
-    assert.equal(advanced.accepted, true);
-  }
-  assert.equal(snapshot.backend_contract.enabled, true);
-  assert.equal(snapshot.ui_contract.enabled, true);
   if (!snapshot.backend_contract.enabled || !snapshot.ui_contract.enabled) {
     assert.fail("cleanup fixture requires both verification lanes");
+  }
+  const backendContract = snapshot.backend_contract;
+  const uiContract = snapshot.ui_contract;
+  assert.equal(
+    (
+      await fixture.store.advanceVerificationState(
+        written.run.run_id,
+        "capabilities",
+      )
+    ).accepted,
+    true,
+  );
+  await fixture.store.recordVerificationAttempt(written.run.run_id, {
+    action_id: `${label}-readiness`,
+    kind: "readiness",
+    lane: null,
+    check_id: null,
+    input_sha256: sha256CanonicalJson({ contract: "fixture-readiness" }),
+    evidence_record_ids: [],
+  });
+  const capabilityRecordIds: string[] = [];
+  const demands = [
+    ...backendContract.required_capabilities.map((capability) => ({
+          lane: "backend" as const,
+          laneRequired: backendContract.required,
+          capability,
+          capabilityRequired: true,
+        })),
+    ...uiContract.required_capabilities.map((capability) => ({
+            lane: "ui" as const,
+            laneRequired: uiContract.required,
+            capability,
+            capabilityRequired: true,
+          })),
+    ...uiContract.optional_capabilities.map((capability) => ({
+            lane: "ui" as const,
+            laneRequired: uiContract.required,
+            capability,
+            capabilityRequired: false,
+          })),
+  ];
+  let readinessRun = written.run;
+  for (const [index, demand] of demands.entries()) {
+    const payload = {
+      kind: "capability" as const,
+      capability: demand.capability,
+      available: true,
+      version: "1.0.0",
+      diagnostic: "fixture capability available",
+    };
+    const record = await fixture.store.appendVerificationRecord(
+      written.run.run_id,
+      {
+        schema_version: 2,
+        contract_id: "verification_contract_v2",
+        record_id: `${label}-capability-${index}`,
+        record_type: "capability",
+        run_id: written.run.run_id,
+        case_id: snapshot.case_id,
+        check_id: null,
+        snapshot_id: snapshot.snapshot_id,
+        lane: demand.lane,
+        stage: "capabilities",
+        timestamp_utc: new Date(TERMINAL_REPORT_AT).toISOString(),
+        source_fingerprint: snapshot.source_fingerprint,
+        package_fingerprint: snapshot.package.package_fingerprint,
+        lane_required: demand.laneRequired,
+        check_required: demand.capabilityRequired,
+        previous_record_sha256: sha256CanonicalJson(
+          readinessRun.verification_records.at(-1),
+        ),
+        payload_sha256: sha256CanonicalJson(payload),
+        payload,
+        adapter: { name: "fixture-probe", version: "1.0.0" },
+        model: null,
+        artifact_references: [],
+      },
+    );
+    readinessRun = record;
+    capabilityRecordIds.push(record.verification_records.at(-1)!.record_id);
+  }
+  await fixture.store.completeVerificationAttempt(written.run.run_id, {
+    action_id: `${label}-readiness`,
+    evidence_record_ids: capabilityRecordIds,
+    error_code: null,
+    message: null,
+  });
+  for (const stage of ["ready", "executing"] as const) {
+    assert.equal(
+      (
+        await fixture.store.advanceVerificationState(
+          written.run.run_id,
+          stage,
+        )
+      ).accepted,
+      true,
+    );
   }
   const backendProbe = snapshot.backend_contract.api_probes[0];
   const browserCase = snapshot.ui_contract.browser_cases[0];
@@ -857,6 +945,7 @@ async function createCleanupRun(
     request_sha256: "c".repeat(64),
     response_sha256: "d".repeat(64),
   };
+  const readyRun = await fixture.store.getRun(written.run.run_id);
   const backendRecord: VerificationLinkedRecord = {
     schema_version: 2,
     contract_id: "verification_contract_v2",
@@ -874,7 +963,7 @@ async function createCleanupRun(
     lane_required: snapshot.backend_contract.required,
     check_required: backendProbe.required,
     previous_record_sha256: sha256CanonicalJson(
-      written.run.verification_records.at(-1),
+      readyRun.verification_records.at(-1),
     ),
     payload_sha256: sha256CanonicalJson(backendPayload),
     payload: backendPayload,

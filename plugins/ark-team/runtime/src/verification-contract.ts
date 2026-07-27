@@ -17,6 +17,18 @@ const SECRET_PATTERN =
   /(?:api[_-]?key|authorization|cookie|password|secret|token)\s*(?:=|:)/i;
 const SECRET_ARGUMENT_PATTERN =
   /^(?:--?)?(?:api[_-]?key|authorization|cookie|password|secret|token)(?:$|[=:])/i;
+const FORBIDDEN_LOCAL_SERVER_TOKENS = new Set([
+  "ansible",
+  "docker",
+  "docker-compose",
+  "helm",
+  "kubectl",
+  "podman",
+  "scp",
+  "ssh",
+  "terraform",
+  "tofu",
+]);
 
 const boundedStringSchema = z
   .string()
@@ -119,6 +131,8 @@ const capabilitySchema = z.enum([
   "semantic_review",
   "server",
 ]);
+
+export type VerificationCapability = z.infer<typeof capabilitySchema>;
 
 const capabilityListSchema = z
   .array(capabilitySchema)
@@ -990,11 +1004,40 @@ export const verificationCoordinatorConfigV2Schema = z
       });
     }
     config.server_argv.forEach((argument, index) => {
+      const normalized = argument.trim().toLowerCase();
       if (SECRET_ARGUMENT_PATTERN.test(argument)) {
         context.addIssue({
           code: "custom",
           path: ["server_argv", index],
           message: "server_argv must not contain credential arguments",
+        });
+      }
+      if (
+        FORBIDDEN_LOCAL_SERVER_TOKENS.has(path.basename(normalized)) ||
+        FORBIDDEN_LOCAL_SERVER_TOKENS.has(normalized)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["server_argv", index],
+          message:
+            "server_argv must not invoke Docker, remote, or infrastructure tools",
+        });
+      }
+      if (
+        normalized === "3000" ||
+        /^--?port(?:=|:)3000$/.test(normalized)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["server_argv", index],
+          message: "server_argv must not select port 3000",
+        });
+      }
+      if (/^(?:https?|wss?):\/\//.test(normalized)) {
+        context.addIssue({
+          code: "custom",
+          path: ["server_argv", index],
+          message: "server_argv must not target a remote service",
         });
       }
     });
@@ -1736,6 +1779,7 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
       capability: capabilitySchema,
       available: z.boolean(),
       version: exactVersionSchema.nullable(),
+      diagnostic: boundedStringSchema.optional(),
     })
     .strict()
     .superRefine((capability, context) => {
@@ -1744,6 +1788,17 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
           code: "custom",
           path: ["version"],
           message: "available capability requires an exact version",
+        });
+      }
+      if (
+        capability.diagnostic !== undefined &&
+        !capability.available &&
+        capability.version !== null
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["version"],
+          message: "new unavailable capability evidence cannot claim a version",
         });
       }
     }),
@@ -1893,8 +1948,46 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
       evidence_record_ids: z.array(identifierSchema).max(500).optional(),
       outcome: verificationOutcomeSchema.optional(),
       integrity_failure: z.boolean().optional(),
+      approval_id: z.string().uuid().optional(),
+      request_sha256: sha256Schema.optional(),
+      capability: capabilitySchema.optional(),
+      capability_required: z.boolean().optional(),
     })
-    .strict(),
+    .strict()
+    .superRefine((error, context) => {
+      if (
+        error.approval_id !== undefined &&
+        (error.code !== "APPROVAL_REQUIRED" ||
+          error.outcome !== "error" ||
+          error.integrity_failure !== false ||
+          error.request_sha256 === undefined)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["approval_id"],
+          message:
+            "approval IDs require an APPROVAL_REQUIRED security error disposition",
+        });
+      }
+      if (
+        (error.capability !== undefined ||
+          error.capability_required !== undefined) &&
+        (!["CAPABILITY_UNAVAILABLE", "SERVER_NOT_READY"].includes(
+          error.code,
+        ) ||
+          error.capability === undefined ||
+          error.capability_required === undefined ||
+          (error.code === "SERVER_NOT_READY" &&
+            error.capability !== "server"))
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["capability"],
+          message:
+            "capability markers require a complete local capability failure scope",
+        });
+      }
+    }),
   z
     .object({
       kind: z.literal("report"),
@@ -2234,10 +2327,38 @@ export function verificationEvidenceDisposition(
       };
     case "capability":
       return {
-        outcome: record.payload.available ? "passed" : "unavailable",
+        outcome: record.payload.available
+          ? "passed"
+          : record.schema_version === 2 &&
+              record.payload.diagnostic !== undefined &&
+              !(record.lane_required === true && record.check_required)
+            ? "skipped"
+            : "unavailable",
         integrity_failure: false,
       };
     case "error":
+      if (
+        record.schema_version === 2 &&
+        record.payload.code === "APPROVAL_REQUIRED" &&
+        record.payload.approval_id !== undefined
+      ) {
+        return { outcome: "error", integrity_failure: false };
+      }
+      if (
+        record.schema_version === 2 &&
+        ["CAPABILITY_UNAVAILABLE", "SERVER_NOT_READY"].includes(
+          record.payload.code,
+        ) &&
+        record.payload.capability !== undefined &&
+        record.payload.capability_required !== undefined &&
+        !(
+          record.lane_required === true &&
+          record.check_required &&
+          record.payload.capability_required
+        )
+      ) {
+        return { outcome: "skipped", integrity_failure: false };
+      }
       return verificationErrorDisposition(record.payload.code);
     default:
       return null;
@@ -2841,6 +2962,38 @@ export function verificationRecordMatchesSnapshot(
     return false;
   }
   if (record.record_type === "error") {
+    if (
+      record.payload.kind === "error" &&
+      record.payload.capability !== undefined
+    ) {
+      if (record.lane === null) {
+        return false;
+      }
+      const declaredCapabilities =
+        record.lane === "backend" && snapshot.backend_contract.enabled
+          ? snapshot.backend_contract.required_capabilities
+          : record.lane === "ui" && snapshot.ui_contract.enabled
+            ? [
+                ...snapshot.ui_contract.required_capabilities,
+                ...snapshot.ui_contract.optional_capabilities,
+              ]
+            : [];
+      if (!declaredCapabilities.includes(record.payload.capability)) {
+        return false;
+      }
+      const requiredCapabilities =
+        record.lane === "backend" && snapshot.backend_contract.enabled
+          ? snapshot.backend_contract.required_capabilities
+          : record.lane === "ui" && snapshot.ui_contract.enabled
+            ? snapshot.ui_contract.required_capabilities
+            : [];
+      if (
+        record.payload.capability_required !==
+        requiredCapabilities.includes(record.payload.capability)
+      ) {
+        return false;
+      }
+    }
     if (record.check_id === null) {
       return true;
     }

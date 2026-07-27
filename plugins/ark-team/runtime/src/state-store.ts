@@ -79,6 +79,7 @@ import {
   sha256CanonicalJson,
   type VerificationApprovedBaselineManifest,
   type VerificationActionKind,
+  type VerificationCapability,
   type VerificationCleanupAudit,
   type VerificationErrorCode,
   type VerificationLaneDecisionInput,
@@ -187,6 +188,7 @@ export interface CompleteVerificationAttemptInput {
   evidence_record_ids: string[];
   error_code: VerificationErrorCode | null;
   message: string | null;
+  capability?: VerificationCapability;
 }
 
 export interface CompleteVerificationAttemptResult {
@@ -199,11 +201,23 @@ export interface RecordVerificationActionErrorInput {
   action_id: string;
   code: VerificationErrorCode;
   message: string;
+  capability?: VerificationCapability;
 }
 
 export interface RecordVerificationActionErrorResult {
   run: RunRecord;
   record: VerificationLinkedRecord;
+}
+
+export interface TerminateVerificationForApprovalInput {
+  request_sha256: string;
+  message: string;
+}
+
+export interface TerminateVerificationForApprovalResult {
+  run: RunRecord;
+  error_record: VerificationLinkedRecord;
+  report_record: VerificationLinkedRecord;
 }
 
 export interface FinalizeVerificationInput {
@@ -926,6 +940,39 @@ export class RunStore {
         await this.writePersistedRun({ ...persisted, run });
         return { run, accepted: false, error_record: errorRecord };
       }
+      if (
+        verificationState.current_state === "capabilities" &&
+        nextState === "ready"
+      ) {
+        try {
+          assertCompleteVerificationCapabilityMatrix(persisted.run);
+        } catch (error) {
+          const timestamp = this.now().toISOString();
+          const errorRecord = createVerificationCoordinatorErrorRecord({
+            run: persisted.run,
+            timestamp,
+            code: "INVALID_RECORD",
+            message:
+              error instanceof Error
+                ? error.message
+                : "verification capability discovery is incomplete",
+            attempt_count: 1,
+            evidence_record_ids: [],
+          });
+          const verificationRecords = appendVerificationLinkedRecord(
+            persisted.run.verification_records,
+            errorRecord,
+          );
+          const run: RunRecord = {
+            ...persisted.run,
+            updated_at: timestamp,
+            revision: persisted.run.revision + 1,
+            verification_records: [...verificationRecords],
+          };
+          await this.writePersistedRun({ ...persisted, run });
+          return { run, accepted: false, error_record: errorRecord };
+        }
+      }
 
       const timestamp = this.now().toISOString();
       const run: RunRecord = {
@@ -1182,6 +1229,32 @@ export class RunStore {
         (attempt) => attempt.action_id === input.action_id,
       );
       const attempt = verificationState.attempts[attemptIndex];
+      if (
+        attempt !== undefined &&
+        attempt.last_error_code === "APPROVAL_REQUIRED" &&
+        (attempt.status === "aborted" || attempt.status === "exhausted") &&
+        verificationState.current_state === "error" &&
+        verificationState.terminal_outcome === "error"
+      ) {
+        const existingError = persisted.run.verification_records.find(
+          (record) =>
+            record.schema_version === 2 &&
+            record.payload.kind === "error" &&
+            record.payload.action_id === input.action_id &&
+            record.payload.code === "APPROVAL_REQUIRED",
+        );
+        if (existingError === undefined) {
+          throw new ArkTeamError(
+            "CORRUPT_STATE",
+            "approval-settled verification attempt is missing its action error",
+          );
+        }
+        return {
+          run: persisted.run,
+          error_code: "APPROVAL_REQUIRED",
+          error_record: existingError,
+        };
+      }
       if (attempt === undefined || attempt.status !== "in_progress") {
         throw new ArkTeamError(
           "INVALID_TRANSITION",
@@ -1241,8 +1314,27 @@ export class RunStore {
                 : ("failed" as const),
         last_error_code: errorCode,
       };
-      const attempts = [...verificationState.attempts];
-      attempts[attemptIndex] = completedAttempt;
+      const attempts =
+        errorCode === "APPROVAL_REQUIRED"
+          ? verificationState.attempts.map((candidate) => {
+              if (candidate.status !== "in_progress") {
+                return candidate;
+              }
+              if (candidate.action_id === input.action_id) {
+                return completedAttempt;
+              }
+              return {
+                ...candidate,
+                status:
+                  candidate.attempt_count >= candidate.max_attempts
+                    ? ("exhausted" as const)
+                    : ("aborted" as const),
+                last_error_code: "APPROVAL_REQUIRED" as const,
+              };
+            })
+          : verificationState.attempts.map((candidate, index) =>
+              index === attemptIndex ? completedAttempt : candidate,
+            );
       const timestamp = this.now().toISOString();
       const stateRun: RunRecord = {
         ...persisted.run,
@@ -1254,37 +1346,89 @@ export class RunStore {
       let errorRecord: VerificationLinkedRecord | null = null;
       let verificationRecords: readonly VerificationLinkedRecord[] =
         persisted.run.verification_records;
-      if (
-        completedAttempt.status === "aborted" ||
-        completedAttempt.status === "exhausted"
-      ) {
+      const attemptsNeedingError =
+        errorCode === "APPROVAL_REQUIRED"
+          ? attempts.filter(
+              (candidate) =>
+                candidate.last_error_code === "APPROVAL_REQUIRED" &&
+                (candidate.status === "aborted" ||
+                  candidate.status === "exhausted") &&
+                verificationState.attempts.find(
+                  (previous) =>
+                    previous.action_id === candidate.action_id &&
+                    previous.status === "in_progress",
+                ) !== undefined,
+            )
+          : completedAttempt.status === "aborted" ||
+              completedAttempt.status === "exhausted"
+            ? [completedAttempt]
+            : [];
+      for (const failedAttempt of attemptsNeedingError) {
         const record = createVerificationCoordinatorErrorRecord({
-          run: stateRun,
+          run: {
+            ...stateRun,
+            verification_records: [...verificationRecords],
+          },
           timestamp,
-          action_id: input.action_id,
-          code: completedAttempt.last_error_code!,
+          action_id: failedAttempt.action_id,
+          code: failedAttempt.last_error_code!,
           message:
             input.message ??
-            `verification action failed closed with ${completedAttempt.last_error_code}`,
-          attempt_count: completedAttempt.attempt_count,
-          evidence_record_ids: completedAttempt.evidence_record_ids,
-          lane: completedAttempt.lane,
-          check_id: completedAttempt.check_id,
+            `verification action failed closed with ${failedAttempt.last_error_code}`,
+          attempt_count: failedAttempt.attempt_count,
+          evidence_record_ids: failedAttempt.evidence_record_ids,
+          lane: failedAttempt.lane,
+          check_id: failedAttempt.check_id,
+          ...(input.capability === undefined
+            ? {}
+            : { capability: input.capability }),
         });
-        errorRecord = {
+        const actionError = {
           ...record,
-          record_id: verificationActionErrorRecordId(input.action_id),
+          record_id: verificationActionErrorRecordId(
+            failedAttempt.action_id,
+          ),
         };
         verificationRecords = appendVerificationLinkedRecord(
-          persisted.run.verification_records,
-          errorRecord,
+          verificationRecords,
+          actionError,
         );
+        if (failedAttempt.action_id === input.action_id) {
+          errorRecord = actionError;
+        }
+      }
+      let terminalVerificationState = stateRun.verification_state;
+      if (
+        errorRecord !== null &&
+        errorRecord.payload.kind === "error" &&
+        errorRecord.payload.code === "APPROVAL_REQUIRED"
+      ) {
+        const reportRecord = createApprovalTerminalReportRecord({
+          run: {
+            ...stateRun,
+            verification_records: [...verificationRecords],
+          },
+          snapshot: persisted.run.verification_snapshot,
+          timestamp,
+          error_record: errorRecord,
+          previous_record: verificationRecords.at(-1)!,
+        });
+        verificationRecords = appendVerificationLinkedRecord(
+          verificationRecords,
+          reportRecord,
+        );
+        terminalVerificationState = {
+          ...stateRun.verification_state!,
+          current_state: "error",
+          terminal_outcome: "error",
+        };
       }
       const run: RunRecord = {
         ...stateRun,
         updated_at: timestamp,
         revision: persisted.run.revision + 1,
         verification_records: [...verificationRecords],
+        verification_state: terminalVerificationState,
       };
       await this.writePersistedRun({ ...persisted, run });
       return { run, error_code: errorCode, error_record: errorRecord };
@@ -1349,6 +1493,9 @@ export class RunStore {
         evidence_record_ids: attempt.evidence_record_ids,
         lane: attempt.lane,
         check_id: attempt.check_id,
+        ...(input.capability === undefined
+          ? {}
+          : { capability: input.capability }),
       });
       const errorRecord = { ...record, record_id: recordId };
       const verificationRecords = appendVerificationLinkedRecord(
@@ -1363,6 +1510,122 @@ export class RunStore {
       };
       await this.writePersistedRun({ ...persisted, run });
       return { run, record: errorRecord };
+    });
+  }
+
+  async terminateVerificationForApproval(
+    runId: string,
+    input: TerminateVerificationForApprovalInput,
+    authority?: symbol,
+  ): Promise<TerminateVerificationForApprovalResult> {
+    return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
+      const persisted = await this.readPersistedRun(runId);
+      const snapshot = persisted.run.verification_snapshot;
+      const verificationState = persisted.run.verification_state;
+      if (
+        snapshot === null ||
+        snapshot.schema_version !== 2 ||
+        verificationState === null
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "approval denial requires a contract-v2 verification snapshot",
+        );
+      }
+      if (verificationState.terminal_outcome !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "approval denial cannot replace a terminal verification outcome",
+        );
+      }
+      await this.assertCurrentVerificationSnapshot(persisted.run);
+      if (!/^[a-f0-9]{64}$/.test(input.request_sha256)) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "approval request hash is invalid",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const attempts = verificationState.attempts.map((attempt) =>
+        attempt.status === "in_progress"
+          ? {
+              ...attempt,
+              status:
+                attempt.attempt_count >= attempt.max_attempts
+                  ? ("exhausted" as const)
+                  : ("aborted" as const),
+              last_error_code: "APPROVAL_REQUIRED" as const,
+            }
+          : attempt,
+      );
+      const stateRun: RunRecord = {
+        ...persisted.run,
+        verification_state: {
+          ...verificationState,
+          attempts,
+        },
+      };
+      let records: readonly VerificationLinkedRecord[] =
+        persisted.run.verification_records;
+      for (const attempt of attempts) {
+        const wasInProgress = verificationState.attempts.find(
+          (candidate) =>
+            candidate.action_id === attempt.action_id &&
+            candidate.status === "in_progress",
+        );
+        if (wasInProgress === undefined) {
+          continue;
+        }
+        const actionError = {
+          ...createVerificationCoordinatorErrorRecord({
+            run: { ...stateRun, verification_records: [...records] },
+            timestamp,
+            action_id: attempt.action_id,
+            code: "APPROVAL_REQUIRED",
+            message: input.message,
+            attempt_count: attempt.attempt_count,
+            evidence_record_ids: attempt.evidence_record_ids,
+            lane: attempt.lane,
+            check_id: attempt.check_id,
+            request_sha256: input.request_sha256,
+          }),
+          record_id: verificationActionErrorRecordId(attempt.action_id),
+        };
+        records = appendVerificationLinkedRecord(records, actionError);
+      }
+      const errorRecord = createVerificationCoordinatorErrorRecord({
+        run: { ...stateRun, verification_records: [...records] },
+        timestamp,
+        code: "APPROVAL_REQUIRED",
+        message: input.message,
+        attempt_count: 1,
+        evidence_record_ids: [],
+        request_sha256: input.request_sha256,
+      });
+      records = appendVerificationLinkedRecord(records, errorRecord);
+      const reportRecord = createApprovalTerminalReportRecord({
+        run: { ...stateRun, verification_records: [...records] },
+        snapshot,
+        timestamp,
+        error_record: errorRecord,
+        previous_record: records.at(-1)!,
+      });
+      records = appendVerificationLinkedRecord(records, reportRecord);
+      const run: RunRecord = {
+        ...stateRun,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        verification_records: [...records],
+        verification_state: {
+          ...verificationState,
+          attempts,
+          current_state: "error",
+          terminal_outcome: "error",
+        },
+      };
+      await this.writePersistedRun({ ...persisted, run });
+      return { run, error_record: errorRecord, report_record: reportRecord };
     });
   }
 
@@ -2078,6 +2341,16 @@ export class RunStore {
 
   async getRun(runId: string): Promise<RunRecord> {
     return (await this.readPersistedRun(runId)).run;
+  }
+
+  async assertCurrentVerification(
+    runId: string,
+    authority?: symbol,
+  ): Promise<RunRecord> {
+    this.assertVerificationCoordinatorAuthority(authority);
+    const run = (await this.readPersistedRun(runId)).run;
+    await this.assertCurrentVerificationSnapshot(run);
+    return run;
   }
 
   async getRunContext(runId: string): Promise<RunContextResult> {
@@ -5048,6 +5321,20 @@ export class RunStore {
         "earlier verification package snapshots are read-only",
       );
     }
+    const coordinator = run.project_config.verification.coordinator;
+    if (
+      coordinator === null ||
+      run.project_config_sha256 !== projectConfigSha256(run.project_config) ||
+      snapshot.resolved_config_sha256 !==
+        sha256CanonicalJson(coordinator) ||
+      snapshot.resolved_config_sha256 !==
+        sha256CanonicalJson(snapshot.resolved_config)
+    ) {
+      throw new ArkTeamError(
+        "CONFIG_INVALID",
+        "verification configuration no longer matches the immutable snapshot",
+      );
+    }
     await this.assertApprovedVerificationPackage(run.project_path);
     const currentSource = await this.verificationSourceLoader(
       run.project_path,
@@ -5348,6 +5635,7 @@ function isTerminalVerificationActionError(
 ): boolean {
   return (
     code === "INVALID_RECORD" ||
+    code === "APPROVAL_REQUIRED" ||
     verificationErrorDisposition(code).integrity_failure
   );
 }
@@ -5416,6 +5704,73 @@ function assertVerificationAttemptScope(
     throw new ArkTeamError(
       "INVALID_RECORD",
       "verification action targets an unknown snapshotted check",
+    );
+  }
+}
+
+function assertCompleteVerificationCapabilityMatrix(run: RunRecord): void {
+  const snapshot = run.verification_snapshot;
+  const state = run.verification_state;
+  if (snapshot?.schema_version !== 2 || state === null) {
+    throw new ArkTeamError(
+      "INVALID_TRANSITION",
+      "capability discovery requires a contract-v2 coordinator state",
+    );
+  }
+  const readinessAttempt = state.attempts.find(
+    (attempt) => attempt.kind === "readiness",
+  );
+  if (
+    readinessAttempt === undefined ||
+    readinessAttempt.status !== "succeeded"
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "capability discovery must finish one durable readiness action",
+    );
+  }
+  const recordById = new Map(
+    run.verification_records.map((record) => [record.record_id, record]),
+  );
+  const evidence = readinessAttempt.decisive_evidence_record_ids.map(
+    (recordId) => recordById.get(recordId),
+  );
+  const demands = [
+    ...(snapshot.backend_contract.enabled
+      ? [
+          ...snapshot.backend_contract.required_capabilities.map(
+            (capability) => `backend\0${capability}`,
+          ),
+        ]
+      : []),
+    ...(snapshot.ui_contract.enabled
+      ? [
+          ...snapshot.ui_contract.required_capabilities.map(
+            (capability) => `ui\0${capability}`,
+          ),
+          ...snapshot.ui_contract.optional_capabilities.map(
+            (capability) => `ui\0${capability}`,
+          ),
+        ]
+      : []),
+  ].sort();
+  const discovered = evidence.flatMap((record) =>
+    record?.schema_version === 2 &&
+    record.payload.kind === "capability" &&
+    record.lane !== null &&
+    record.payload.diagnostic !== undefined
+      ? [`${record.lane}\0${record.payload.capability}`]
+      : [],
+  ).sort();
+  if (
+    evidence.length !== demands.length ||
+    discovered.length !== demands.length ||
+    new Set(discovered).size !== discovered.length ||
+    demands.some((demand, index) => demand !== discovered[index])
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "capability discovery must persist the exact immutable lane matrix once",
     );
   }
 }
@@ -5619,6 +5974,8 @@ function createVerificationCoordinatorErrorRecord(input: {
   evidence_record_ids: string[];
   lane?: "backend" | "ui" | null;
   check_id?: string | null;
+  request_sha256?: string;
+  capability?: VerificationCapability;
 }): VerificationLinkedRecord {
   const snapshot = input.run.verification_snapshot;
   if (snapshot === null || snapshot.schema_version !== 2) {
@@ -5633,7 +5990,52 @@ function createVerificationCoordinatorErrorRecord(input: {
     checkId === null
       ? false
       : (expectedVerificationCheckRequired(snapshot, lane, checkId) ?? false);
-  const disposition = verificationErrorDisposition(input.code);
+  const laneRequired =
+    lane === null
+      ? null
+      : lane === "backend"
+        ? snapshot.backend_contract.enabled
+          ? snapshot.backend_contract.required
+          : null
+        : snapshot.ui_contract.enabled
+          ? snapshot.ui_contract.required
+          : null;
+  const approvalRequestSha256 =
+    input.code === "APPROVAL_REQUIRED"
+      ? (input.request_sha256 ??
+        input.run.verification_state?.attempts.find(
+          (attempt) => attempt.action_id === input.action_id,
+        )?.input_sha256 ??
+        sha256CanonicalJson({
+          action_id: input.action_id ?? null,
+          code: input.code,
+          message: input.message.trim().slice(0, 1_000),
+        }))
+      : undefined;
+  const capabilityRequired =
+    input.capability === undefined
+      ? true
+      : lane === "backend" && snapshot.backend_contract.enabled
+        ? snapshot.backend_contract.required_capabilities.includes(
+            input.capability as "api" | "server",
+          )
+        : lane === "ui" && snapshot.ui_contract.enabled
+          ? snapshot.ui_contract.required_capabilities.includes(
+              input.capability,
+            )
+          : false;
+  const disposition =
+    input.code === "APPROVAL_REQUIRED"
+      ? { outcome: "error" as const, integrity_failure: false }
+      : (input.code === "CAPABILITY_UNAVAILABLE" ||
+            input.code === "SERVER_NOT_READY") &&
+          !(
+            laneRequired === true &&
+            checkRequired &&
+            capabilityRequired
+          )
+        ? { outcome: "skipped" as const, integrity_failure: false }
+        : verificationErrorDisposition(input.code);
   const payload = {
     kind: "error" as const,
     code: input.code,
@@ -5645,6 +6047,20 @@ function createVerificationCoordinatorErrorRecord(input: {
     evidence_record_ids: input.evidence_record_ids,
     outcome: disposition.outcome,
     integrity_failure: disposition.integrity_failure,
+    ...(input.code === "APPROVAL_REQUIRED"
+      ? {
+          approval_id: randomUUID(),
+          request_sha256: approvalRequestSha256!,
+        }
+      : {}),
+    ...((input.code === "CAPABILITY_UNAVAILABLE" ||
+      input.code === "SERVER_NOT_READY") &&
+    input.capability !== undefined
+      ? {
+          capability: input.capability,
+          capability_required: capabilityRequired,
+        }
+      : {}),
   };
   const current = input.run.verification_state?.current_state;
   const stage: VerificationStage =
@@ -5668,20 +6084,59 @@ function createVerificationCoordinatorErrorRecord(input: {
     timestamp_utc: input.timestamp,
     source_fingerprint: snapshot.source_fingerprint,
     package_fingerprint: snapshot.package.package_fingerprint,
-    lane_required:
-      lane === null
-        ? null
-        : lane === "backend"
-          ? snapshot.backend_contract.enabled
-            ? snapshot.backend_contract.required
-            : null
-          : snapshot.ui_contract.enabled
-            ? snapshot.ui_contract.required
-            : null,
+    lane_required: laneRequired,
     check_required: checkRequired,
     previous_record_sha256: sha256CanonicalJson(
       input.run.verification_records.at(-1)!,
     ),
+    payload_sha256: sha256CanonicalJson(payload),
+    payload,
+    adapter: null,
+    model: null,
+    artifact_references: [],
+  };
+}
+
+function createApprovalTerminalReportRecord(input: {
+  run: RunRecord;
+  snapshot: VerificationRunSnapshotV2;
+  timestamp: string;
+  error_record: VerificationLinkedRecord;
+  previous_record: VerificationLinkedRecord;
+}): VerificationLinkedRecord {
+  if (
+    input.error_record.schema_version !== 2 ||
+    input.error_record.payload.kind !== "error" ||
+    input.error_record.payload.code !== "APPROVAL_REQUIRED" ||
+    input.error_record.payload.approval_id === undefined
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "approval terminal report requires one opaque approval error",
+    );
+  }
+  const payload = {
+    kind: "report" as const,
+    outcome: "error" as const,
+    evidence_record_ids: [input.error_record.record_id],
+  };
+  return {
+    schema_version: 2,
+    contract_id: "verification_contract_v2",
+    record_id: `${input.run.run_id}-terminal-report`,
+    record_type: "report",
+    run_id: input.run.run_id,
+    case_id: input.snapshot.case_id,
+    check_id: null,
+    snapshot_id: input.snapshot.snapshot_id,
+    lane: null,
+    stage: "deciding",
+    timestamp_utc: input.timestamp,
+    source_fingerprint: input.snapshot.source_fingerprint,
+    package_fingerprint: input.snapshot.package.package_fingerprint,
+    lane_required: null,
+    check_required: true,
+    previous_record_sha256: sha256CanonicalJson(input.previous_record),
     payload_sha256: sha256CanonicalJson(payload),
     payload,
     adapter: null,

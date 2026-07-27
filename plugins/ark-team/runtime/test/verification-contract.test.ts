@@ -24,7 +24,9 @@ import {
   verificationBaselineSetSha256,
   verificationCleanupAuditSchema,
   verificationCoordinatorConfigSchema,
+  verificationEvidenceDisposition,
   verificationLinkedRecordSchema,
+  verificationRecordMatchesSnapshot,
   verificationRunSnapshotSchema,
   verificationRunSnapshotSha256,
 } from "../src/verification-contract.js";
@@ -170,6 +172,7 @@ test("TEST-1704 validates schema-2 records, legacy readability, and chain isolat
         capability: "browser",
         available: true,
         version: "1.62.0",
+        diagnostic: "browser available",
       },
       "ui",
       { name: "playwright-cli", version: "1.62.0" },
@@ -398,6 +401,179 @@ test("TEST-1704 validates schema-2 records, legacy readability, and chain isolat
     true,
   );
 
+  const capability = cases.find(
+    (candidate) => candidate.record_type === "capability",
+  );
+  assert.notEqual(capability, undefined);
+  for (const payload of [
+    { ...capability?.payload, diagnostic: "x".repeat(1_001) },
+    { ...capability?.payload, diagnostic: "token: exposed" },
+    {
+      ...capability?.payload,
+      available: false,
+      version: "1.62.0",
+      diagnostic: "browser unavailable",
+    },
+  ]) {
+    assert.equal(
+      verificationLinkedRecordSchema.safeParse({
+        ...capability,
+        payload,
+        payload_sha256: sha256CanonicalJson(payload),
+      }).success,
+      false,
+    );
+  }
+  const legacyUnavailableCapabilityPayload = {
+    kind: "capability" as const,
+    capability: "browser" as const,
+    available: false,
+    version: "1.62.0",
+  };
+  const legacyUnavailableCapability =
+    verificationLinkedRecordSchema.parse({
+      ...recordCase(
+        "capability",
+        legacyUnavailableCapabilityPayload,
+        "ui",
+        { name: "playwright-cli", version: "1.62.0" },
+        null,
+        [],
+        false,
+      ),
+      payload_sha256: sha256CanonicalJson(
+        legacyUnavailableCapabilityPayload,
+      ),
+    });
+  assert.deepEqual(
+    verificationEvidenceDisposition(legacyUnavailableCapability),
+    { outcome: "unavailable", integrity_failure: false },
+  );
+  const markedUnavailableCapabilityPayload = {
+    ...legacyUnavailableCapabilityPayload,
+    version: null,
+    diagnostic: "browser unavailable",
+  };
+  const markedUnavailableCapability =
+    verificationLinkedRecordSchema.parse({
+      ...legacyUnavailableCapability,
+      payload: markedUnavailableCapabilityPayload,
+      payload_sha256: sha256CanonicalJson(
+        markedUnavailableCapabilityPayload,
+      ),
+    });
+  assert.deepEqual(
+    verificationEvidenceDisposition(markedUnavailableCapability),
+    { outcome: "skipped", integrity_failure: false },
+  );
+
+  const legacyApprovalPayload = {
+    kind: "error" as const,
+    code: "APPROVAL_REQUIRED" as const,
+    message: "separate approval required",
+    attempt_count: 1,
+    evidence_record_ids: [],
+    outcome: "skipped" as const,
+    integrity_failure: false,
+  };
+  const legacyApproval = verificationLinkedRecordSchema.parse({
+    ...recordCase("error", legacyApprovalPayload),
+    payload_sha256: sha256CanonicalJson(legacyApprovalPayload),
+  });
+  assert.deepEqual(verificationEvidenceDisposition(legacyApproval), {
+    outcome: "skipped",
+    integrity_failure: false,
+  });
+
+  const legacyOptionalCapabilityErrorPayload = {
+    kind: "error" as const,
+    code: "CAPABILITY_UNAVAILABLE" as const,
+    message: "optional browser unavailable",
+    attempt_count: 1,
+    evidence_record_ids: [],
+    outcome: "unavailable" as const,
+    integrity_failure: false,
+  };
+  const legacyOptionalCapabilityError =
+    verificationLinkedRecordSchema.parse({
+      ...recordCase(
+        "error",
+        legacyOptionalCapabilityErrorPayload,
+        "ui",
+        null,
+        null,
+        [],
+        false,
+      ),
+      payload_sha256: sha256CanonicalJson(
+        legacyOptionalCapabilityErrorPayload,
+      ),
+    });
+  assert.deepEqual(
+    verificationEvidenceDisposition(legacyOptionalCapabilityError),
+    { outcome: "unavailable", integrity_failure: false },
+  );
+  const markedOptionalCapabilityErrorPayload = {
+    ...legacyOptionalCapabilityErrorPayload,
+    capability: "browser" as const,
+    capability_required: true,
+    outcome: "skipped" as const,
+  };
+  const markedOptionalCapabilityError =
+    verificationLinkedRecordSchema.parse({
+      ...legacyOptionalCapabilityError,
+      payload: markedOptionalCapabilityErrorPayload,
+      payload_sha256: sha256CanonicalJson(
+        markedOptionalCapabilityErrorPayload,
+      ),
+    });
+  assert.deepEqual(
+    verificationEvidenceDisposition(markedOptionalCapabilityError),
+    { outcome: "skipped", integrity_failure: false },
+  );
+  const snapshot = buildSnapshot(validVerificationCoordinatorConfig());
+  assert.equal(
+    verificationRecordMatchesSnapshot(
+      snapshot,
+      markedOptionalCapabilityError,
+    ),
+    true,
+  );
+  const mismatchedCapabilityErrorPayload = {
+    ...markedOptionalCapabilityErrorPayload,
+    capability: "api" as const,
+  };
+  assert.equal(
+    verificationRecordMatchesSnapshot(snapshot, {
+      ...markedOptionalCapabilityError,
+      payload: mismatchedCapabilityErrorPayload,
+      payload_sha256: sha256CanonicalJson(
+        mismatchedCapabilityErrorPayload,
+      ),
+    }),
+    false,
+  );
+
+  const approvalPayload = {
+    kind: "error" as const,
+    code: "APPROVAL_REQUIRED" as const,
+    message: "separate approval required",
+    attempt_count: 1,
+    evidence_record_ids: [],
+    outcome: "error" as const,
+    integrity_failure: false,
+    approval_id: "not-an-opaque-uuid",
+    request_sha256: SHA,
+  };
+  assert.equal(
+    verificationLinkedRecordSchema.safeParse({
+      ...recordCase("error", approvalPayload),
+      payload: approvalPayload,
+      payload_sha256: sha256CanonicalJson(approvalPayload),
+    }).success,
+    false,
+  );
+
   const request = cases.find(
     (candidate) => candidate.record_type === "request",
   );
@@ -564,6 +740,16 @@ test("TEST-1705 enforces the lane matrix and immutable schema-2 snapshot", () =>
     required: true,
   } as never;
   invalidConfigurations.push(disabledResidual);
+
+  for (const serverArgv of [
+    ["docker", "compose", "up"],
+    ["npm", "run", "dev", "--", "--port=3000"],
+    ["npm", "run", "dev", "https://remote.example"],
+  ]) {
+    const unsafeServer = validVerificationCoordinatorConfig();
+    unsafeServer.server_argv = serverArgv;
+    invalidConfigurations.push(unsafeServer);
+  }
 
   for (const invalid of invalidConfigurations) {
     assert.equal(
