@@ -1,8 +1,23 @@
+import { createHash } from "node:crypto";
 import { createServer } from "node:net";
 import path from "node:path";
 
 import type { RunRecord } from "./domain.js";
 import { ArkTeamError } from "./errors.js";
+import {
+  createVerificationApiRequest,
+  normalizeVerificationApiResult,
+  VerificationApiAdapterError,
+  type VerificationApiEvidence,
+  type VerificationApiRuntimeRequest,
+} from "./verification-api-adapter.js";
+import {
+  createVerificationBrowserDriverRequest,
+  normalizeVerificationBrowserDriverResult,
+  VerificationBrowserContractError,
+  type VerificationBrowserEvidence,
+  type VerificationBrowserDriverRequest,
+} from "./verification-browser-adapter.js";
 import type {
   VerificationActionKind,
   VerificationCapability,
@@ -14,6 +29,7 @@ import type {
   VerificationStage,
 } from "./verification-contract.js";
 import {
+  canonicalJson,
   sha256CanonicalJson,
   verificationEvidenceDisposition,
   verificationErrorDisposition,
@@ -227,6 +243,40 @@ export interface RunVerificationReadinessInput {
   server: Omit<VerificationServerRegistration, "registration_id">;
 }
 
+export interface RunVerificationApiProbeInput {
+  action_id: string;
+  probe_id: string;
+  body_base64?: string;
+}
+
+export interface RunVerificationBrowserCaseInput {
+  action_id: string;
+  case_id: string;
+}
+
+export interface VerificationApiProbeValue {
+  evidence: VerificationApiEvidence;
+  evidence_artifact: {
+    artifact_id: string;
+    relative_path: string;
+    sha256: string;
+  };
+}
+
+export interface VerificationBrowserCaseValue {
+  evidence: VerificationBrowserEvidence;
+  evidence_artifact: {
+    artifact_id: string;
+    relative_path: string;
+    sha256: string;
+  };
+  trace_artifact: {
+    artifact_id: string;
+    relative_path: string;
+    sha256: string;
+  };
+}
+
 export interface VerificationCoordinatorRuntime {
   port_available?: VerificationPortAvailabilityProbe;
   capability_adapters: Readonly<
@@ -252,6 +302,14 @@ export interface VerificationCoordinatorRuntime {
   ) => Promise<{ status: number }>;
   execute_local: (
     request: DeepReadonly<VerificationLocalEffectRequest>,
+  ) => Promise<unknown>;
+  execute_api?: (
+    request: DeepReadonly<VerificationApiRuntimeRequest>,
+    signal: AbortSignal,
+  ) => Promise<unknown>;
+  execute_browser?: (
+    request: DeepReadonly<VerificationBrowserDriverRequest>,
+    signal: AbortSignal,
   ) => Promise<unknown>;
 }
 
@@ -303,6 +361,11 @@ export type VerificationLocalEffectResult<T> =
 export class VerificationCoordinator {
   private submissionQueue: Promise<void> = Promise.resolve();
   private runtime: Readonly<VerificationCoordinatorRuntime> | null = null;
+  private readonly attemptNumbers = new WeakMap<object, number>();
+  private readonly attemptDeadlines = new WeakMap<
+    object,
+    VerificationActionDeadline
+  >();
   private readonly activeControllers = new Map<
     string,
     Map<string, AbortController>
@@ -558,6 +621,319 @@ export class VerificationCoordinator {
           ok: true,
           value: { server_ready: serverReady, unavailable },
         };
+      },
+    });
+  }
+
+  async runApiProbe(
+    runId: string,
+    input: RunVerificationApiProbeInput,
+  ): Promise<VerificationActionResult<VerificationApiProbeValue>> {
+    const parsedInput = parseApiProbeInput(input);
+    const current = await this.store.getRun(runId);
+    const snapshot = requireV2Snapshot(current);
+    if (!snapshot.backend_contract.enabled) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "API probes cannot run when the backend lane is disabled",
+      );
+    }
+    const backend = snapshot.backend_contract;
+    const probe = backend.api_probes.find(
+      (candidate) => candidate.id === parsedInput.probe_id,
+    );
+    if (probe === undefined) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "API probe is not declared in the immutable snapshot",
+      );
+    }
+    const bodyBytes =
+      parsedInput.body_base64 === undefined
+        ? undefined
+        : decodeCanonicalBase64(parsedInput.body_base64);
+    const runtime = this.requireLocalRuntime();
+
+    return this.runAction(runId, {
+      action_id: parsedInput.action_id,
+      kind: "api",
+      lane: "backend",
+      check_id: probe.id,
+      input: {
+        probe_id: probe.id,
+        body_sha256:
+          bodyBytes === undefined ? "none" : sha256Bytes(bodyBytes),
+      },
+      adapter: async (context) => {
+        const registered = runtime.capability_adapters.api;
+        if (
+          runtime.execute_api === undefined ||
+          registered.name !== backend.api_adapter ||
+          registered.version !==
+            backend.api_adapter_version
+        ) {
+          return {
+            ok: false,
+            code: "CAPABILITY_UNAVAILABLE",
+            capability: "api",
+            message: "registered API runtime does not match the snapshot",
+          };
+        }
+
+        let request: VerificationApiRuntimeRequest;
+        try {
+          request = createVerificationApiRequest(
+            snapshot,
+            probe.id,
+            bodyBytes,
+          );
+        } catch (error) {
+          if (error instanceof VerificationApiAdapterError) {
+            return {
+              ok: false,
+              code: error.code,
+              message: error.message,
+            };
+          }
+          throw error;
+        }
+        const rawResult = await runtime.execute_api(
+          request,
+          context.signal,
+        );
+        this.completeTimedEffect(context);
+        const normalized = normalizeVerificationApiResult(request, rawResult);
+        if (
+          normalized.evidence.actual_status === null ||
+          normalized.evidence.response_sha256 === null
+        ) {
+          return {
+            ok: false,
+            code: normalized.error_code ?? "INVALID_RECORD",
+            message:
+              normalized.message ??
+              "registered API runtime returned incomplete evidence",
+          };
+        }
+
+        const artifactToken = sha256CanonicalJson({
+          action_id: parsedInput.action_id,
+          attempt: this.attemptNumber(context),
+          probe_id: probe.id,
+        }).slice(0, 24);
+        const evidenceBytes = canonicalJsonBytes(normalized.evidence);
+        const evidenceArtifact = await this.writeArtifact(runId, {
+          artifact_id: `api-evidence-${artifactToken}`,
+          relative_path: `api/${probe.id}/${artifactToken}.json`,
+          media_type: "application/json",
+          bytes: evidenceBytes,
+          sha256: sha256Bytes(evidenceBytes),
+          lane: "backend",
+        });
+        const evidenceReference =
+          verificationArtifactReference(evidenceArtifact);
+        const payload = {
+          kind: "request" as const,
+          method: probe.method,
+          path: probe.path,
+          expected_status: probe.expected_status,
+          actual_status: normalized.evidence.actual_status,
+          request_sha256: normalized.evidence.request_sha256,
+          response_sha256: normalized.evidence.response_sha256,
+        };
+        await context.submit({
+          schema_version: 2,
+          contract_id: "verification_contract_v2",
+          record_id: `request-${artifactToken}`,
+          record_type: "request",
+          run_id: snapshot.run_id,
+          case_id: snapshot.case_id,
+          check_id: probe.id,
+          snapshot_id: snapshot.snapshot_id,
+          lane: "backend",
+          stage: "executing",
+          timestamp_utc: new Date().toISOString(),
+          source_fingerprint: snapshot.source_fingerprint,
+          package_fingerprint: snapshot.package.package_fingerprint,
+          lane_required: backend.required,
+          check_required: probe.required,
+          previous_record_sha256: "0".repeat(64),
+          payload_sha256: sha256CanonicalJson(payload),
+          payload,
+          adapter: {
+            name: backend.api_adapter,
+            version: backend.api_adapter_version,
+          },
+          model: null,
+          artifact_references: [evidenceReference],
+        });
+
+        if (!normalized.passed) {
+          return {
+            ok: false,
+            code: normalized.error_code ?? "API_CONTRACT_MISMATCH",
+            message:
+              normalized.message ?? "API response does not match the snapshot",
+          };
+        }
+        return {
+          ok: true,
+          value: {
+            evidence: normalized.evidence,
+            evidence_artifact: evidenceReference,
+          },
+        };
+      },
+    });
+  }
+
+  async runBrowserCase(
+    runId: string,
+    input: RunVerificationBrowserCaseInput,
+  ): Promise<VerificationActionResult<VerificationBrowserCaseValue>> {
+    const parsedInput = parseBrowserCaseInput(input);
+    const current = await this.store.getRun(runId);
+    const snapshot = requireV2Snapshot(current);
+    if (!snapshot.ui_contract.enabled) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "browser cases cannot run when the UI lane is disabled",
+      );
+    }
+    const ui = snapshot.ui_contract;
+    const browserCase = ui.browser_cases.find(
+      (candidate) => candidate.id === parsedInput.case_id,
+    );
+    if (browserCase === undefined) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "browser case is not declared in the immutable snapshot",
+      );
+    }
+    const runtime = this.requireLocalRuntime();
+
+    return this.runAction(runId, {
+      action_id: parsedInput.action_id,
+      kind: "browser",
+      lane: "ui",
+      check_id: browserCase.id,
+      input: { case_id: browserCase.id },
+      adapter: async (context) => {
+        const registered = runtime.capability_adapters.browser;
+        if (
+          runtime.execute_browser === undefined ||
+          registered.name !== ui.deterministic_adapter ||
+          registered.version !== ui.deterministic_adapter_version
+        ) {
+          return {
+            ok: false,
+            code: "CAPABILITY_UNAVAILABLE",
+            capability: "browser",
+            message: "registered browser runtime does not match the snapshot",
+          };
+        }
+
+        const artifactToken = sha256CanonicalJson({
+          action_id: parsedInput.action_id,
+          attempt: this.attemptNumber(context),
+          case_id: browserCase.id,
+        }).slice(0, 24);
+        try {
+          const request = createVerificationBrowserDriverRequest({
+            snapshot,
+            case_id: browserCase.id,
+            attempt_id: `browser-${artifactToken}`,
+          });
+          const rawResult = await runtime.execute_browser(
+            request,
+            context.signal,
+          );
+          this.completeTimedEffect(context);
+          const normalized = normalizeVerificationBrowserDriverResult(
+            request,
+            rawResult,
+          );
+          const traceArtifact = await this.writeArtifact(runId, {
+            artifact_id: `browser-trace-${artifactToken}`,
+            relative_path: request.trace.relative_path,
+            media_type: request.trace.media_type,
+            bytes: normalized.trace_bytes,
+            sha256: sha256Bytes(normalized.trace_bytes),
+            lane: "ui",
+          });
+          const evidenceBytes = canonicalJsonBytes(normalized.evidence);
+          const evidenceArtifact = await this.writeArtifact(runId, {
+            artifact_id: `browser-evidence-${artifactToken}`,
+            relative_path: `browser/${browserCase.id}/${artifactToken}.json`,
+            media_type: "application/json",
+            bytes: evidenceBytes,
+            sha256: sha256Bytes(evidenceBytes),
+            lane: "ui",
+          });
+          const traceReference =
+            verificationArtifactReference(traceArtifact);
+          const evidenceReference =
+            verificationArtifactReference(evidenceArtifact);
+          const payload = {
+            kind: "browser" as const,
+            case_sha256: request.case_sha256,
+            action_count: request.actions.length,
+            assertion_count: request.assertions.length,
+          };
+          await context.submit({
+            schema_version: 2,
+            contract_id: "verification_contract_v2",
+            record_id: `browser-${artifactToken}`,
+            record_type: "browser",
+            run_id: snapshot.run_id,
+            case_id: snapshot.case_id,
+            check_id: browserCase.id,
+            snapshot_id: snapshot.snapshot_id,
+            lane: "ui",
+            stage: "executing",
+            timestamp_utc: new Date().toISOString(),
+            source_fingerprint: snapshot.source_fingerprint,
+            package_fingerprint: snapshot.package.package_fingerprint,
+            lane_required: ui.required,
+            check_required: browserCase.required,
+            previous_record_sha256: "0".repeat(64),
+            payload_sha256: sha256CanonicalJson(payload),
+            payload,
+            adapter: {
+              name: ui.deterministic_adapter,
+              version: ui.deterministic_adapter_version,
+            },
+            model: null,
+            artifact_references: [evidenceReference, traceReference],
+          });
+
+          if (!normalized.passed) {
+            return {
+              ok: false,
+              code: "BROWSER_CONTRACT_MISMATCH",
+              message:
+                normalized.message ||
+                "browser result does not match the snapshot",
+            };
+          }
+          return {
+            ok: true,
+            value: {
+              evidence: normalized.evidence,
+              evidence_artifact: evidenceReference,
+              trace_artifact: traceReference,
+            },
+          };
+        } catch (error) {
+          if (error instanceof VerificationBrowserContractError) {
+            return {
+              ok: false,
+              code: error.code,
+              message: error.message,
+            };
+          }
+          throw error;
+        }
       },
     });
   }
@@ -848,9 +1224,25 @@ export class VerificationCoordinator {
           ...disposition,
         };
       }
+      const durableAttemptNumber =
+        reservation.run.verification_state?.attempts.find(
+          (candidate) => candidate.action_id === options.action_id,
+        )?.attempt_count;
+      if (
+        durableAttemptNumber === undefined ||
+        !Number.isInteger(durableAttemptNumber) ||
+        durableAttemptNumber < 1 ||
+        durableAttemptNumber > attemptLimit
+      ) {
+        throw new ArkTeamError(
+          "CORRUPT_STATE",
+          "reserved verification attempt has no durable attempt number",
+        );
+      }
 
       const attemptEvidenceIds: string[] = [];
       const controller = new AbortController();
+      const deadline = new VerificationActionDeadline(controller);
       this.trackActiveAction(runId, options.action_id, controller);
       let active = true;
       const context: VerificationAdapterContext<TInput> = Object.freeze({
@@ -875,19 +1267,23 @@ export class VerificationCoordinator {
           return recordId;
         },
       });
+      this.attemptNumbers.set(context, durableAttemptNumber);
+      this.attemptDeadlines.set(context, deadline);
 
       let attemptResult: VerificationAdapterAttemptResult<TValue>;
       try {
         attemptResult = await raceAction(
           () => actionAdapter(context),
           timeoutMs,
-          controller,
+          deadline,
         );
       } catch (error) {
         attemptResult = normalizeActionFailure(error);
       } finally {
         active = false;
         controller.abort();
+        this.attemptNumbers.delete(context);
+        this.attemptDeadlines.delete(context);
         this.untrackActiveAction(runId, options.action_id, controller);
       }
 
@@ -1091,6 +1487,36 @@ export class VerificationCoordinator {
     return this.runtime;
   }
 
+  private attemptNumber<TInput>(
+    context: VerificationAdapterContext<TInput>,
+  ): number {
+    const attemptNumber = this.attemptNumbers.get(context);
+    if (
+      attemptNumber === undefined ||
+      !Number.isInteger(attemptNumber) ||
+      attemptNumber < 1
+    ) {
+      throw new ArkTeamError(
+        "CORRUPT_STATE",
+        "verification adapter has no durable attempt number",
+      );
+    }
+    return attemptNumber;
+  }
+
+  private completeTimedEffect<TInput>(
+    context: VerificationAdapterContext<TInput>,
+  ): void {
+    const deadline = this.attemptDeadlines.get(context);
+    if (deadline === undefined) {
+      throw new ArkTeamError(
+        "CORRUPT_STATE",
+        "verification adapter has no active deadline",
+      );
+    }
+    deadline.completeTimedEffect();
+  }
+
   private trackActiveAction(
     runId: string,
     actionId: string,
@@ -1244,6 +1670,101 @@ function parseReadinessInput(
     );
   }
   return deepFreeze(structuredClone(input)) as RunVerificationReadinessInput;
+}
+
+function parseApiProbeInput(
+  input: RunVerificationApiProbeInput,
+): RunVerificationApiProbeInput {
+  const expectedKeys =
+    input?.body_base64 === undefined
+      ? ["action_id", "probe_id"]
+      : ["action_id", "probe_id", "body_base64"];
+  if (
+    !hasExactKeys(input, expectedKeys) ||
+    typeof input.action_id !== "string" ||
+    !IDENTIFIER_PATTERN.test(input.action_id) ||
+    typeof input.probe_id !== "string" ||
+    !IDENTIFIER_PATTERN.test(input.probe_id) ||
+    (input.body_base64 !== undefined &&
+      (typeof input.body_base64 !== "string" ||
+        input.body_base64.length > 70 * 1_024 * 1_024))
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "API probe input is not a strict bounded descriptor",
+    );
+  }
+  return structuredClone(input);
+}
+
+function parseBrowserCaseInput(
+  input: RunVerificationBrowserCaseInput,
+): RunVerificationBrowserCaseInput {
+  if (
+    !hasExactKeys(input, ["action_id", "case_id"]) ||
+    typeof input.action_id !== "string" ||
+    !IDENTIFIER_PATTERN.test(input.action_id) ||
+    typeof input.case_id !== "string" ||
+    !IDENTIFIER_PATTERN.test(input.case_id)
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "browser case input is not a strict bounded descriptor",
+    );
+  }
+  return structuredClone(input);
+}
+
+function decodeCanonicalBase64(value: string): Uint8Array {
+  if (
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      value,
+    )
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "API request body is not canonical base64",
+    );
+  }
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.toString("base64") !== value) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "API request body is not canonical base64",
+    );
+  }
+  return bytes;
+}
+
+function canonicalJsonBytes(value: unknown): Uint8Array {
+  return Buffer.from(canonicalJson(value), "utf8");
+}
+
+function sha256Bytes(value: Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function verificationArtifactReference(
+  result: WriteVerificationArtifactResult,
+): {
+  artifact_id: string;
+  relative_path: string;
+  sha256: string;
+} {
+  if (
+    result.record.schema_version !== 2 ||
+    result.record.payload.kind !== "artifact"
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "verification execution artifact was not persisted",
+    );
+  }
+  return {
+    artifact_id: result.record.payload.artifact_id,
+    relative_path: result.record.payload.relative_path,
+    sha256: result.record.payload.sha256,
+  };
 }
 
 function verificationServerRegistration(
@@ -2025,20 +2546,50 @@ function actionTimeoutMs<TInput, TValue>(
 async function raceAction<T>(
   execute: () => Promise<T>,
   timeoutMs: number,
-  controller: AbortController,
+  deadline: VerificationActionDeadline,
 ): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      controller.abort();
-      reject(new VerificationTimeoutError());
-    }, timeoutMs);
-  });
+  const timeout = deadline.start(timeoutMs);
   try {
     return await Promise.race([Promise.resolve().then(execute), timeout]);
   } finally {
-    if (timer !== undefined) {
-      clearTimeout(timer);
+    deadline.clear();
+  }
+}
+
+class VerificationActionDeadline {
+  private timer: NodeJS.Timeout | undefined;
+  private expiresAtNanoseconds: bigint | undefined;
+
+  constructor(private readonly controller: AbortController) {}
+
+  start(timeoutMs: number): Promise<never> {
+    this.expiresAtNanoseconds =
+      process.hrtime.bigint() + BigInt(timeoutMs) * 1_000_000n;
+    return new Promise<never>((_resolve, reject) => {
+      this.timer = setTimeout(() => {
+        this.controller.abort();
+        reject(new VerificationTimeoutError());
+      }, timeoutMs);
+    });
+  }
+
+  completeTimedEffect(): void {
+    if (
+      this.controller.signal.aborted ||
+      this.expiresAtNanoseconds === undefined ||
+      process.hrtime.bigint() >= this.expiresAtNanoseconds
+    ) {
+      this.controller.abort();
+      throw new VerificationTimeoutError();
+    }
+    this.expiresAtNanoseconds = undefined;
+    this.clear();
+  }
+
+  clear(): void {
+    if (this.timer !== undefined) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
     }
   }
 }
