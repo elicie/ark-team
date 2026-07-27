@@ -1102,6 +1102,19 @@ test("TEST-1722 applies required precedence, optional-check visibility, and inte
 
   const optionalCheck = await createFixture(t, "both", true, true);
   await advanceToExecuting(optionalCheck);
+  const optionalLanes = await submitLaneEvidence(optionalCheck, {
+    backend: "passed",
+    ui: "passed",
+  });
+  assert.equal(
+    (
+      await optionalCheck.coordinator.advance(
+        optionalCheck.run_id,
+        "collecting",
+      )
+    ).accepted,
+    true,
+  );
   const optionalTask = requireV2Snapshot(
     await optionalCheck.store.getRun(optionalCheck.run_id),
   ).ui_contract;
@@ -1132,10 +1145,6 @@ test("TEST-1722 applies required precedence, optional-check visibility, and inte
       record.payload.code === "ENVIRONMENT_UNAVAILABLE",
   );
   assert.notEqual(optionalError, undefined);
-  const optionalLanes = await submitLaneEvidence(optionalCheck, {
-    backend: "passed",
-    ui: "passed",
-  });
   const optionalUi = optionalLanes.find((lane) => lane.lane === "ui");
   optionalUi?.checks.push({
     check_id: task.id,
@@ -1144,7 +1153,15 @@ test("TEST-1722 applies required precedence, optional-check visibility, and inte
     evidence_record_ids: [optionalError!.record_id],
     integrity_failure: false,
   });
-  await advanceToDeciding(optionalCheck);
+  assert.equal(
+    (
+      await optionalCheck.coordinator.advance(
+        optionalCheck.run_id,
+        "deciding",
+      )
+    ).accepted,
+    true,
+  );
   const optionalTerminal = await optionalCheck.coordinator.finalize(
     optionalCheck.run_id,
     optionalLanes,
@@ -1350,6 +1367,7 @@ async function advanceToActionStage(
   }
   await advanceToExecuting(fixture);
   if (
+    kind === "agentic_browser" ||
     kind === "screenshot" ||
     kind === "semantic_review" ||
     kind === "comparison" ||

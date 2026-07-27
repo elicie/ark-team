@@ -386,6 +386,7 @@ test("TEST-1714 preserves required, optional, and disabled capability gates with
       );
     }
     if (
+      capabilityCase.action.kind === "agentic_browser" ||
       capabilityCase.action.kind === "screenshot" ||
       capabilityCase.action.kind === "semantic_review" ||
       capabilityCase.action.kind === "comparison"
