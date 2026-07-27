@@ -15,6 +15,10 @@ import { DEFAULT_PROJECT_CONFIG } from "../src/project-config.js";
 import { RunStore } from "../src/state-store.js";
 import type { VerificationApiRuntimeRequest } from "../src/verification-api-adapter.js";
 import type {
+  VerificationAgenticBrowserRequest,
+  VerificationAgenticBrowserRuntimeResult,
+} from "../src/verification-agentic-browser-adapter.js";
+import type {
   VerificationBrowserDriverRequest,
   VerificationBrowserDriverResult,
 } from "../src/verification-browser-adapter.js";
@@ -28,6 +32,18 @@ import {
   VerificationCoordinator,
   type DeepReadonly,
 } from "../src/verification-coordinator.js";
+import {
+  VERIFICATION_SEMANTIC_REVIEW_CHECKS,
+  type VerificationSemanticReviewRequest,
+  type VerificationSemanticReviewRuntimeResult,
+} from "../src/verification-semantic-review-adapter.js";
+import {
+  encodeVerificationRgba8Png,
+} from "../src/verification-png.js";
+import type {
+  VerificationScreenshotRuntimeRequest,
+  VerificationScreenshotRuntimeResult,
+} from "../src/verification-visual-adapter.js";
 import {
   validVerificationCoordinatorConfig,
   validVerificationSourceIdentity,
@@ -206,6 +222,168 @@ test("IS-1705 connects registered API/browser requests to JSON and trace evidenc
   );
 });
 
+test("IS-1706 persists screenshots, semantic review, comparison guard, and advisory agentic evidence", async (t) => {
+  const fixture = await createFixture(
+    t,
+    {
+      execute_api: async (request) => validApiResult(request),
+      execute_browser: async (request) => validBrowserResult(request),
+      execute_screenshots: async (request) => validScreenshotResult(request),
+      semantic_review_active_turn: () => ({
+        capability: "localImage",
+        adapter: {
+          name: "fixture-image-review",
+          version: "1.0.0",
+        },
+      }),
+      execute_semantic_review: async (request) =>
+        validSemanticReviewResult(request),
+      execute_agentic_browser: async (request) =>
+        validAgenticResult(request),
+    },
+    10_001,
+    true,
+  );
+  const snapshot = requireV2Snapshot(
+    (await fixture.store.getRun(fixture.run_id)).verification_snapshot,
+  );
+  if (!snapshot.ui_contract.enabled) {
+    assert.fail("visual execution fixture requires the UI lane");
+  }
+  const browserCase = snapshot.ui_contract.browser_cases[0]!;
+  const task = snapshot.ui_contract.agentic_tasks[0]!;
+
+  const browser = await fixture.coordinator.runBrowserCase(fixture.run_id, {
+    action_id: "visual-browser",
+    case_id: browserCase.id,
+  });
+  if (!browser.ok) {
+    assert.fail(browser.message);
+  }
+  assert.equal(
+    (await fixture.coordinator.advance(fixture.run_id, "collecting")).accepted,
+    true,
+  );
+
+  const screenshots = await fixture.coordinator.runScreenshots(
+    fixture.run_id,
+    {
+      action_id: "visual-screenshots",
+      case_id: browserCase.id,
+    },
+  );
+  if (!screenshots.ok) {
+    assert.fail(screenshots.message);
+  }
+  assert.equal(screenshots.value.images.length, 3);
+  for (const image of screenshots.value.images) {
+    assert.equal(
+      sha256Bytes(
+        await readArtifact(snapshot, image.artifact.relative_path),
+      ),
+      image.artifact.sha256,
+    );
+  }
+  const comparisonInputs = {
+    actuals: screenshots.value.images.map((image) => ({
+      evidence: image.evidence,
+      png_bytes: image.png_bytes,
+    })),
+    baseline_png_bytes: Object.fromEntries(
+      screenshots.value.images.map((image) => [
+        image.evidence.viewport,
+        image.png_bytes,
+      ]),
+    ) as {
+      "375x812": Uint8Array;
+      "768x1024": Uint8Array;
+      "1440x900": Uint8Array;
+    },
+  };
+  await assert.rejects(
+    () =>
+      fixture.coordinator.runComparison(fixture.run_id, {
+        action_id: "forged-semantic-approval",
+        case_id: browserCase.id,
+        ...comparisonInputs,
+        semantic_review_outcome: "approved",
+      }),
+    (error: unknown) =>
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "INVALID_RECORD",
+  );
+
+  const review = await fixture.coordinator.runSemanticReview(
+    fixture.run_id,
+    {
+      action_id: "visual-review",
+      case_id: browserCase.id,
+      screenshot_paths: screenshots.value.images.map((image) =>
+        path.join(snapshot.artifact_root, image.artifact.relative_path),
+      ),
+      checklist: {
+        identity: "ui-visual-review",
+        version: "1.0.0",
+      },
+    },
+  );
+  if (!review.ok) {
+    assert.fail(review.message);
+  }
+  assert.equal(review.value.outcome, "approved");
+
+  const comparison = await fixture.coordinator.runComparison(
+    fixture.run_id,
+    {
+      action_id: "visual-comparison-no-baseline",
+      case_id: browserCase.id,
+      ...comparisonInputs,
+      semantic_review_outcome: review.value.outcome,
+    },
+  );
+  assert.equal(comparison.ok, false);
+  if (!comparison.ok) {
+    assert.equal(comparison.code, "BASELINE_NOT_APPROVED");
+  }
+
+  const agentic = await fixture.coordinator.runAgenticBrowser(
+    fixture.run_id,
+    {
+      action_id: "visual-agentic",
+      task_id: task.id,
+    },
+  );
+  if (!agentic.ok) {
+    assert.fail(agentic.message);
+  }
+  assert.equal(agentic.value.evidence.can_pass_ui_lane, false);
+  assert.equal(agentic.value.evidence.deterministic_recheck.required, true);
+  assert.equal(agentic.value.evidence.deterministic_recheck.status, "passed");
+
+  const run = await fixture.store.getRun(fixture.run_id);
+  assert.equal(
+    run.verification_records.filter(
+      (record) => record.record_type === "screenshot",
+    ).length,
+    3,
+  );
+  assert.equal(
+    run.verification_records.filter(
+      (record) => record.record_type === "review",
+    ).length,
+    3,
+  );
+  const agenticRecord = findRecord(
+    run.verification_records,
+    "agentic_browser",
+    task.id,
+  );
+  assert.equal(agenticRecord.stage, "collecting");
+  assert.equal(agenticRecord.check_required, false);
+  assert.equal(agenticRecord.artifact_references.length, 4);
+});
+
 test("TEST-1710 fails closed when the registered browser runtime is missing", async (t) => {
   const fixture = await createFixture(t, {
     execute_api: async (request) => ({
@@ -335,8 +513,21 @@ async function createFixture(
     execute_browser?: NonNullable<
       Parameters<VerificationCoordinator["registerLocalRuntime"]>[0]["execute_browser"]
     >;
+    execute_screenshots?: NonNullable<
+      Parameters<VerificationCoordinator["registerLocalRuntime"]>[0]["execute_screenshots"]
+    >;
+    semantic_review_active_turn?: NonNullable<
+      Parameters<VerificationCoordinator["registerLocalRuntime"]>[0]["semantic_review_active_turn"]
+    >;
+    execute_semantic_review?: NonNullable<
+      Parameters<VerificationCoordinator["registerLocalRuntime"]>[0]["execute_semantic_review"]
+    >;
+    execute_agentic_browser?: NonNullable<
+      Parameters<VerificationCoordinator["registerLocalRuntime"]>[0]["execute_agentic_browser"]
+    >;
   },
   serverPort = 10_001,
+  includeAgentic = false,
 ): Promise<ExecutionFixture> {
   const root = await mkdtemp(path.join(tmpdir(), "ark-team-execution-1705-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -348,8 +539,10 @@ async function createFixture(
   if (!verification.ui.enabled) {
     assert.fail("verification fixture UI lane is disabled");
   }
-  verification.ui.agentic_tasks = [];
-  verification.ui.optional_capabilities = [];
+  if (!includeAgentic) {
+    verification.ui.agentic_tasks = [];
+    verification.ui.optional_capabilities = [];
+  }
   const projectConfig = structuredClone(DEFAULT_PROJECT_CONFIG);
   projectConfig.verification.coordinator = verification;
 
@@ -383,7 +576,10 @@ async function createFixture(
       version: verification.ui.deterministic_adapter_version,
     },
     comparison: { name: "fixture-comparison", version: "1.0.0" },
-    screenshot: { name: "fixture-screenshot", version: "1.0.0" },
+    screenshot: {
+      name: verification.ui.deterministic_adapter,
+      version: verification.ui.deterministic_adapter_version,
+    },
     semantic_review: { name: "fixture-image-review", version: "1.0.0" },
     server: { name: "fixture-server", version: "1.0.0" },
   } as const;
@@ -403,6 +599,21 @@ async function createFixture(
     ...(effects.execute_browser === undefined
       ? {}
       : { execute_browser: effects.execute_browser }),
+    ...(effects.execute_screenshots === undefined
+      ? {}
+      : { execute_screenshots: effects.execute_screenshots }),
+    ...(effects.semantic_review_active_turn === undefined
+      ? {}
+      : {
+          semantic_review_active_turn:
+            effects.semantic_review_active_turn,
+        }),
+    ...(effects.execute_semantic_review === undefined
+      ? {}
+      : { execute_semantic_review: effects.execute_semantic_review }),
+    ...(effects.execute_agentic_browser === undefined
+      ? {}
+      : { execute_agentic_browser: effects.execute_agentic_browser }),
   });
 
   assert.equal(
@@ -506,6 +717,125 @@ function validApiResult(
   };
 }
 
+function validScreenshotResult(
+  request: DeepReadonly<VerificationScreenshotRuntimeRequest>,
+): VerificationScreenshotRuntimeResult {
+  return {
+    schema_version: 1,
+    contract_id: "verification_screenshot_runtime_result_v1",
+    run_id: request.run_id,
+    snapshot_id: request.snapshot_id,
+    case_id: request.case_id,
+    attempt_id: request.attempt_id,
+    case_sha256: request.case_sha256,
+    package_fingerprint: request.package_fingerprint,
+    source_fingerprint: request.source_fingerprint,
+    adapter: { ...request.adapter },
+    browser_build: request.browser_build,
+    origin: request.origin,
+    url: request.url,
+    screenshots: request.captures.map((capture) => {
+      const rgba = new Uint8Array(capture.width * capture.height * 4);
+      rgba.fill(255);
+      const bytes = encodeVerificationRgba8Png({
+        width: capture.width,
+        height: capture.height,
+        rgba,
+      });
+      return {
+        sequence: capture.sequence,
+        viewport: capture.viewport,
+        width: capture.width,
+        height: capture.height,
+        device_scale_factor: 1,
+        url: capture.url,
+        relative_path: capture.relative_path,
+        media_type: "image/png",
+        captured_at_utc: "2026-07-27T20:00:01.000Z",
+        byte_length: bytes.byteLength,
+        sha256: sha256Bytes(bytes),
+        capture: {
+          browser_chrome: "excluded",
+          full_page: false,
+          resized: false,
+          cropped: false,
+          converted: false,
+          color_space_converted: false,
+          alpha_normalized: false,
+          post_processed: false,
+        },
+        bytes,
+      };
+    }),
+  };
+}
+
+function validSemanticReviewResult(
+  request: DeepReadonly<VerificationSemanticReviewRequest>,
+): VerificationSemanticReviewRuntimeResult {
+  return {
+    schema_version: 1,
+    contract_id: "verification_semantic_review_result_v1",
+    input_sha256: request.input_sha256,
+    adapter: { ...request.identity.adapter },
+    checklist: {
+      identity: request.checklist.identity,
+      version: request.checklist.version,
+      sha256: request.checklist.sha256,
+    },
+    reviewed_at_utc: "2026-07-27T20:00:02.000Z",
+    outcome: "approved",
+    observations: VERIFICATION_SEMANTIC_REVIEW_CHECKS.map((check) => ({
+      check,
+      observation: `${check} 이상 없음`,
+    })),
+  };
+}
+
+function validAgenticResult(
+  request: DeepReadonly<VerificationAgenticBrowserRequest>,
+): VerificationAgenticBrowserRuntimeResult {
+  return {
+    schema_version: 1,
+    contract_id: "verification_agentic_browser_result_v1",
+    task_id: request.task_id,
+    task_sha256: request.task_sha256,
+    input_sha256: request.input_sha256,
+    adapter: { ...request.adapter },
+    browser_build: request.browser_build,
+    model_identity: request.model_identity,
+    origin: request.origin,
+    execution_status: "completed",
+    finding_status: "no_finding",
+    self_verdict: "achieved",
+    judge_verdict: "unknown",
+    findings: [],
+    ledger: [
+      {
+        sequence: 0,
+        action: request.allowed_actions[0]!,
+        url: request.start_url,
+        parameters: { path: "/" },
+        result: "completed",
+        error_code: null,
+        artifact_references: [],
+        timestamp_utc: "2026-07-27T20:00:03.500Z",
+      },
+    ],
+    candidates: [
+      {
+        kind: "test",
+        relative_path: `agentic/${request.task_id}/candidates/test.json`,
+        sha256: "d".repeat(64),
+        applied: false,
+      },
+    ],
+    started_at_utc: "2026-07-27T20:00:03.000Z",
+    finished_at_utc: "2026-07-27T20:00:04.000Z",
+    elapsed_ms: 1_000,
+  };
+}
+
 function requireV2Snapshot(
   snapshot: VerificationRunSnapshot | null,
 ): VerificationRunSnapshot & { schema_version: 2 } {
@@ -517,7 +847,7 @@ function requireV2Snapshot(
 
 function findRecord(
   records: readonly VerificationLinkedRecord[],
-  recordType: "request" | "browser",
+  recordType: "request" | "browser" | "agentic_browser",
   checkId: string,
 ): Extract<VerificationLinkedRecord, { schema_version: 2 }> {
   const record = records.find(

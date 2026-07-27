@@ -5538,12 +5538,12 @@ function verificationAdapterRecordStage(
   }
   if (
     recordType === "request" ||
-    recordType === "browser" ||
-    recordType === "agentic_browser"
+    recordType === "browser"
   ) {
     return "executing";
   }
   if (
+    recordType === "agentic_browser" ||
     recordType === "screenshot" ||
     recordType === "review" ||
     recordType === "comparison"
@@ -5564,12 +5564,12 @@ function verificationActionStage(
   }
   if (
     kind === "api" ||
-    kind === "browser" ||
-    kind === "agentic_browser"
+    kind === "browser"
   ) {
     return "executing";
   }
   if (
+    kind === "agentic_browser" ||
     kind === "screenshot" ||
     kind === "semantic_review" ||
     kind === "comparison" ||
