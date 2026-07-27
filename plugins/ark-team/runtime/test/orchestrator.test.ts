@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -91,6 +97,80 @@ test("TEST-801 and TEST-802 execute the exact PM plan and persist usage only", a
     );
     assert.equal(raw.includes("PRIVATE_PM_FINAL_JSON"), false);
     assert.equal(raw.includes('"private_reasoning":'), false);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("external worker catalogs pass provider-only environment names to the native planning PM", async () => {
+  const fixture = await createFixture("provider-environment");
+  try {
+    const providerEnvironmentName =
+      "ARK_TEAM_ORCHESTRATOR_CATALOG_KEY";
+    const catalogPath = path.join(fixture.root, "providers.toml");
+    await writeFile(
+      catalogPath,
+      [
+        "version = 1",
+        "",
+        "[providers.inline_provider]",
+        'adapter = "builtin:openai-chat"',
+        'base_url = "https://inline.example.invalid/v1"',
+        'auth_kind = "inline_key"',
+        'api_key = "inline-provider-canary"',
+        'structured_output_mode = "validated_json"',
+        'policy = "standard"',
+        'allowed_models = ["inline-model"]',
+        "",
+        "[providers.inline_provider.reasoning_effort_map]",
+        'xhigh = "high"',
+        "",
+        "[providers.environment_provider]",
+        'adapter = "builtin:openai-chat"',
+        'base_url = "https://environment.example.invalid/v1"',
+        'auth_kind = "env_key"',
+        `api_key_env = ${JSON.stringify(providerEnvironmentName)}`,
+        'structured_output_mode = "validated_json"',
+        'policy = "standard"',
+        'allowed_models = ["environment-model"]',
+        "",
+        "[providers.environment_provider.reasoning_effort_map]",
+        'xhigh = "high"',
+        "",
+      ].join("\n"),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    const store = new RunStore({
+      root_path: fixture.state,
+      environment: {
+        ARK_TEAM_PROVIDER_CONFIG: catalogPath,
+      },
+    });
+    const launcher = new ScriptedPmLauncher(pmResult(validPlan()));
+    const orchestrator = new ArkTeamOrchestrator(store, {
+      pm_launcher: launcher,
+      materializer: new PlanMaterializer(store, {
+        worktree_manager: new FakeWorkspaceManager(fixture.worktrees),
+      }),
+      coordinator: new SnapshotCoordinator(store),
+    });
+
+    await orchestrator.execute({
+      objective: "Keep provider credentials out of native PM",
+      project_path: fixture.project,
+      model_overrides: {
+        worker: {
+          provider: "inline_provider",
+          model: "inline-model",
+          reasoning_effort: "xhigh",
+        },
+      },
+    });
+
+    assert.deepEqual(
+      launcher.requests[0]?.provider_sensitive_env_names,
+      [providerEnvironmentName],
+    );
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

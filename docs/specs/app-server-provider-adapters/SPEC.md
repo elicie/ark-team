@@ -1,9 +1,11 @@
 # Ark Team App-Server Provider Adapters — Implementation Specification
 
-- Spec identity: `ark-team-provider-adapters-v1.0.0`
+- Spec identity: `ark-team-provider-adapters-v1.1.0`
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
-- Authority date: 2026-07-26 UTC
-- Authority: 사용자가 승인한 대화 요구사항과 이 문서의 명시적 결정
+- Authority date: 2026-07-27 UTC
+- Authority: 사용자가 승인한 대화 요구사항, inline API key 저장 지시와 이
+  문서의 명시적 결정
+- Supersedes: `ark-team-provider-adapters-v1.0.0`
 - Target workspace: `/home/elicie/Dev/arc`
 - Package shape: `SPEC.md`, `HANDOFF.md`, `STATUS.md`
 - Reference boundary: `NONE`
@@ -14,7 +16,8 @@
 
 ### OBJ-001 — Codex 전역 설정과 분리된 provider 관리
 
-Ark Team은 외부 model provider의 endpoint, adapter, credential 참조를
+Ark Team은 외부 model provider의 endpoint, adapter, credential 또는
+credential 참조를
 `~/.codex/config.toml`에 저장하거나 수정하지 않고 별도의 Ark-owned provider
 catalog에서 관리해야 한다.
 
@@ -34,8 +37,9 @@ OpenCodex 전체 제품, CLI, GUI, provider 관리 서버를 설치하지 않고
 ### OBJ-004 — 재현 가능한 resume, 실패 격리, 비밀 보호
 
 한 assignment가 시작한 provider, model, adapter revision은 resume과 retry에서
-변경되지 않아야 한다. credential은 저장·로그하지 않으며 provider 실패를 Luna나
-다른 provider로 자동 fallback하지 않아야 한다.
+변경되지 않아야 한다. inline credential은 owner-only provider catalog 밖으로
+복제·저장·로그하지 않으며 provider 실패를 Luna나 다른 provider로 자동
+fallback하지 않아야 한다.
 
 성공 신호는 다음과 같다.
 
@@ -57,7 +61,12 @@ OpenCodex 전체 제품, CLI, GUI, provider 관리 서버를 설치하지 않고
 - Git tree: `de77e16a2c257456721bd44fc260f6b90afd2af6`
 - Branch label at capture: `main`
 - Worktree state at capture: `clean`
-- Expected post-capture changes: 이 spec package의 문서 세 개
+- Delta application observation:
+  - Git HEAD:
+    `150d81a4ebe97ce0aeb2046f8f1461a73fa91742`
+  - worktree에는 사용자가 승인한 `~/.ark-team/runs` 기본값 변경과 이 spec
+    delta가 존재한다.
+  - 구현자는 실제 baseline을 다시 기록하고 해당 변경을 되돌리지 않는다.
 
 확인한 핵심 surface:
 
@@ -73,6 +82,7 @@ OpenCodex 전체 제품, CLI, GUI, provider 관리 서버를 설치하지 않고
 | Codex app-server generated schema | EXPLORED | GENERATED SOURCE | CLI 0.145.0에서 start/resume params와 responses에 `modelProvider`가 존재함 |
 | Runtime scripts/tests | EXPLORED | SOURCE, TEST | 현재 typecheck, build, unit, MCP, schema 검증 명령을 확인함 |
 | 실제 외부 provider 호출 | OUT_OF_SCOPE | NOT EXECUTED | credential 사용과 과금/정책 영향을 피하기 위해 실행하지 않음 |
+| Inline credential 요구 | EXPLORED | USER_STATEMENT | 사용자가 Ark-owned catalog에 API key 값을 직접 저장하도록 명시함 |
 
 ### 2.2 OpenCodex reference
 
@@ -117,6 +127,9 @@ Pinned source:
 - 설치된 Codex CLI `0.145.0` generated TypeScript schema에서
   `ThreadStartParams.modelProvider?`, `ThreadResumeParams.modelProvider?`,
   그리고 두 response의 필수 `modelProvider`를 확인했다.
+- Z.AI Open Platform Quick Start는 일반 API key billing endpoint
+  `https://api.z.ai/api/paas/v4/`, Bearer 인증과 `glm-5.2` Chat Completions
+  예시를 제공한다. 이는 Coding Plan 전용 endpoint와 구분된다.
 - Z.AI Coding Plan 문서는 지원 도구 밖의 subscription quota 사용을 제한한다.
   2026-07-26 확인 시 지원 목록에 Codex 또는 Ark Team은 없었다.
 
@@ -124,6 +137,8 @@ References:
 
 - [Codex custom model providers](https://developers.openai.com/codex/config-advanced/#custom-model-providers)
 - [Codex app-server](https://developers.openai.com/codex/app-server/)
+- [Z.AI Open Platform Quick Start](https://docs.z.ai/guides/overview/quick-start)
+- [Z.AI Chat Completion API](https://docs.z.ai/api-reference/llm/chat-completion)
 - [Z.AI supported tools and endpoints](https://docs.z.ai/devpack/tool/others)
 - [Z.AI Coding Plan usage policy](https://docs.z.ai/devpack/usage-policy)
 - [Z.AI subscription usage rules](https://docs.z.ai/legal-agreement/subscription-terms)
@@ -133,7 +148,7 @@ References:
 ### 포함
 
 - Ark-owned provider catalog와 strict schema
-- environment-referenced credential
+- inline 또는 environment-referenced credential
 - run 요청의 `worker` external model override
 - run/assignment provider binding snapshot
 - authenticated process-local Responses bridge
@@ -186,7 +201,8 @@ PL과 integration PL의 외부 provider 선택은 동일한 app-server transport
 ### 결정
 
 - `DEC-001`: provider catalog는 `ARK_TEAM_PROVIDER_CONFIG`가 가리키는 절대
-  TOML 파일이다. 외부 provider를 선택하지 않으면 이 변수가 없어도 된다.
+  TOML 파일이다. 이 파일은 provider credential 값을 포함할 수 있다. 외부
+  provider를 선택하지 않으면 이 변수가 없어도 된다.
 - `DEC-002`: project `.codex/team-orchestrator.toml`은 provider credential
   저장소가 아니며 현재 native model defaults를 유지한다.
 - `DEC-003`: 외부 모델은 run 입력의 explicit role override로만 활성화한다.
@@ -210,6 +226,12 @@ PL과 integration PL의 외부 provider 선택은 동일한 app-server transport
   무결성 제어이지 sandbox가 아니다.
 - `DEC-012`: Claude는 API key 경로부터 지원한다. Claude account OAuth는
   별도 credential-lifecycle slice다.
+- `DEC-013`: operator는 provider catalog에 `auth_kind = "inline_key"`와
+  `api_key`로 API key를 직접 저장할 수 있다. inline secret은 owner-only
+  catalog에서만 at-rest로 존재하며 redacted hash, binding, state, event, log,
+  argv, app-server child environment에 복제하지 않는다.
+- `DEC-014`: managed runtime 기본 state root는 `~/.ark-team/runs`이며
+  `ARK_TEAM_STATE_ROOT` override는 계속 허용한다.
 
 ### 가정
 
@@ -231,8 +253,8 @@ live activation slice만 막는다.
 
 ## 5. 용어
 
-- **Provider catalog**: endpoint, adapter ID, credential environment variable,
-  capability와 quirk를 정의하는 Ark-owned TOML.
+- **Provider catalog**: endpoint, adapter ID, inline credential 또는 credential
+  environment variable, capability와 quirk를 정의하는 Ark-owned TOML.
 - **Model binding**: 한 역할에 대해 확정된 provider, adapter, model,
   requested/effective reasoning effort의 불변 조합.
 - **Bridge**: app-server가 보내는 Responses 요청을 받아 adapter로 upstream
@@ -285,26 +307,43 @@ worker → ark_<provider> → selected model/effective effort
 - `ARK_TEAM_PROVIDER_CONFIG`는 absolute path여야 한다.
 - 외부 provider override가 존재할 때 변수가 없거나 파일을 읽을 수 없으면
   session을 시작하기 전에 실패한다.
-- catalog는 run 시작 시 strict parse하고 canonical bytes의 SHA-256을 run에
-  저장한다.
+- catalog는 run 시작 시 strict parse한다. `inline_key`가 하나라도 있으면
+  resolved catalog는 current user 소유의 regular file이어야 하고 group/other
+  permission bit가 없어야 하며, containing Ark catalog directory도
+  owner-only여야 한다.
+- catalog hash는 parsed catalog의 canonical safe projection으로 계산한다.
+  모든 `api_key` 값은 고정 sentinel `<redacted:inline-key>`로 치환한 뒤
+  SHA-256을 run에 저장한다.
 - restart/resume 시 같은 catalog hash가 아니면
   `PROVIDER_CONFIG_DRIFT`로 pause한다. 변경된 설정을 기존 session에 적용하지
   않는다.
-- raw credential value는 hash, snapshot, event, error에 포함하지 않는다.
+- inline key 값만 회전한 경우 redacted catalog hash는 바뀌지 않으며 다음
+  request/resume은 현재 catalog의 key를 사용한다. `auth_kind`, endpoint,
+  provider, model policy 또는 다른 non-secret 값 변경은 drift를 발생시킨다.
+- raw credential value는 inline catalog 원본, parent-process environment 원본,
+  runtime secret memory 밖의 hash, snapshot, binding, event, error에 포함하지
+  않는다.
 
 ### 7.2 예시 schema
 
 ```toml
 version = 1
 
-[providers.zai]
+[providers.zai_open_platform]
 adapter = "builtin:openai-chat"
-base_url = "https://api.z.ai/api/coding/paas/v4"
-auth_kind = "env_key"
-api_key_env = "ZAI_API_KEY"
+base_url = "https://api.z.ai/api/paas/v4/"
+auth_kind = "inline_key"
+api_key = "replace-with-Z.AI-api-key"
 structured_output_mode = "validated_json"
-model_suffix_bracket_strip = true
 policy = "blocked"
+allowed_models = ["glm-5.2"]
+
+[providers.zai_open_platform.reasoning_effort_map]
+minimal = "minimal"
+low = "high"
+medium = "high"
+high = "high"
+xhigh = "max"
 
 [providers.anthropic_api]
 adapter = "builtin:anthropic"
@@ -339,8 +378,14 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 - `base_url`에 userinfo, fragment, embedded credential이 있으면 거부한다.
 - HTTPS가 기본이다. private/local HTTP upstream은
   `allow_private_network = true`가 명시된 provider만 허용한다.
-- `api_key_env`는 environment variable 이름만 허용하고 값은 허용하지 않는다.
-- `auth_kind`는 initial scope에서 `env_key` 또는 `none`이다.
+- `auth_kind = "env_key"`는 `api_key_env` 하나를 요구하고 `api_key`를
+  금지한다. `api_key_env`는 environment variable 이름만 허용한다.
+- `auth_kind = "inline_key"`는 `api_key` 하나를 요구하고 `api_key_env`를
+  금지한다. `api_key`는 비어 있거나 leading/trailing whitespace, CR, LF, NUL을
+  포함하면 거부한다.
+- `auth_kind = "none"`은 `api_key`와 `api_key_env`를 모두 금지한다.
+- inline credential이 있는 catalog의 owner/permission을 안전하게 검증할 수
+  없으면 request 전에 `PROVIDER_CONFIG_INSECURE_PERMISSIONS`로 중단한다.
 - `policy`는 `standard` 또는 `blocked`다. `blocked` provider는 network request
   전에 `PROVIDER_POLICY_BLOCKED`로 중단한다. 다른 승인 형태는 후속 spec
   delta 없이는 추가하지 않는다.
@@ -532,8 +577,10 @@ adapter가 raw provider event를 app-server에 직접 노출하지 않는다.
 - high-entropy bearer token 없이는 모든 request를 거부한다.
 - token은 assignment/app-server child별로 발급하고 child environment에만
   넣는다.
-- upstream credential은 bridge 내부에서 `api_key_env`로 resolve하며
-  app-server child에 전달하지 않는다.
+- upstream credential은 bridge 내부의 credential resolver가 request 시점마다
+  안전한 catalog owner/permission을 다시 확인한 뒤 inline `api_key`를 다시
+  읽거나 `api_key_env`의 현재 parent-process value를 읽어 제공한다.
+  app-server child에는 전달하지 않는다.
 - provider path/query, authorization header, raw request/response body를
   일반 log에 기록하지 않는다.
 - last external session이 끝나면 listener를 종료할 수 있다. always-on daemon은
@@ -557,10 +604,11 @@ raw token 값과 upstream credential은 argv에 넣지 않는다. 기존
 유지한다.
 
 external app-server child는
-`$ARK_TEAM_STATE_ROOT/runs/<run-id>/external-codex-home`을 `CODEX_HOME`으로
-사용한다. directory는 owner-only 권한으로 만들고 같은 run의 resume에서
-재사용한다. 사용자 `~/.codex`를 provider 설정이나 external session state에
-사용하지 않는다.
+`$ARK_TEAM_STATE_ROOT/<run-id>/external-codex-home`을 `CODEX_HOME`으로
+사용한다. 기본 경로는
+`~/.ark-team/runs/<run-id>/external-codex-home`이다. directory는 owner-only
+권한으로 만들고 같은 run의 resume에서 재사용한다. 사용자 `~/.codex`를
+provider 설정이나 external session state에 사용하지 않는다.
 
 `thread/start`와 `thread/resume`은 다음을 포함한다.
 
@@ -609,7 +657,8 @@ fallback하지 않는다.
 | `PROVIDER_CONFIG_INVALID` | schema, URL, ID, unknown key가 유효하지 않음 |
 | `PROVIDER_CONFIG_DRIFT` | resume 시 catalog hash가 변경됨 |
 | `PROVIDER_NOT_FOUND` | override provider가 catalog에 없음 |
-| `PROVIDER_CREDENTIAL_MISSING` | required environment credential이 없음 |
+| `PROVIDER_CREDENTIAL_MISSING` | required inline/environment credential이 없음 |
+| `PROVIDER_CONFIG_INSECURE_PERMISSIONS` | inline credential catalog의 owner-only 접근을 검증할 수 없음 |
 | `PROVIDER_CAPABILITY_UNSUPPORTED` | tools/reasoning/structured output 요구를 충족하지 못함 |
 | `ADAPTER_NOT_FOUND` | builtin 또는 custom adapter가 없음 |
 | `ADAPTER_HASH_MISMATCH` | custom module hash가 catalog와 다름 |
@@ -644,6 +693,11 @@ bounded issues만 저장한다.
 ### Security
 
 - project-controlled config에서 executable custom adapter path를 읽지 않는다.
+- inline credential catalog는 current user만 읽을 수 있어야 하며 unsafe
+  owner/permission이면 fail closed한다.
+- raw inline/environment key는 원래 credential source 밖의 safe provider
+  config, canonical hash, binding, state, event, error, log, argv 또는 child
+  environment로 복사하지 않는다.
 - custom module hash를 import 전에 검증한다.
 - bridge는 loopback과 bearer auth를 동시에 요구한다.
 - child argv와 logs에 secrets를 넣지 않는다.
@@ -665,8 +719,12 @@ bounded issues만 저장한다.
 
 - no override run의 Sol/Terra/Luna model contract와 current approval behavior를
   변경하지 않는다.
+- 기존 `env_key` catalog는 계속 유효하며 `inline_key`로 자동 변환하지 않는다.
 - old assignment record에 binding이 없으면 native 역할 binding으로만 읽는다.
 - project config `version = 1`과 fixed model defaults를 변경하지 않는다.
+- managed runtime state root 기본값은 `~/.ark-team/runs`이고 명시적
+  `ARK_TEAM_STATE_ROOT`는 계속 우선한다. legacy
+  `~/.codex/team-orchestrator/runs` record는 자동 이동하지 않는다.
 - `verify-app-server-schema`에 `modelProvider` 필드와 custom provider config
   compatibility 검사를 추가한다.
 - external path는 installed Codex CLI `0.145.0` baseline에서 검증하고 향후 CLI
@@ -684,18 +742,21 @@ bounded issues만 저장한다.
 
 ## 14. Normative requirements
 
-### REQ-001 — 별도 provider catalog와 secret 참조
+### REQ-001 — 별도 provider catalog와 credential 방식
 
 - Level: MUST
-- Source: USER_REQUIREMENT, DEC-001, DEC-002
+- Source: USER_REQUIREMENT, DEC-001, DEC-002, DEC-013
 - Actors: operator, ProviderCatalog
 - Preconditions: external override가 요청됨
 - Trigger: run이 binding을 해석함
-- Observable result: absolute Ark provider catalog를 strict parse하고 credential
-  값이 아닌 environment variable 이름만 사용함
+- Observable result: absolute Ark provider catalog를 strict parse하고 각
+  provider가 mutually exclusive `inline_key`, `env_key`, `none` credential
+  contract 중 하나를 사용함
 - State/error behavior: missing/invalid catalog 또는 credential은 session 시작 전
-  명시적 provider error로 실패함
-- Permissions/privacy: 사용자 Codex config를 쓰지 않고 secret을 저장하지 않음
+  명시적 provider error로 실패하며 inline catalog의 unsafe owner/permission도
+  fail closed함
+- Permissions/privacy: inline secret은 owner-only catalog에 저장할 수 있지만
+  사용자 Codex config, project config, state, event, log에는 저장하지 않음
 - Exclusions: project config credential
 - Acceptance: AC-001
 - Verification: TEST-001
@@ -734,13 +795,14 @@ bounded issues만 저장한다.
 ### REQ-004 — 불변 binding snapshot
 
 - Level: MUST
-- Source: DEC-008
+- Source: DEC-008, DEC-013
 - Actors: RunStore, scheduler
 - Preconditions: binding preflight가 성공함
 - Trigger: run/assignment 생성, resume, retry
 - Observable result: provider/adapter/model/effort/config hash를 저장하고 모든
   continuation에서 같은 값을 사용함
-- State/error behavior: config/adapter drift는 pause/error이며 재해석하지 않음
+- State/error behavior: non-secret config/adapter drift는 pause/error이며
+  재해석하지 않는다. inline key 값만 회전한 경우에는 redacted hash가 유지됨
 - Permissions/privacy: credential value와 full credential URL을 저장하지 않음
 - Exclusions: live config switching
 - Acceptance: AC-004
@@ -749,14 +811,15 @@ bounded issues만 저장한다.
 ### REQ-005 — 인증된 process-local bridge
 
 - Level: MUST
-- Source: DEC-005, DEC-006, DEC-007
+- Source: DEC-005, DEC-006, DEC-007, DEC-013
 - Actors: ProviderBridge, app-server child
 - Preconditions: valid external binding
 - Trigger: first external assignment starts
 - Observable result: authenticated `127.0.0.1` listener가 port 10001 이상에서
   시작되고 upstream credential은 bridge 안에서만 resolve됨
 - State/error behavior: unauthenticated, malformed, wrong-provider request를 거부함
-- Permissions/privacy: public/non-loopback bind와 raw secret logging 금지
+- Permissions/privacy: public/non-loopback bind, raw secret logging, catalog
+  credential의 app-server child 전달 금지
 - Exclusions: sidecar, daemon, Docker
 - Acceptance: AC-005
 - Verification: TEST-005
@@ -840,12 +903,12 @@ bounded issues만 저장한다.
 ### REQ-011 — Audit와 redaction
 
 - Level: MUST
-- Source: SECURITY_DECISION
+- Source: SECURITY_DECISION, DEC-013
 - Actors: RunStore, logger
 - Preconditions: provider lifecycle event가 발생함
 - Trigger: select/start/retry/complete/fail
-- Observable result: provider/model/adapter/config hashes와 usage를 기록하고 secret,
-  raw auth, private reasoning을 기록하지 않음
+- Observable result: provider/model/adapter/redacted config hashes와 usage를
+  기록하고 catalog 밖에는 secret, raw auth, private reasoning을 기록하지 않음
 - State/error behavior: secret-bearing record는 schema에서 거부됨
 - Permissions/privacy: bounded diagnostics
 - Exclusions: raw payload archive
@@ -855,12 +918,13 @@ bounded issues만 저장한다.
 ### REQ-012 — Native 호환성과 사용자 Codex 상태 비변경
 
 - Level: MUST
-- Source: USER_REQUIREMENT, DEC-004
+- Source: USER_REQUIREMENT, DEC-004, DEC-014
 - Actors: native worker, external app-server child
 - Preconditions: native 또는 external run
 - Trigger: session lifecycle
 - Observable result: native no-override behavior가 그대로 유지되고 external
-  session은 isolated Ark `CODEX_HOME`을 사용함
+  session은 `~/.ark-team/runs` 또는 explicit `ARK_TEAM_STATE_ROOT` 아래의
+  isolated Ark `CODEX_HOME`을 사용함
 - State/error behavior: old native records를 external로 오인하지 않음
 - Permissions/privacy: external path가 사용자 Codex config/state를 쓰지 않음
 - Exclusions: native auth/state migration
@@ -916,10 +980,12 @@ bounded issues만 저장한다.
 
 ### AC-001
 
-Given a valid catalog using environment references and an external override,
-when the run resolves the provider, then it loads the provider without reading
-a raw key from TOML. Missing variables, unknown keys, inline secrets, or invalid
-URLs fail before app-server launch.
+Given valid `inline_key`, `env_key`, and `none` provider entries and an external
+override, when the run resolves each provider, then it accepts exactly the
+credential field allowed by that auth kind. Inline keys load only from an
+owner-only catalog, and missing credentials, unsafe permissions, mixed auth
+fields, unknown keys, or invalid URLs fail before app-server launch without
+echoing the key.
 
 ### AC-002
 
@@ -938,15 +1004,17 @@ provider/model/effective effort. Neither run infers another selection.
 ### AC-004
 
 Given an external assignment that has started, when catalog content, adapter
-bytes, or current defaults change before resume, then resume uses the stored
-binding only when hashes still match; otherwise it stops with drift and never
-switches model/provider.
+bytes, or current defaults change before resume, then non-secret changes stop
+with drift and never switch model/provider. Changing only an inline `api_key`
+keeps the redacted catalog hash stable and uses the current key without changing
+the stored binding.
 
 ### AC-005
 
 Given a prepared external binding, when the bridge starts, then it listens only
 on `127.0.0.1` at a recorded port of at least 10001, rejects absent/wrong bearer
-tokens, and keeps the upstream key out of the child environment and logs.
+tokens, and keeps inline/environment upstream keys out of the child environment,
+argv, state, and logs.
 
 ### AC-006
 
@@ -983,8 +1051,11 @@ user retry decision. No native or alternate provider request is made.
 
 ### AC-011
 
-Given a provider run containing canary secrets in keys, headers, URLs, and
-errors, when persisted records and logs are scanned, then no canary appears;
+Given a provider run containing canary secrets in inline catalog fields,
+environment values, headers, URLs, and errors, when safe config objects,
+canonical hashes, child argv/environment, persisted records, and logs are
+scanned, then no canary appears outside the original inline catalog or
+parent-process environment credential source;
 provider/model/adapter hashes, usage, counters, and bounded errors remain
 observable.
 
@@ -993,7 +1064,8 @@ observable.
 Given a clean no-override baseline and an external run, when both complete
 their session lifecycle, then native Luna request fixtures remain byte-for-byte
 compatible where not intentionally extended, the external child uses the
-isolated run home, and user `~/.codex/config.toml` is unchanged.
+isolated `~/.ark-team/runs` home by default, and user
+`~/.codex/config.toml` is unchanged.
 
 ### AC-013
 
@@ -1004,7 +1076,7 @@ notice, with no CLI/GUI/management/config-mutation code included.
 
 ### AC-014
 
-Given the Z.AI Coding Plan catalog example, when live activation is requested
+Given a policy-blocked Z.AI Coding Plan provider entry, when live activation is requested
 without provider confirmation or a separate written agreement, then the run
 fails with `PROVIDER_POLICY_BLOCKED` before a quota-consuming request. Offline
 adapter tests remain available.
@@ -1022,10 +1094,10 @@ passes, native regression passes, and no real paid provider is contacted.
 
 - Covers: REQ-001, AC-001
 - Level: unit, security
-- Setup: temporary provider TOML and canary environment values
-- Procedure: valid parse plus missing path/key, inline secret, unknown key,
-  invalid/private URL cases
-- Expected: valid safe config only; bounded error messages without canary
+- Setup: owner-only temporary provider TOML with inline and environment canaries
+- Procedure: parse all auth kinds; test missing/mixed fields, empty or malformed
+  inline values, unsafe mode/owner, unknown key, invalid/private URL
+- Expected: valid auth unions only; safe projection and errors contain no canary
 - Evidence: focused provider-config test output
 
 ### TEST-002
@@ -1050,18 +1122,23 @@ passes, native regression passes, and no real paid provider is contacted.
 
 - Covers: REQ-004, AC-004
 - Level: unit, recovery
-- Setup: persisted run/assignment with binding and changed catalog/module
-- Procedure: reopen, resume, retry, then introduce drift
-- Expected: stable binding when hashes match; drift error otherwise
+- Setup: persisted run/assignment with binding, inline key, and changed
+  catalog/module fixtures
+- Procedure: reopen, rotate only the inline key, resume/retry, then change a
+  non-secret field and adapter bytes
+- Expected: key-only rotation retains the hash/binding; non-secret or adapter
+  change produces drift
 - Evidence: state-store reopen and recovery tests
 
 ### TEST-005
 
 - Covers: REQ-005, AC-005
 - Level: integration, security
-- Setup: process-local bridge with fake upstream
-- Procedure: inspect bind/port; send no/wrong/right token; inspect child env/logs
-- Expected: only authenticated loopback request succeeds; no upstream secret leak
+- Setup: process-local bridge with inline-key and env-key fake upstreams
+- Procedure: inspect bind/port; send no/wrong/right bridge token; inspect child
+  argv/environment, state, and logs
+- Expected: only authenticated loopback requests succeed; neither upstream
+  secret leaks
 - Evidence: bridge integration test
 
 ### TEST-006
@@ -1114,9 +1191,12 @@ passes, native regression passes, and no real paid provider is contacted.
 
 - Covers: REQ-011, AC-011
 - Level: security
-- Setup: canaries in credential, header, endpoint query, upstream error/body
-- Procedure: execute failure paths and recursively scan persisted state/logs
-- Expected: no canary, required audit fields present
+- Setup: distinct canaries in inline key, environment credential, header,
+  endpoint query, upstream error/body
+- Procedure: execute success/failure paths and recursively scan safe config,
+  hashes, child args/env, persisted state, and logs
+- Expected: no canary outside the original inline catalog/environment source;
+  required audit fields remain present
 - Evidence: redaction test report
 
 ### TEST-012
@@ -1162,21 +1242,22 @@ passes, native regression passes, and no real paid provider is contacted.
 - Status: APPROVED
 - Objective: OBJ-001, OBJ-002, OBJ-004
 - Includes: REQ-001, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007,
-  REQ-009, REQ-010, REQ-011, REQ-012, REQ-015, and the
+  REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-015, and the
   `builtin:openai-chat` portion of REQ-008
 - Acceptance: AC-001, AC-003, AC-004, AC-005, AC-006, AC-007, AC-009,
-  AC-010, AC-011, AC-012, AC-015
+  AC-010, AC-011, AC-012, AC-013, AC-015
 - Verification: TEST-001, TEST-003, TEST-004, TEST-005, TEST-006, TEST-007,
-  TEST-009, TEST-010, TEST-011, TEST-012, TEST-015
+  TEST-009, TEST-010, TEST-011, TEST-012, TEST-013, TEST-015
 - Dependencies: Codex CLI 0.145.0 baseline, current app-server worker path
 - Excludes: real paid provider, custom module, Anthropic/Google, OAuth
-- External contracts affected: execute input, persisted run/assignment,
-  app-server provider/start/resume
+- External contracts affected: execute input, provider catalog auth union,
+  redacted catalog hash, persisted run/assignment, app-server
+  provider/start/resume
 - Rollback/recovery: omit override and use native Luna; preserve external run
   state for diagnosis
 - Completion rule: fake OpenAI-compatible upstream에서 worker structured report가
-  app-server end-to-end로 완료되고 native regression과 no-global-config 검사가
-  통과함
+  inline/env credential 양쪽으로 app-server end-to-end 완료되고 native
+  regression, provenance, permission, redaction, no-global-config 검사가 통과함
 
 ### SLICE-002 — Claude API-key worker
 
@@ -1268,7 +1349,7 @@ passes, native regression passes, and no real paid provider is contacted.
 | OBJ-004 | REQ-010 | AC-010 | TEST-010 | SLICE-001, SLICE-002, SLICE-003, SLICE-004 |
 | OBJ-004 | REQ-011 | AC-011 | TEST-011 | SLICE-001, SLICE-002, SLICE-003, SLICE-004 |
 | OBJ-001, OBJ-002 | REQ-012 | AC-012 | TEST-012 | SLICE-001 |
-| OBJ-003 | REQ-013 | AC-013 | TEST-013 | SLICE-002, SLICE-003 |
+| OBJ-003 | REQ-013 | AC-013 | TEST-013 | SLICE-001, SLICE-002, SLICE-003 |
 | OBJ-002, OBJ-004 | REQ-014 | AC-014 | TEST-014 | SLICE-005 |
 | OBJ-004 | REQ-015 | AC-015 | TEST-015 | SLICE-001, SLICE-002, SLICE-003, SLICE-004 |
 
@@ -1288,6 +1369,8 @@ passes, native regression passes, and no real paid provider is contacted.
 | `DEC-010` | Pinned OpenCodex code를 attribution과 함께 최소 port |
 | `DEC-011` | Custom adapter는 trusted executable code |
 | `DEC-012` | Claude API key 먼저, OAuth는 별도 delta |
+| `DEC-013` | Owner-only provider catalog의 inline API key를 정식 지원 |
+| `DEC-014` | Managed runtime 기본 state root는 `~/.ark-team/runs` |
 
 ## 20. Approval result
 
@@ -1297,4 +1380,6 @@ passes, native regression passes, and no real paid provider is contacted.
 - Warning: Z.AI Coding Plan live activation은 현재 공식 supported-tool 정책에
   의해 승인되지 않았다.
 - Warning: custom adapter hash pinning은 code sandbox가 아니다.
+- Warning: inline API key는 operator catalog에 plaintext로 존재하므로
+  owner-only permission과 backup/version-control 제외가 필수다.
 - Next action: `SLICE-001`을 `sdd-implementation-loop`으로 구현한다.

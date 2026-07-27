@@ -30,7 +30,7 @@ cleanup_verified_worktrees = true
 require_approval_for_remote_actions = true
 
 [logging]
-root = "~/.codex/team-orchestrator/runs"
+root = "~/.ark-team/runs"
 retention_days = 30
 record_usage = true
 record_private_reasoning = false

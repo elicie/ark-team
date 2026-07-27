@@ -87,9 +87,20 @@ plugins/ark-team/
 - `ark_team_assignment_retry_decide`
 - `ark_team_assignment_cancel`
 
-실행 정보는 기본적으로 `~/.codex/team-orchestrator/runs` 아래에 원자적
+실행 정보는 기본적으로 `~/.ark-team/runs` 아래에 원자적
 JSON 레코드로 저장됩니다. 다른 위치를 사용하려면 Codex를 시작하기 전에
 절대 경로인 `ARK_TEAM_STATE_ROOT` 환경 변수를 설정합니다.
+
+Worker만 외부 OpenAI Chat 호환 provider로 명시적으로 교체할 수 있습니다.
+Codex 시작 전에 `ARK_TEAM_PROVIDER_CONFIG`에 Ark-owned version-1 catalog의
+절대 경로를 설정하고, `ark_team_start` 또는 `ark_team_execute` 입력의
+`model_overrides.worker`에 provider, model, reasoning effort를 지정합니다.
+Override를 생략하면 기존 Luna/xhigh worker가 그대로 사용됩니다. Catalog
+형식과 inline/env credential 권한 규칙은
+`plugins/ark-team/skills/ark-team/references/configuration.md`를 따릅니다.
+설치된 plugin manifest는 catalog 경로와 샘플 `ZAI_API_KEY`를 전달합니다.
+다른 이름의 `env_key`를 쓰면 Codex 시작 전에 해당 이름도 MCP 환경 변수
+전달 목록에 추가해야 합니다.
 
 런타임은 실행을 생성할 때 선택한 프로젝트의
 `.codex/team-orchestrator.toml`을 엄격하게 불러오고, 문서화된 기본값을

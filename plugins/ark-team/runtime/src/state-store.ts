@@ -57,6 +57,15 @@ import {
   projectConfigSchema,
   type ProjectConfig,
 } from "./project-config.js";
+import {
+  resolveProviderSensitiveEnvironmentNames,
+  resolveRunWorkerBinding,
+} from "./provider-config.js";
+import {
+  createNativeModelBinding,
+  type ModelOverrides,
+  type ResolvedModelBindingV1,
+} from "./provider-types.js";
 import { assertRunId, createRunId } from "./run-id.js";
 import {
   APPROVED_VERIFICATION_PACKAGE,
@@ -77,6 +86,7 @@ import type { PreparedTeamWorkspace } from "./worktree-manager.js";
 
 export interface RunStoreOptions {
   root_path?: string;
+  environment?: NodeJS.ProcessEnv;
   now?: () => Date;
   suffix?: () => string;
   assignment_suffix?: () => string;
@@ -93,6 +103,7 @@ export interface CreateRunInput {
   project_path: string;
   project_config?: ProjectConfig;
   project_config_source?: string | null;
+  model_overrides?: ModelOverrides;
 }
 
 export interface RecordVerificationSnapshotInput {
@@ -254,7 +265,7 @@ const ACTIVE_STATES = new Set<RunState>([
 export function resolveStateRoot(environment = process.env): string {
   const configured = environment.ARK_TEAM_STATE_ROOT?.trim();
   if (!configured) {
-    return path.join(homedir(), ".codex", "team-orchestrator", "runs");
+    return path.join(homedir(), ".ark-team", "runs");
   }
 
   if (configured === "~") {
@@ -287,10 +298,12 @@ export class RunStore {
   private readonly verificationPackageLoader: (
     projectPath: string,
   ) => Promise<string | Uint8Array>;
+  private readonly providerEnvironment: NodeJS.ProcessEnv;
   private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(options: RunStoreOptions = {}) {
     this.root_path = path.resolve(options.root_path ?? resolveStateRoot());
+    this.providerEnvironment = options.environment ?? process.env;
     this.now = options.now ?? (() => new Date());
     this.suffix = options.suffix ?? (() => randomBytes(3).toString("hex"));
     this.assignmentSuffix =
@@ -302,6 +315,14 @@ export class RunStore {
       options.verification_package_loader ??
       ((projectPath) =>
         readFile(path.join(projectPath, "docs", "slices", "SLICE-017.md")));
+  }
+
+  async providerSensitiveEnvironmentNames(
+    binding: ResolvedModelBindingV1,
+  ): Promise<string[]> {
+    return resolveProviderSensitiveEnvironmentNames(binding, {
+      environment: this.providerEnvironment,
+    });
   }
 
   async createRun(input: CreateRunInput): Promise<RunRecord> {
@@ -357,6 +378,10 @@ export class RunStore {
           "project configuration source must be absolute",
         );
       }
+      const workerBinding = await resolveRunWorkerBinding(
+        input.model_overrides,
+        { environment: this.providerEnvironment },
+      );
 
       await this.ensureRoot();
       const timestamp = this.now();
@@ -382,6 +407,9 @@ export class RunStore {
         verification_snapshot: null,
         verification_snapshot_sha256: null,
         verification_records: [],
+        model_bindings: {
+          worker: workerBinding,
+        },
       };
       const event: RunEvent = {
         schema_version: 1,
@@ -1412,6 +1440,10 @@ export class RunStore {
 
       const timestamp = this.now().toISOString();
       const assignmentId = this.allocateAssignmentId(persisted);
+      const modelBinding =
+        input.role === "worker"
+          ? persisted.run.model_bindings.worker
+          : createNativeModelBinding("gpt-5.6-terra", "xhigh");
       const assignment: AssignmentRecord = {
         schema_version: 1,
         assignment_id: assignmentId,
@@ -1447,6 +1479,7 @@ export class RunStore {
         turn_count: 1,
         session_attempt_count: 1,
         correction_count: 0,
+        model_binding: modelBinding,
       };
       const nextState =
         persisted.run.state === "waiting_user"
@@ -1454,9 +1487,41 @@ export class RunStore {
           : input.role === "integration_pl"
             ? "integrating"
             : "executing";
+      const providerSelectedEvent: RunEvent | null =
+        modelBinding.kind === "external"
+          ? {
+              schema_version: 1,
+              sequence: persisted.run.event_count + 1,
+              event_id: randomUUID(),
+              event_type: "assignment.provider_selected",
+              timestamp,
+              state: nextState,
+              assignment_id: assignmentId,
+              team_id: assignment.team_id,
+              agent_role: assignment.role,
+              message: "external worker provider selected",
+              provider_id: modelBinding.provider_id,
+              app_server_provider_id:
+                modelBinding.app_server_provider_id,
+              adapter_id: modelBinding.adapter_id,
+              adapter_api_version: modelBinding.adapter_api_version,
+              adapter_sha256: modelBinding.adapter_sha256,
+              provider_config_sha256:
+                modelBinding.provider_config_sha256,
+              model: modelBinding.model,
+              requested_reasoning_effort:
+                modelBinding.requested_reasoning_effort,
+              effective_reasoning_effort:
+                modelBinding.effective_reasoning_effort,
+              structured_output_mode:
+                modelBinding.structured_output_mode,
+            }
+          : null;
       const event: RunEvent = {
         schema_version: 1,
-        sequence: persisted.run.event_count + 1,
+        sequence:
+          persisted.run.event_count +
+          (providerSelectedEvent === null ? 1 : 2),
         event_id: randomUUID(),
         event_type: "assignment.started",
         timestamp,
@@ -1473,7 +1538,9 @@ export class RunStore {
           nextState === "waiting_user" ? persisted.run.resume_state : null,
         updated_at: timestamp,
         revision: persisted.run.revision + 1,
-        event_count: persisted.run.event_count + 1,
+        event_count:
+          persisted.run.event_count +
+          (providerSelectedEvent === null ? 1 : 2),
         assignment_count: persisted.run.assignment_count + 1,
       };
       const teams =
@@ -1502,7 +1569,13 @@ export class RunStore {
 
       await this.writePersistedRun({
         run: updatedRun,
-        events: [...persisted.events, event],
+        events: [
+          ...persisted.events,
+          ...(providerSelectedEvent === null
+            ? []
+            : [providerSelectedEvent]),
+          event,
+        ],
         assignments: [...persisted.assignments, assignment],
         teams,
         plan: persisted.plan,
@@ -2093,6 +2166,72 @@ export class RunStore {
     });
   }
 
+  async recordProviderBridgeStarted(
+    runId: string,
+    assignmentId: string,
+    port: number,
+  ): Promise<RunEvent> {
+    return this.withMutation(async () => {
+      if (!Number.isInteger(port) || port < 10001 || port > 65535) {
+        throw new ArkTeamError(
+          "INVALID_INPUT",
+          "provider bridge port must be between 10001 and 65535",
+        );
+      }
+      const persisted = await this.readPersistedRun(runId);
+      const assignment = findAssignment(persisted, assignmentId);
+      const binding = assignment.model_binding;
+      if (
+        assignment.role !== "worker" ||
+        assignment.state !== "running" ||
+        binding.kind !== "external"
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "provider bridge diagnostics require a running external worker",
+        );
+      }
+      const timestamp = this.now().toISOString();
+      const event: RunEvent = {
+        schema_version: 1,
+        sequence: persisted.run.event_count + 1,
+        event_id: randomUUID(),
+        event_type: "assignment.provider_bridge_started",
+        timestamp,
+        state: persisted.run.state,
+        assignment_id: assignment.assignment_id,
+        team_id: assignment.team_id,
+        agent_role: assignment.role,
+        message: "external worker provider bridge started",
+        provider_id: binding.provider_id,
+        app_server_provider_id: binding.app_server_provider_id,
+        adapter_id: binding.adapter_id,
+        adapter_api_version: binding.adapter_api_version,
+        adapter_sha256: binding.adapter_sha256,
+        provider_config_sha256: binding.provider_config_sha256,
+        model: binding.model,
+        requested_reasoning_effort:
+          binding.requested_reasoning_effort,
+        effective_reasoning_effort:
+          binding.effective_reasoning_effort,
+        structured_output_mode: binding.structured_output_mode,
+        bridge_port: port,
+      };
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        event_count: persisted.run.event_count + 1,
+      };
+      await this.writePersistedRun({
+        ...persisted,
+        run,
+        events: [...persisted.events, event],
+      });
+      return event;
+    });
+  }
+
   async listAssignments(
     runId: string,
     input: ListAssignmentsInput = {},
@@ -2308,6 +2447,7 @@ export class RunStore {
             agent_role: assignment.role,
             usage: update.usage,
             message: `${assignment.role} assignment completed`,
+            ...providerAuditFields(assignment),
           },
           {
             schema_version: 1,
@@ -3226,12 +3366,14 @@ export class RunStore {
     runId: string,
     assignmentId: string,
     failureMessage: string,
+    failureCode?: string,
   ): Promise<AssignmentRecord> {
     return this.finishAssignmentAbnormally(
       runId,
       assignmentId,
       "failed",
       failureMessage,
+      failureCode,
     );
   }
 
@@ -3373,6 +3515,7 @@ export class RunStore {
     assignmentId: string,
     state: "failed" | "paused" | "cancelled",
     rawMessage: string,
+    failureCode?: string,
   ): Promise<AssignmentRecord> {
     return this.withMutation(async () => {
       const persisted = await this.readPersistedRun(runId);
@@ -3435,6 +3578,12 @@ export class RunStore {
         team_id: assignment.team_id,
         agent_role: assignment.role,
         message,
+        ...providerAuditFields(assignment),
+        ...(state === "failed" &&
+        failureCode !== undefined &&
+        assignment.model_binding.kind === "external"
+          ? { provider_error_code: failureCode.slice(0, 80) }
+          : {}),
       });
       const sequencedEvents = events.map((event, index) => ({
         ...event,
@@ -3684,11 +3833,33 @@ function retryAttemptEvents(input: {
     session_attempt_count: input.assignment.session_attempt_count,
     correction_count: input.assignment.correction_count,
     message: input.message,
+    ...providerAuditFields(input.assignment),
   });
   return events.map((event, index) => ({
     ...event,
     sequence: input.persisted.run.event_count + index + 1,
   }));
+}
+
+function providerAuditFields(assignment: AssignmentRecord) {
+  const binding = assignment.model_binding;
+  if (binding.kind === "native") {
+    return {};
+  }
+  return {
+    provider_id: binding.provider_id,
+    app_server_provider_id: binding.app_server_provider_id,
+    adapter_id: binding.adapter_id,
+    adapter_api_version: binding.adapter_api_version,
+    adapter_sha256: binding.adapter_sha256,
+    provider_config_sha256: binding.provider_config_sha256,
+    model: binding.model,
+    requested_reasoning_effort:
+      binding.requested_reasoning_effort,
+    effective_reasoning_effort:
+      binding.effective_reasoning_effort,
+    structured_output_mode: binding.structured_output_mode,
+  };
 }
 
 function invalidTransition(operation: string, state: RunState): ArkTeamError {

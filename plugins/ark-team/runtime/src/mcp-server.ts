@@ -18,6 +18,7 @@ import {
 } from "./orchestrator.js";
 import { PlanMaterializer } from "./plan-materializer.js";
 import { loadProjectConfig } from "./project-config.js";
+import { modelOverridesSchema } from "./provider-types.js";
 import { pmPlanSchema } from "./role-contracts.js";
 import { RunStore } from "./state-store.js";
 import { TeamCoordinator } from "./team-coordinator.js";
@@ -73,6 +74,7 @@ export function createArkTeamMcpServer(
       inputSchema: {
         objective: z.string().min(1).max(20_000),
         project_path: z.string().min(1),
+        model_overrides: modelOverridesSchema.optional(),
       },
       annotations: {
         readOnlyHint: false,
@@ -81,7 +83,7 @@ export function createArkTeamMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ objective, project_path }) =>
+    async ({ objective, project_path, model_overrides }) =>
       handleTool(async () => {
         const resolved = await loadProjectConfig(project_path);
         return {
@@ -90,6 +92,9 @@ export function createArkTeamMcpServer(
             project_path,
             project_config: resolved.config,
             project_config_source: resolved.source_path,
+            ...(model_overrides === undefined
+              ? {}
+              : { model_overrides }),
           }),
         };
       }),
@@ -104,6 +109,7 @@ export function createArkTeamMcpServer(
       inputSchema: {
         objective: z.string().min(1).max(20_000),
         project_path: z.string().min(1),
+        model_overrides: modelOverridesSchema.optional(),
       },
       annotations: {
         readOnlyHint: false,
@@ -112,9 +118,15 @@ export function createArkTeamMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ objective, project_path }) =>
+    async ({ objective, project_path, model_overrides }) =>
       handleTool(async () => ({
-        ...(await orchestrator.execute({ objective, project_path })),
+        ...(await orchestrator.execute({
+          objective,
+          project_path,
+          ...(model_overrides === undefined
+            ? {}
+            : { model_overrides }),
+        })),
       })),
   );
 

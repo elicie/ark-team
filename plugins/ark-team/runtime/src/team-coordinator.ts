@@ -104,8 +104,12 @@ export class TeamCoordinator {
           const retryOperations: Array<() => Promise<AssignmentRecord>> = [];
           const exhaustedOperations: Array<() => Promise<AssignmentRecord>> = [];
           for (const assignment of failedAssignments) {
+            const retryLimit =
+              assignment.model_binding.kind === "external"
+                ? run.project_config.execution.external_provider_retries
+                : internalAgentRetries;
             if (
-              assignment.session_attempt_count <= internalAgentRetries
+              assignment.session_attempt_count <= retryLimit
             ) {
               retryOperations.push(
                 async () =>
@@ -122,7 +126,7 @@ export class TeamCoordinator {
                     assignment_id: assignment.assignment_id,
                     kind: "internal_failure_exhausted",
                     mode: "fresh_session",
-                    reason: `${assignment.role} assignment exhausted ${internalAgentRetries} automatic internal retries: ${assignment.failure_message ?? "managed session failed"}`,
+                    reason: `${assignment.role} assignment exhausted ${retryLimit} automatic ${assignment.model_binding.kind === "external" ? "external provider" : "internal"} retries: ${assignment.failure_message ?? "managed session failed"}`,
                   }),
               );
             }
@@ -751,7 +755,9 @@ function isRetryableSessionFailure(error: unknown): boolean {
     error instanceof ArkTeamError &&
     (error.code === "AGENT_SESSION_FAILED" ||
       error.code === "AGENT_SESSION_PROTOCOL_ERROR" ||
-      error.code === "AGENT_SESSION_UNAVAILABLE")
+      error.code === "AGENT_SESSION_UNAVAILABLE" ||
+      error.code === "PROVIDER_BRIDGE_UNAVAILABLE" ||
+      error.code === "PROVIDER_RESPONSE_INVALID")
   );
 }
 

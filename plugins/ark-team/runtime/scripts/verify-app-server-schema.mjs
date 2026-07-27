@@ -22,6 +22,7 @@ const requiredTokens = {
   ],
   "ServerNotification.ts": ['"method": "model/rerouted"'],
   "v2/ThreadStartParams.ts": [
+    "modelProvider?:",
     "approvalPolicy?:",
     "approvalsReviewer?:",
     "sandbox?:",
@@ -30,6 +31,7 @@ const requiredTokens = {
     "ephemeral?:",
   ],
   "v2/ThreadStartResponse.ts": [
+    "modelProvider:",
     "approvalPolicy:",
     "approvalsReviewer:",
     "sandbox:",
@@ -44,6 +46,7 @@ const requiredTokens = {
   "v2/ThreadResumeParams.ts": [
     "threadId:",
     "model?:",
+    "modelProvider?:",
     "cwd?:",
     "approvalPolicy?:",
     "approvalsReviewer?:",
@@ -52,6 +55,7 @@ const requiredTokens = {
     "developerInstructions?:",
   ],
   "v2/ThreadResumeResponse.ts": [
+    "modelProvider:",
     "approvalPolicy:",
     "approvalsReviewer:",
     "sandbox:",

@@ -20,6 +20,7 @@ import {
   type ProjectConfig,
   type ResolvedProjectConfig,
 } from "./project-config.js";
+import type { ModelOverrides } from "./provider-types.js";
 import type { PmPlan, PmReport } from "./role-contracts.js";
 import {
   type RecordPmPlanResult,
@@ -50,6 +51,7 @@ export interface ArkTeamOrchestratorOptions {
 export interface ExecuteArkTeamInput {
   objective: string;
   project_path: string;
+  model_overrides?: ModelOverrides;
 }
 
 export interface ExecuteArkTeamResult {
@@ -122,6 +124,10 @@ export class ArkTeamOrchestrator {
     let pmResult: ManagedSessionResult;
     let recorded: RecordPmPlanResult;
     try {
+      const providerSensitiveEnvironmentNames =
+        await this.store.providerSensitiveEnvironmentNames(
+          run.model_bindings.worker,
+        );
       pmResult = await this.pmLauncher.run({
         role: "pm",
         assignment: buildPmPlanningAssignment(run, resolvedConfig.config),
@@ -129,6 +135,12 @@ export class ArkTeamOrchestrator {
         output_contract: "pm_plan",
         timeout_ms:
           resolvedConfig.config.execution.agent_timeout_minutes * 60_000,
+        ...(providerSensitiveEnvironmentNames.length === 0
+          ? {}
+          : {
+              provider_sensitive_env_names:
+                providerSensitiveEnvironmentNames,
+            }),
       });
       assertPmResult(pmResult);
       assertPlanWithinProjectConfig(

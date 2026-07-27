@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import type {
   AppServerMessage,
   AppServerProtocolClient,
+  ExternalAppServerRuntime,
   JsonRpcId,
 } from "../src/app-server-client.js";
 import {
@@ -16,6 +17,7 @@ import {
   type ApprovalSessionUpdate,
 } from "../src/approval-session.js";
 import { ArkTeamError } from "../src/errors.js";
+import type { ExternalModelBindingSnapshotV1 } from "../src/provider-types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -425,6 +427,29 @@ test("TEST-405 returns final report and usage without raw event history", async 
 
 test("TEST-406 fails closed on timeout, cancellation, connection, and protocol errors", async () => {
   await withWorktree(async (workingDirectory) => {
+    for (const method of [
+      "initialize",
+      "thread/start",
+      "turn/start",
+    ] as const) {
+      const hangingClient = new FakeAppServerClient({
+        hang_method: method,
+      });
+      const hanging = new AppServerApprovalSession({
+        client: hangingClient,
+        timeout_ms: 5,
+      }).start({
+        role: "worker",
+        assignment: `Hang during ${method}.`,
+        working_directory: workingDirectory,
+      });
+      await assertSessionFailure(
+        rejectIfStillPending(hanging, 250),
+        "AGENT_SESSION_FAILED",
+      );
+      assert.equal(hangingClient.closed, 1);
+    }
+
     const timeoutClient = new FakeAppServerClient();
     const timedOut = new AppServerApprovalSession({
       client: timeoutClient,
@@ -501,6 +526,39 @@ test("TEST-406 fails closed on timeout, cancellation, connection, and protocol e
     });
     await assertSessionFailure(rerouted, "AGENT_SESSION_PROTOCOL_ERROR");
     assert.equal(rerouteClient.closed, 1);
+  });
+});
+
+test("terminal failure listeners observe a timeout after an approval wait", async () => {
+  await withWorktree(async (workingDirectory) => {
+    const client = new FakeAppServerClient();
+    const session = new AppServerApprovalSession({
+      client,
+      timeout_ms: 25,
+    });
+    let listenerCalls = 0;
+    const terminalFailure = new Promise<ArkTeamError>((resolve) => {
+      session.onTerminalFailure((error) => {
+        listenerCalls += 1;
+        resolve(error);
+      });
+    });
+    const start = session.start({
+      role: "worker",
+      assignment: "Wait for approval until the managed session expires.",
+      working_directory: workingDirectory,
+    });
+
+    await client.waitForRequest("turn/start");
+    client.emit(commandApproval(91));
+    assert.equal((await start).status, "waiting_user");
+
+    const failure = await rejectIfStillPending(terminalFailure, 250);
+    assert.equal(failure.code, "AGENT_SESSION_FAILED");
+    assert.match(failure.message, /timed out/i);
+    await session.close();
+    assert.equal(listenerCalls, 1);
+    assert.equal(client.closed, 1);
   });
 });
 
@@ -683,12 +741,193 @@ test("TEST-608 ignores replayed prior-turn usage during resume without weakening
   });
 });
 
+test("TEST-006 injects and verifies the exact external provider binding on start and resume", async () => {
+  await withWorktree(async (workingDirectory) => {
+    const binding = externalBinding();
+    const runtime = externalRuntime(workingDirectory);
+    const startClient = new FakeAppServerClient();
+    const startSession = new AppServerApprovalSession({
+      client: startClient,
+      external_runtime: runtime,
+    });
+    const completion = startSession.start({
+      role: "worker",
+      assignment: "Use the selected external model.",
+      working_directory: workingDirectory,
+      model_binding: binding,
+      output_contract: "worker_report",
+    });
+
+    await startClient.waitForRequest("turn/start");
+    emitCompletion(startClient, JSON.stringify(validWorkerReport()));
+    const update = await completion;
+    assert.equal(update.status, "completed");
+    if (update.status !== "completed") {
+      return;
+    }
+    assert.equal(update.model, binding.model);
+    assert.equal(
+      update.model_reasoning_effort,
+      binding.effective_reasoning_effort,
+    );
+    assert.deepEqual(
+      externalBindingFields(startClient.params("thread/start")),
+      {
+        model: binding.model,
+        modelProvider: binding.app_server_provider_id,
+        reasoningEffort: binding.effective_reasoning_effort,
+      },
+    );
+    assert.deepEqual(
+      externalTurnFields(startClient.params("turn/start")),
+      {
+        model: binding.model,
+        effort: binding.effective_reasoning_effort,
+      },
+    );
+    assert.match(
+      JSON.stringify(startClient.params("turn/start")),
+      /Model contract: glm-coding-plan-test \/ max/,
+    );
+
+    const resumeClient = new FakeAppServerClient();
+    const resumeSession = new AppServerApprovalSession({
+      client: resumeClient,
+      external_runtime: runtime,
+    });
+    const resumed = resumeSession.start({
+      role: "worker",
+      assignment: "Resume with the same external model.",
+      working_directory: workingDirectory,
+      resume_session_id: "thread-existing",
+      model_binding: binding,
+      output_contract: "worker_report",
+    });
+    await resumeClient.waitForRequest("turn/start");
+    emitCompletion(resumeClient, JSON.stringify(validWorkerReport()), {
+      threadId: "thread-existing",
+    });
+    assert.equal((await resumed).status, "completed");
+    assert.deepEqual(
+      externalBindingFields(resumeClient.params("thread/resume")),
+      {
+        model: binding.model,
+        modelProvider: binding.app_server_provider_id,
+        reasoningEffort: binding.effective_reasoning_effort,
+      },
+    );
+
+    for (const options of [
+      { response_model: "different-model" },
+      { response_model_provider: "ark_different" },
+      { response_reasoning_effort: "low" },
+    ]) {
+      await assertSessionFailure(
+        new AppServerApprovalSession({
+          client: new FakeAppServerClient(options),
+          external_runtime: runtime,
+        }).start({
+          role: "worker",
+          assignment: "Reject mismatched external binding evidence.",
+          working_directory: workingDirectory,
+          model_binding: binding,
+        }),
+        "AGENT_SESSION_PROTOCOL_ERROR",
+      );
+    }
+
+    const rerouteClient = new FakeAppServerClient();
+    const rerouted = new AppServerApprovalSession({
+      client: rerouteClient,
+      external_runtime: runtime,
+    }).start({
+      role: "worker",
+      assignment: "Reject an external model reroute.",
+      working_directory: workingDirectory,
+      model_binding: binding,
+    });
+    await rerouteClient.waitForRequest("turn/start");
+    rerouteClient.emit({
+      method: "model/rerouted",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        fromModel: binding.model,
+        toModel: "different-model",
+      },
+    });
+    await assertSessionFailure(rerouted, "AGENT_SESSION_PROTOCOL_ERROR");
+  });
+});
+
+function externalBinding(): ExternalModelBindingSnapshotV1 {
+  return {
+    schema_version: 1,
+    kind: "external",
+    provider_id: "zai_coding_plan",
+    app_server_provider_id: "ark_zai_coding_plan",
+    adapter_id: "builtin:openai-chat",
+    adapter_api_version: 1,
+    adapter_sha256: "b".repeat(64),
+    provider_config_sha256: "a".repeat(64),
+    model: "glm-coding-plan-test",
+    requested_reasoning_effort: "xhigh",
+    effective_reasoning_effort: "max",
+    structured_output_mode: "validated_json",
+  };
+}
+
+function externalRuntime(workingDirectory: string): ExternalAppServerRuntime {
+  return {
+    app_server_provider_id: "ark_zai_coding_plan",
+    bridge_base_url:
+      "http://127.0.0.1:10001/v1/providers/zai_coding_plan",
+    bridge_token_env: "ARK_TEAM_TEST_BRIDGE_TOKEN",
+    bridge_token: "test-bridge-token",
+    upstream_env_names: ["ZAI_API_KEY"],
+    codex_home: path.join(workingDirectory, ".ark-test-codex-home"),
+  };
+}
+
+function externalBindingFields(params: unknown): {
+  model: unknown;
+  modelProvider: unknown;
+  reasoningEffort: unknown;
+} {
+  assert.equal(typeof params, "object");
+  assert.notEqual(params, null);
+  const record = params as Record<string, unknown>;
+  const config = record.config as Record<string, unknown>;
+  return {
+    model: record.model,
+    modelProvider: record.modelProvider,
+    reasoningEffort: config.model_reasoning_effort,
+  };
+}
+
+function externalTurnFields(params: unknown): {
+  model: unknown;
+  effort: unknown;
+} {
+  assert.equal(typeof params, "object");
+  assert.notEqual(params, null);
+  const record = params as Record<string, unknown>;
+  return {
+    model: record.model,
+    effort: record.effort,
+  };
+}
+
 interface FakeAppServerOptions {
   resumed_thread_id?: string;
+  response_model?: string;
+  response_model_provider?: string;
+  response_reasoning_effort?: string;
   network_access?: boolean;
   writable_roots?: string[];
   runtime_workspace_roots?: string[];
   replayed_turn_id?: string;
+  hang_method?: "initialize" | "thread/start" | "turn/start";
 }
 
 class FakeAppServerClient implements AppServerProtocolClient {
@@ -698,11 +937,17 @@ class FakeAppServerClient implements AppServerProtocolClient {
   closed = 0;
   private readonly messageListeners = new Set<(message: AppServerMessage) => void>();
   private readonly failureListeners = new Set<(error: Error) => void>();
+  private readonly hangingRejects = new Set<(error: Error) => void>();
 
   constructor(private readonly options: FakeAppServerOptions = {}) {}
 
   async request(method: string, params: unknown): Promise<unknown> {
     this.requests.push({ method, params });
+    if (method === this.options.hang_method) {
+      return new Promise<unknown>((_resolve, reject) => {
+        this.hangingRejects.add(reject);
+      });
+    }
     if (method === "initialize" || method === "turn/interrupt") {
       return {};
     }
@@ -714,6 +959,23 @@ class FakeAppServerClient implements AppServerProtocolClient {
         typeof params.model === "string"
           ? params.model
           : "unknown";
+      const modelProvider =
+        typeof params === "object" &&
+        params !== null &&
+        "modelProvider" in params &&
+        typeof params.modelProvider === "string"
+          ? params.modelProvider
+          : "openai";
+      const reasoningEffort =
+        typeof params === "object" &&
+        params !== null &&
+        "config" in params &&
+        typeof params.config === "object" &&
+        params.config !== null &&
+        "model_reasoning_effort" in params.config &&
+        typeof params.config.model_reasoning_effort === "string"
+          ? params.config.model_reasoning_effort
+          : "xhigh";
       const cwd =
         typeof params === "object" &&
         params !== null &&
@@ -758,7 +1020,9 @@ class FakeAppServerClient implements AppServerProtocolClient {
               ? (this.options.resumed_thread_id ?? threadId)
               : threadId,
         },
-        model,
+        model: this.options.response_model ?? model,
+        modelProvider:
+          this.options.response_model_provider ?? modelProvider,
         cwd,
         ...(this.options.runtime_workspace_roots === undefined
           ? {}
@@ -779,7 +1043,8 @@ class FakeAppServerClient implements AppServerProtocolClient {
                 readOnlyAccess: { type: "fullAccess" },
                 networkAccess: this.options.network_access ?? false,
               },
-        reasoningEffort: "xhigh",
+        reasoningEffort:
+          this.options.response_reasoning_effort ?? reasoningEffort,
       };
     }
     if (method === "turn/start") {
@@ -812,6 +1077,14 @@ class FakeAppServerClient implements AppServerProtocolClient {
 
   async close(): Promise<void> {
     this.closed += 1;
+    const error = new ArkTeamError(
+      "AGENT_SESSION_FAILED",
+      "fake app-server client closed",
+    );
+    for (const reject of this.hangingRejects) {
+      reject(error);
+    }
+    this.hangingRejects.clear();
   }
 
   emit(message: AppServerMessage): void {
@@ -1040,6 +1313,28 @@ function assertWaiting(
   assert.equal(update.status, "waiting_user");
   if (update.status === "waiting_user") {
     assert.equal(update.approval.kind, kind);
+  }
+}
+
+async function rejectIfStillPending<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("session remained pending after cleanup")),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
   }
 }
 

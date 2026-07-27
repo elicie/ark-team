@@ -14,6 +14,18 @@ const cliPath = path.join(
 );
 
 test("TEST-306 built session CLI rejects a writing role in the primary checkout", async () => {
+  const { stdout: commonGitDirectory } = await execFileAsync(
+    "git",
+    [
+      "-C",
+      repositoryRoot,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ],
+    { encoding: "utf8" },
+  );
+  const primaryCheckout = path.dirname(commonGitDirectory.trim());
   await assert.rejects(
     execFileAsync(
       process.execPath,
@@ -22,7 +34,7 @@ test("TEST-306 built session CLI rejects a writing role in the primary checkout"
         "--role",
         "worker",
         "--cwd",
-        repositoryRoot,
+        primaryCheckout,
         "--assignment",
         "This assignment must not start.",
       ],

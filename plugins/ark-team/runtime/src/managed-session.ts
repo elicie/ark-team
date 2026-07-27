@@ -81,6 +81,12 @@ export class ManagedCodexSessionLauncher {
     const session = this.sessionFactory({
       codex_path: this.codexPath,
       timeout_ms: timeoutMs,
+      ...(request.provider_sensitive_env_names === undefined
+        ? {}
+        : {
+            provider_sensitive_env_names:
+              request.provider_sensitive_env_names,
+          }),
     });
     let update: ApprovalSessionUpdate;
     try {
