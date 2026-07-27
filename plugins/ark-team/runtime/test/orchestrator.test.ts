@@ -4,12 +4,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import type { Usage } from "@openai/codex-sdk";
-
 import { ArkTeamError } from "../src/errors.js";
 import type {
   ManagedSessionRequest,
   ManagedSessionResult,
+  Usage,
 } from "../src/managed-session.js";
 import {
   ArkTeamOrchestrator,

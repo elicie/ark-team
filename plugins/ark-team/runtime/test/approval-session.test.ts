@@ -104,21 +104,94 @@ test("TEST-401 performs the handshake and verifies exact writer settings", async
   });
 });
 
-test("TEST-402 rejects PM and primary-checkout writer sessions before launch", async () => {
+test("TEST-402 runs PM read-only and rejects invalid or primary-checkout writers", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "ark-team-approval-refusal-"));
   try {
-    const client = new FakeAppServerClient();
-    const pm = new AppServerApprovalSession({ client });
-    await assert.rejects(
-      pm.start({
-        role: "pm",
-        assignment: "Do not launch.",
-        working_directory: root,
-      }),
-      (error: unknown) =>
-        error instanceof ArkTeamError && error.code === "INVALID_INPUT",
+    const pmClient = new FakeAppServerClient();
+    const pm = new AppServerApprovalSession({ client: pmClient });
+    const pmCompletion = pm.start({
+      role: "pm",
+      assignment: "Inspect the project and return a read-only report.",
+      working_directory: root,
+    });
+    await pmClient.waitForRequest("turn/start");
+    emitCompletion(pmClient);
+    const pmUpdate = await pmCompletion;
+    assert.equal(pmUpdate.status, "completed");
+    if (pmUpdate.status !== "completed") {
+      return;
+    }
+    assert.equal(pmUpdate.role, "pm");
+    assert.equal(pmUpdate.sandbox_mode, "read-only");
+    assert.equal(pmUpdate.approval_policy, "never");
+    assert.deepEqual(pmClient.params("thread/start"), {
+      model: "gpt-5.6-sol",
+      cwd: root,
+      approvalPolicy: "never",
+      approvalsReviewer: "user",
+      sandbox: "read-only",
+      config: {
+        agents: { enabled: false },
+        apps: { _default: { enabled: false } },
+        features: { multi_agent: false },
+        model_reasoning_effort: "xhigh",
+        web_search: "disabled",
+      },
+      developerInstructions:
+        "Act only as the management-only Ark Team PM. " +
+        "Never edit, create, delete, merge, commit, or directly mutate project files. " +
+        "Inspect observable project evidence, define acceptance criteria, and manage work through reports. " +
+        "Do not spawn native subagents from this session. " +
+        "When another managed session is needed, return a bounded TEAM_SPAWN_REQUEST for the Ark Team controller.",
+      ephemeral: false,
+    });
+    assert.deepEqual(pmClient.params("turn/start"), {
+      threadId: "thread-1",
+      input: [
+        {
+          type: "text",
+          text:
+            "<ark_team_managed_role>\n" +
+            "Role: ark_pm\n" +
+            "Model contract: gpt-5.6-sol / xhigh\n" +
+            "Permission contract: read-only / never\n" +
+            "Act only as the management-only Ark Team PM. " +
+            "Never edit, create, delete, merge, commit, or directly mutate project files. " +
+            "Inspect observable project evidence, define acceptance criteria, and manage work through reports. " +
+            "Do not spawn native subagents from this session. " +
+            "When another managed session is needed, return a bounded TEAM_SPAWN_REQUEST for the Ark Team controller.\n" +
+            "Return only the observable role report. Never expose private chain-of-thought.\n" +
+            "</ark_team_managed_role>\n" +
+            "<ark_team_assignment>\n" +
+            "Inspect the project and return a read-only report.\n" +
+            "</ark_team_assignment>",
+          text_elements: [],
+        },
+      ],
+      cwd: root,
+      approvalPolicy: "never",
+      approvalsReviewer: "user",
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+    });
+
+    const unexpectedApprovalClient = new FakeAppServerClient();
+    const unexpectedApproval = new AppServerApprovalSession({
+      client: unexpectedApprovalClient,
+    }).start({
+      role: "pm",
+      assignment: "Fail if an approval is requested.",
+      working_directory: root,
+    });
+    await unexpectedApprovalClient.waitForRequest("turn/start");
+    unexpectedApprovalClient.emit(commandApproval(40));
+    await assertSessionFailure(
+      unexpectedApproval,
+      "AGENT_SESSION_PROTOCOL_ERROR",
     );
-    const invalid = new AppServerApprovalSession({ client });
+
+    const invalidClient = new FakeAppServerClient();
+    const invalid = new AppServerApprovalSession({ client: invalidClient });
     await assert.rejects(
       invalid.start({
         role: "reviewer" as never,
@@ -130,7 +203,8 @@ test("TEST-402 rejects PM and primary-checkout writer sessions before launch", a
     );
 
     await mkdir(path.join(root, ".git"));
-    const writer = new AppServerApprovalSession({ client });
+    const writerClient = new FakeAppServerClient();
+    const writer = new AppServerApprovalSession({ client: writerClient });
     await assert.rejects(
       writer.start({
         role: "worker",
@@ -140,7 +214,8 @@ test("TEST-402 rejects PM and primary-checkout writer sessions before launch", a
       (error: unknown) =>
         error instanceof ArkTeamError && error.code === "UNSAFE_AGENT_WORKSPACE",
     );
-    assert.equal(client.requests.length, 0);
+    assert.equal(invalidClient.requests.length, 0);
+    assert.equal(writerClient.requests.length, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -646,6 +721,22 @@ class FakeAppServerClient implements AppServerProtocolClient {
         typeof params.cwd === "string"
           ? params.cwd
           : "/unknown";
+      const approvalPolicy =
+        typeof params === "object" &&
+        params !== null &&
+        "approvalPolicy" in params &&
+        (params.approvalPolicy === "never" ||
+          params.approvalPolicy === "on-request")
+          ? params.approvalPolicy
+          : "on-request";
+      const sandboxMode =
+        typeof params === "object" &&
+        params !== null &&
+        "sandbox" in params &&
+        (params.sandbox === "read-only" ||
+          params.sandbox === "workspace-write")
+          ? params.sandbox
+          : "workspace-write";
       const threadId =
         method === "thread/resume" &&
         typeof params === "object" &&
@@ -674,14 +765,20 @@ class FakeAppServerClient implements AppServerProtocolClient {
           : {
               runtimeWorkspaceRoots: this.options.runtime_workspace_roots,
             }),
-        approvalPolicy: "on-request",
+        approvalPolicy,
         approvalsReviewer: "user",
-        sandbox: {
-          type: "workspaceWrite",
-          writableRoots: this.options.writable_roots ?? [cwd],
-          readOnlyAccess: { type: "fullAccess" },
-          networkAccess: this.options.network_access ?? false,
-        },
+        sandbox:
+          sandboxMode === "read-only"
+            ? {
+                type: "readOnly",
+                networkAccess: this.options.network_access ?? false,
+              }
+            : {
+                type: "workspaceWrite",
+                writableRoots: this.options.writable_roots ?? [cwd],
+                readOnlyAccess: { type: "fullAccess" },
+                networkAccess: this.options.network_access ?? false,
+              },
         reasoningEffort: "xhigh",
       };
     }

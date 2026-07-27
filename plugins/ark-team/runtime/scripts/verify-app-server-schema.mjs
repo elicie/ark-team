@@ -35,6 +35,12 @@ const requiredTokens = {
     "sandbox:",
     "reasoningEffort:",
   ],
+  "v2/AskForApproval.ts": ['"on-request"', '"never"'],
+  "v2/SandboxPolicy.ts": [
+    '"type": "readOnly"',
+    '"type": "workspaceWrite"',
+    "networkAccess:",
+  ],
   "v2/ThreadResumeParams.ts": [
     "threadId:",
     "model?:",
