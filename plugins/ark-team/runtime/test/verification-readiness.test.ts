@@ -519,11 +519,20 @@ test("TEST-1715 selects the next free port and retries one registered Next.js se
       record.payload.kind === "capability" &&
       record.payload.capability === "server",
   );
-  assert.equal(decisiveServerRecords.length, 2);
+  assert.equal(decisiveServerRecords.length, 4);
   assert.equal(
     decisiveServerRecords.every(
       (record) =>
         record.payload.kind === "capability" && record.payload.available,
+    ),
+    true,
+  );
+  assert.equal(
+    decisiveServerRecords.slice(-2).every(
+      (record) =>
+        record.schema_version === 2 &&
+        record.payload.kind === "capability" &&
+        record.payload.diagnostic?.includes("HTTP 200"),
     ),
     true,
   );
