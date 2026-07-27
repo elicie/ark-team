@@ -16,6 +16,7 @@ import {
 import {
   sha256CanonicalJson,
   verificationLinkedRecordSchema,
+  verificationRecordMatchesSnapshot,
   verificationRunSnapshotSchema,
   verificationRunSnapshotSha256,
 } from "./verification-contract.js";
@@ -676,6 +677,14 @@ export const runRecordSchema = z
             code: "custom",
             path: ["verification_records", index],
             message: "verification record linkage does not match the run snapshot",
+          });
+        }
+        if (!verificationRecordMatchesSnapshot(snapshot, record)) {
+          context.addIssue({
+            code: "custom",
+            path: ["verification_records", index],
+            message:
+              "verification record check provenance does not match the run snapshot",
           });
         }
         if (record.previous_record_sha256 !== previousRecordHash) {

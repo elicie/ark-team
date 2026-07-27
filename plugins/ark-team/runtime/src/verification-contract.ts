@@ -1500,6 +1500,7 @@ export const verificationLinkedRecordV2Schema = z
     record_type: verificationRecordTypeSchema,
     run_id: z.string().regex(RUN_ID_PATTERN),
     case_id: identifierSchema,
+    check_id: identifierSchema.nullable(),
     snapshot_id: identifierSchema,
     lane: z.enum(["backend", "ui"]).nullable(),
     stage: verificationStageSchema,
@@ -1528,6 +1529,22 @@ export const verificationLinkedRecordV2Schema = z
   })
   .strict()
   .superRefine((record, context) => {
+    const checkScopedRecord = [
+      "request",
+      "browser",
+      "agentic_browser",
+      "screenshot",
+      "review",
+      "comparison",
+    ].includes(record.record_type);
+    if (checkScopedRecord !== (record.check_id !== null)) {
+      context.addIssue({
+        code: "custom",
+        path: ["check_id"],
+        message:
+          "check-scoped verification evidence requires exactly one check ID",
+      });
+    }
     if (record.record_type !== record.payload.kind) {
       context.addIssue({
         code: "custom",
@@ -1789,13 +1806,13 @@ export const verificationPackageIdentitySchema = z
   .strict();
 
 export const APPROVED_VERIFICATION_SPEC_SHA256 =
-  "68b9553034481d4a7ee530f1886d4a87d7ceede03a7cfb127c10051b0db8f4d7";
+  "1392eb7604eb6d3f2dedc50d2810070f7467d1bad1c8dc9bd05471b83828441c";
 
 export const APPROVED_VERIFICATION_PACKAGE = Object.freeze({
   package_id: "verification-spec-v3",
   package_status: "SPEC_APPROVED",
   package_fingerprint:
-    "de4df180bfc6754e21b8177e8302ef861eda37acc5cb7b7979715b8773e24bd2",
+    "af32edde6b11335892ad1f7777f80fd30b66bb239c1a82e95fd3f4bbcfc5e58c",
   authority_date: "2026-07-27",
   reference_boundary: "NONE",
   spec_sha256: APPROVED_VERIFICATION_SPEC_SHA256,
@@ -2166,6 +2183,112 @@ export const verificationRunSnapshotSchema = z.union([
 export type VerificationRunSnapshot = z.infer<
   typeof verificationRunSnapshotSchema
 >;
+
+export function verificationRecordMatchesSnapshot(
+  snapshot: VerificationRunSnapshot,
+  record: VerificationLinkedRecord,
+): boolean {
+  if (snapshot.schema_version !== 2 || record.schema_version !== 2) {
+    return snapshot.schema_version === record.schema_version;
+  }
+  if (record.lane === null) {
+    if (record.lane_required !== null) {
+      return false;
+    }
+  } else {
+    const laneContract =
+      record.lane === "backend"
+        ? snapshot.backend_contract
+        : snapshot.ui_contract;
+    if (
+      !laneContract.enabled ||
+      record.lane_required !== laneContract.required
+    ) {
+      return false;
+    }
+  }
+
+  const checkScopedRecord = [
+    "request",
+    "browser",
+    "agentic_browser",
+    "screenshot",
+    "review",
+    "comparison",
+  ].includes(record.record_type);
+  if (checkScopedRecord !== (record.check_id !== null)) {
+    return false;
+  }
+  if (!checkScopedRecord || record.check_id === null) {
+    return true;
+  }
+
+  if (
+    record.record_type === "request" &&
+    record.lane === "backend" &&
+    record.payload.kind === "request" &&
+    snapshot.backend_contract.enabled
+  ) {
+    const probe = snapshot.backend_contract.api_probes.find(
+      (candidate) => candidate.id === record.check_id,
+    );
+    return (
+      probe !== undefined &&
+      record.payload.method === probe.method &&
+      record.payload.path === probe.path &&
+      record.payload.expected_status === probe.expected_status &&
+      record.check_required === probe.required &&
+      record.adapter?.name === snapshot.backend_contract.api_adapter &&
+      record.adapter.version === snapshot.backend_contract.api_adapter_version
+    );
+  }
+  if (
+    record.record_type === "agentic_browser" &&
+    record.lane === "ui" &&
+    record.payload.kind === "agentic_browser" &&
+    snapshot.ui_contract.enabled
+  ) {
+    const task = snapshot.ui_contract.agentic_tasks.find(
+      (candidate) => candidate.id === record.check_id,
+    );
+    return (
+      task !== undefined &&
+      record.check_required === task.required &&
+      record.adapter?.name === task.adapter &&
+      record.adapter.version === task.adapter_version &&
+      record.model?.identity === task.model_identity
+    );
+  }
+  if (
+    ["browser", "screenshot", "review", "comparison"].includes(
+      record.record_type,
+    ) &&
+    record.lane === "ui" &&
+    record.payload.kind === record.record_type &&
+    snapshot.ui_contract.enabled
+  ) {
+    const browserCase = snapshot.ui_contract.browser_cases.find(
+      (candidate) => candidate.id === record.check_id,
+    );
+    const deterministicAdapterMatches =
+      !["browser", "screenshot"].includes(record.record_type) ||
+      (record.adapter?.name === snapshot.ui_contract.deterministic_adapter &&
+        record.adapter.version ===
+          snapshot.ui_contract.deterministic_adapter_version);
+    const caseHashMatches =
+      record.record_type !== "browser" ||
+      (record.payload.kind === "browser" &&
+        browserCase !== undefined &&
+        record.payload.case_sha256 === sha256CanonicalJson(browserCase));
+    return (
+      browserCase !== undefined &&
+      record.check_required === browserCase.required &&
+      deterministicAdapterMatches &&
+      caseHashMatches
+    );
+  }
+  return false;
+}
 
 export interface BuildVerificationRunSnapshotInput {
   run_id: string;

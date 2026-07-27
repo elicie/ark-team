@@ -382,6 +382,24 @@ test("TEST-1704 validates schema-2 records, legacy readability, and chain isolat
     true,
   );
 
+  const request = cases.find(
+    (candidate) => candidate.record_type === "request",
+  );
+  assert.notEqual(request, undefined);
+  assert.equal(
+    verificationLinkedRecordSchema.safeParse({
+      ...request,
+      check_id: "",
+    }).success,
+    false,
+  );
+  const missingCheckId = { ...request } as Record<string, unknown>;
+  delete missingCheckId.check_id;
+  assert.equal(
+    verificationLinkedRecordSchema.safeParse(missingCheckId).success,
+    false,
+  );
+
   const legacyPayload = { kind: "snapshot" as const, snapshot_sha256: SHA };
   const legacyRecord = {
     schema_version: 1 as const,
@@ -583,6 +601,14 @@ function recordCase(
   }> = [],
   checkRequired = true,
 ) {
+  const checkId =
+    recordType === "request"
+      ? "home-api"
+      : recordType === "agentic_browser"
+        ? "home-agentic"
+        : ["browser", "screenshot", "review", "comparison"].includes(recordType)
+          ? "home-browser"
+          : null;
   return {
     schema_version: 2 as const,
     contract_id: "verification_contract_v2" as const,
@@ -597,6 +623,7 @@ function recordCase(
     source_fingerprint: SHA,
     package_fingerprint: APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
     lane_required: lane === null ? null : true,
+    check_id: checkId,
     check_required: checkRequired,
     previous_record_sha256: null,
     payload_sha256: sha256CanonicalJson(payload),

@@ -70,6 +70,7 @@ import {
   type VerificationLinkedRecord,
   type VerificationRollbackRecord,
   type VerificationSourceIdentity,
+  verificationRecordMatchesSnapshot,
   verificationRollbackRecordSchema,
   verificationRunSnapshotSha256,
 } from "./verification-contract.js";
@@ -497,6 +498,7 @@ export class RunStore {
         contract_id: "verification_contract_v2" as const,
         run_id: snapshot.run_id,
         case_id: snapshot.case_id,
+        check_id: null,
         snapshot_id: snapshot.snapshot_id,
         lane: null,
         timestamp_utc: timestamp,
@@ -618,20 +620,11 @@ export class RunStore {
           "verification evidence does not link to the immutable run snapshot",
         );
       }
-      if (input.lane !== null) {
-        const laneContract =
-          input.lane === "backend"
-            ? snapshot.backend_contract
-            : snapshot.ui_contract;
-        if (
-          !laneContract.enabled ||
-          input.lane_required !== laneContract.required
-        ) {
-          throw new ArkTeamError(
-            "INVALID_RECORD",
-            "verification evidence changes immutable lane requiredness",
-          );
-        }
+      if (!verificationRecordMatchesSnapshot(snapshot, input)) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "verification evidence changes or cannot resolve immutable check provenance",
+        );
       }
       const verificationRecords = appendVerificationLinkedRecord(
         persisted.run.verification_records,
