@@ -1036,6 +1036,8 @@ export const verificationStageSchema = z.enum([
   "original_pm_review",
 ]);
 
+export type VerificationStage = z.infer<typeof verificationStageSchema>;
+
 export const verificationOutcomeSchema = z.enum([
   "passed",
   "failed",
@@ -1043,6 +1045,223 @@ export const verificationOutcomeSchema = z.enum([
   "skipped",
   "error",
 ]);
+
+export type VerificationOutcome = z.infer<typeof verificationOutcomeSchema>;
+
+export const verificationActionKindSchema = z.enum([
+  "readiness",
+  "api",
+  "browser",
+  "agentic_browser",
+  "screenshot",
+  "semantic_review",
+  "comparison",
+  "artifact_write",
+  "cleanup",
+]);
+
+export type VerificationActionKind = z.infer<
+  typeof verificationActionKindSchema
+>;
+
+const verificationActionMaxAttempts = {
+  readiness: 2,
+  api: 2,
+  browser: 2,
+  agentic_browser: 1,
+  screenshot: 1,
+  semantic_review: 1,
+  comparison: 1,
+  artifact_write: 1,
+  cleanup: 1,
+} as const satisfies Record<VerificationActionKind, 1 | 2>;
+
+const verificationCoordinatorAttemptSchema = z
+  .object({
+    action_id: identifierSchema,
+    kind: verificationActionKindSchema,
+    lane: z.enum(["backend", "ui"]).nullable(),
+    check_id: identifierSchema.nullable(),
+    input_sha256: sha256Schema,
+    attempt_count: z.number().int().min(1).max(2),
+    max_attempts: z.number().int().min(1).max(2),
+    evidence_record_ids: z.array(identifierSchema).max(500),
+    decisive_evidence_record_ids: z.array(identifierSchema).max(500),
+    status: z.enum([
+      "in_progress",
+      "failed",
+      "succeeded",
+      "exhausted",
+      "aborted",
+    ]),
+    last_error_code: z.lazy(() => verificationErrorCodeSchema).nullable(),
+  })
+  .strict()
+  .superRefine((attempt, context) => {
+    addDuplicateIssues(attempt.evidence_record_ids, context, [
+      "evidence_record_ids",
+    ]);
+    addDuplicateIssues(attempt.decisive_evidence_record_ids, context, [
+      "decisive_evidence_record_ids",
+    ]);
+    if (
+      attempt.decisive_evidence_record_ids.some(
+        (recordId) => !attempt.evidence_record_ids.includes(recordId),
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["decisive_evidence_record_ids"],
+        message: "decisive evidence must belong to the complete attempt evidence",
+      });
+    }
+    if (
+      attempt.status === "in_progress" &&
+      attempt.decisive_evidence_record_ids.length !== 0
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["decisive_evidence_record_ids"],
+        message: "in-progress attempts cannot have decisive evidence",
+      });
+    }
+    if (attempt.max_attempts !== verificationActionMaxAttempts[attempt.kind]) {
+      context.addIssue({
+        code: "custom",
+        path: ["max_attempts"],
+        message: "maximum attempts do not match the action kind",
+      });
+    }
+    if (attempt.attempt_count > attempt.max_attempts) {
+      context.addIssue({
+        code: "custom",
+        path: ["attempt_count"],
+        message: "attempt count exceeds the action maximum",
+      });
+    }
+    if (
+      (attempt.status === "in_progress" ||
+        attempt.status === "succeeded") !==
+      (attempt.last_error_code === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["last_error_code"],
+        message: "attempt status does not match its last error code",
+      });
+    }
+    if (
+      attempt.status === "exhausted" &&
+      attempt.attempt_count !== attempt.max_attempts
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "exhausted attempts must consume the complete budget",
+      });
+    }
+    if (
+      attempt.status === "aborted" &&
+      attempt.attempt_count >= attempt.max_attempts
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "aborted attempts must retain unused retry budget",
+      });
+    }
+  });
+
+export const verificationCoordinatorStateSchema = z
+  .object({
+    schema_version: z.literal(1),
+    current_state: z.union([
+      verificationStageSchema,
+      verificationOutcomeSchema,
+    ]),
+    terminal_outcome: verificationOutcomeSchema.nullable(),
+    attempts: z.array(verificationCoordinatorAttemptSchema).max(500),
+  })
+  .strict()
+  .superRefine((state, context) => {
+    addDuplicateIssues(
+      state.attempts.map((attempt) => attempt.action_id),
+      context,
+      ["attempts"],
+    );
+    if (verificationOutcomeSchema.safeParse(state.current_state).success) {
+      if (state.terminal_outcome !== state.current_state) {
+        context.addIssue({
+          code: "custom",
+          path: ["terminal_outcome"],
+          message: "terminal state and outcome must match",
+        });
+      }
+      return;
+    }
+    if (
+      state.current_state === "pm_review_pending" ||
+      state.current_state === "original_pm_review"
+    ) {
+      if (state.terminal_outcome !== "passed") {
+        context.addIssue({
+          code: "custom",
+          path: ["terminal_outcome"],
+          message: "PM review states require a passed terminal outcome",
+        });
+      }
+      return;
+    }
+    if (state.terminal_outcome !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["terminal_outcome"],
+        message: "preterminal states cannot have a terminal outcome",
+      });
+    }
+  });
+
+export type VerificationCoordinatorState = z.infer<
+  typeof verificationCoordinatorStateSchema
+>;
+
+const verificationLaneCheckDecisionSchema = z
+  .object({
+    check_id: identifierSchema,
+    required: z.boolean(),
+    outcome: verificationOutcomeSchema,
+    evidence_record_ids: z.array(identifierSchema).min(1).max(500),
+    integrity_failure: z.boolean(),
+  })
+  .strict()
+  .superRefine((check, context) => {
+    addDuplicateIssues(check.evidence_record_ids, context, [
+      "evidence_record_ids",
+    ]);
+  });
+
+const verificationLaneCheckDecisionsSchema = z
+  .array(verificationLaneCheckDecisionSchema)
+  .min(1)
+  .max(500)
+  .superRefine((checks, context) => {
+    addDuplicateIssues(
+      checks.map((check) => check.check_id),
+      context,
+      [],
+    );
+  });
+
+export const verificationLaneDecisionInputSchema = z
+  .object({
+    lane: z.enum(["backend", "ui"]),
+    checks: verificationLaneCheckDecisionsSchema,
+  })
+  .strict();
+
+export type VerificationLaneDecisionInput = z.infer<
+  typeof verificationLaneDecisionInputSchema
+>;
 
 const legacyVerificationRecordTypeSchema = z.enum([
   "source",
@@ -1343,7 +1562,7 @@ const verificationRecordTypeSchema = z.enum([
   "spec_delta",
 ]);
 
-const verificationErrorCodeSchema = z.enum([
+export const verificationErrorCodeSchema = z.enum([
   "SOURCE_DRIFT",
   "PACKAGE_FINGERPRINT_MISMATCH",
   "CONTRACT_VERSION_MISMATCH",
@@ -1363,6 +1582,54 @@ const verificationErrorCodeSchema = z.enum([
   "ENVIRONMENT_UNAVAILABLE",
   "INVALID_RECORD",
 ]);
+
+export type VerificationErrorCode = z.infer<
+  typeof verificationErrorCodeSchema
+>;
+
+export function verificationErrorDisposition(
+  code: VerificationErrorCode,
+): {
+  outcome: VerificationOutcome;
+  integrity_failure: boolean;
+} {
+  if (
+    [
+      "SOURCE_DRIFT",
+      "PACKAGE_FINGERPRINT_MISMATCH",
+      "CONTRACT_VERSION_MISMATCH",
+      "SCENARIO_SNAPSHOT_MISMATCH",
+      "ARTIFACT_ROOT_INVALID",
+      "BASELINE_NOT_APPROVED",
+    ].includes(code)
+  ) {
+    return { outcome: "error", integrity_failure: true };
+  }
+  if (
+    [
+      "API_CONTRACT_MISMATCH",
+      "BROWSER_CONTRACT_MISMATCH",
+      "SCREENSHOT_CAPTURE_FAILED",
+      "IMAGE_REVIEW_REJECTED",
+      "COMPARISON_THRESHOLD_FAILED",
+    ].includes(code)
+  ) {
+    return { outcome: "failed", integrity_failure: false };
+  }
+  if (
+    [
+      "CAPABILITY_UNAVAILABLE",
+      "SERVER_NOT_READY",
+      "ENVIRONMENT_UNAVAILABLE",
+    ].includes(code)
+  ) {
+    return { outcome: "unavailable", integrity_failure: false };
+  }
+  if (code === "APPROVAL_REQUIRED") {
+    return { outcome: "skipped", integrity_failure: false };
+  }
+  return { outcome: "error", integrity_failure: false };
+}
 
 export const verificationCleanupAuditSchema = z
   .object({
@@ -1613,6 +1880,7 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
       lane: z.enum(["backend", "ui"]),
       outcome: verificationOutcomeSchema,
       evidence_record_ids: z.array(identifierSchema).min(1).max(500),
+      checks: verificationLaneCheckDecisionsSchema.optional(),
     })
     .strict(),
   z
@@ -1620,6 +1888,11 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
       kind: z.literal("error"),
       code: verificationErrorCodeSchema,
       message: boundedStringSchema,
+      action_id: identifierSchema.optional(),
+      attempt_count: z.number().int().min(1).max(2).optional(),
+      evidence_record_ids: z.array(identifierSchema).max(500).optional(),
+      outcome: verificationOutcomeSchema.optional(),
+      integrity_failure: z.boolean().optional(),
     })
     .strict(),
   z
@@ -1729,7 +2002,7 @@ export const verificationLinkedRecordV2Schema = z
   })
   .strict()
   .superRefine((record, context) => {
-    const checkScopedRecord = [
+    const requiresCheckScope = [
       "request",
       "browser",
       "agentic_browser",
@@ -1737,7 +2010,12 @@ export const verificationLinkedRecordV2Schema = z
       "review",
       "comparison",
     ].includes(record.record_type);
-    if (checkScopedRecord !== (record.check_id !== null)) {
+    if (
+      (requiresCheckScope && record.check_id === null) ||
+      (!requiresCheckScope &&
+        record.record_type !== "error" &&
+        record.check_id !== null)
+    ) {
       context.addIssue({
         code: "custom",
         path: ["check_id"],
@@ -1855,9 +2133,11 @@ export const verificationLinkedRecordV2Schema = z
         message: "artifact-linked record has no artifact reference",
       });
     }
-    if (
+    const usesV4PayloadContract =
       record.package_fingerprint !==
-        LEGACY_APPROVED_VERIFICATION_PACKAGE_V3.package_fingerprint &&
+      LEGACY_APPROVED_VERIFICATION_PACKAGE_V3.package_fingerprint;
+    if (
+      usesV4PayloadContract &&
       record.payload.kind === "artifact"
     ) {
       const artifact = record.payload;
@@ -1916,6 +2196,53 @@ export const verificationLinkedRecordSchema = z.union([
 export type VerificationLinkedRecord = z.infer<
   typeof verificationLinkedRecordSchema
 >;
+
+export function verificationEvidenceDisposition(
+  record: VerificationLinkedRecord,
+): {
+  outcome: VerificationOutcome;
+  integrity_failure: boolean;
+} | null {
+  switch (record.payload.kind) {
+    case "request":
+      return {
+        outcome:
+          record.payload.actual_status === record.payload.expected_status
+            ? "passed"
+            : "failed",
+        integrity_failure: false,
+      };
+    case "browser":
+    case "screenshot":
+    case "artifact":
+      return { outcome: "passed", integrity_failure: false };
+    case "agentic_browser":
+      return {
+        outcome:
+          record.payload.execution_status === "completed"
+            ? "passed"
+            : record.payload.execution_status === "blocked"
+              ? "unavailable"
+              : "error",
+        integrity_failure: false,
+      };
+    case "review":
+    case "comparison":
+      return {
+        outcome: record.payload.outcome,
+        integrity_failure: false,
+      };
+    case "capability":
+      return {
+        outcome: record.payload.available ? "passed" : "unavailable",
+        integrity_failure: false,
+      };
+    case "error":
+      return verificationErrorDisposition(record.payload.code);
+    default:
+      return null;
+  }
+}
 
 export function appendVerificationLinkedRecord(
   existing: readonly VerificationLinkedRecord[],
@@ -2497,7 +2824,7 @@ export function verificationRecordMatchesSnapshot(
     }
   }
 
-  const checkScopedRecord = [
+  const requiresCheckScope = [
     "request",
     "browser",
     "agentic_browser",
@@ -2505,10 +2832,58 @@ export function verificationRecordMatchesSnapshot(
     "review",
     "comparison",
   ].includes(record.record_type);
-  if (checkScopedRecord !== (record.check_id !== null)) {
+  if (
+    (requiresCheckScope && record.check_id === null) ||
+    (!requiresCheckScope &&
+      record.record_type !== "error" &&
+      record.check_id !== null)
+  ) {
     return false;
   }
-  if (!checkScopedRecord || record.check_id === null) {
+  if (record.record_type === "error") {
+    if (record.check_id === null) {
+      return true;
+    }
+    if (record.lane === "backend" && snapshot.backend_contract.enabled) {
+      const probe = snapshot.backend_contract.api_probes.find(
+        (candidate) => candidate.id === record.check_id,
+      );
+      return probe !== undefined && record.check_required === probe.required;
+    }
+    if (record.lane === "ui" && snapshot.ui_contract.enabled) {
+      const check =
+        snapshot.ui_contract.browser_cases.find(
+          (candidate) => candidate.id === record.check_id,
+        ) ??
+        snapshot.ui_contract.agentic_tasks.find(
+          (candidate) => candidate.id === record.check_id,
+        );
+      return check !== undefined && record.check_required === check.required;
+    }
+    return false;
+  }
+  if (
+    record.record_type === "capability" &&
+    record.payload.kind === "capability"
+  ) {
+    const requiredCapabilities =
+      record.lane === "backend" && snapshot.backend_contract.enabled
+        ? snapshot.backend_contract.required_capabilities
+        : record.lane === "ui" && snapshot.ui_contract.enabled
+          ? snapshot.ui_contract.required_capabilities
+          : [];
+    const optionalCapabilities =
+      record.lane === "ui" && snapshot.ui_contract.enabled
+        ? snapshot.ui_contract.optional_capabilities
+        : [];
+    return (
+      (requiredCapabilities.includes(record.payload.capability) ||
+        optionalCapabilities.includes(record.payload.capability)) &&
+      record.check_required ===
+        requiredCapabilities.includes(record.payload.capability)
+    );
+  }
+  if (!requiresCheckScope || record.check_id === null) {
     return true;
   }
 

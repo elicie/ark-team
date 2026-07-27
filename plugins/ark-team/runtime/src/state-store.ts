@@ -78,10 +78,20 @@ import {
   captureVerificationSource,
   sha256CanonicalJson,
   type VerificationApprovedBaselineManifest,
+  type VerificationActionKind,
   type VerificationCleanupAudit,
+  type VerificationErrorCode,
+  type VerificationLaneDecisionInput,
   type VerificationLinkedRecord,
+  type VerificationOutcome,
   type VerificationRollbackRecord,
+  type VerificationRunSnapshot,
   type VerificationSourceIdentity,
+  type VerificationStage,
+  verificationLaneDecisionInputSchema,
+  verificationEvidenceDisposition,
+  verificationErrorCodeSchema,
+  verificationErrorDisposition,
   verificationRecordMatchesSnapshot,
   verificationRollbackRecordSchema,
   verificationRunSnapshotSha256,
@@ -149,6 +159,55 @@ export interface CleanupVerificationArtifactsResult {
   run: RunRecord;
   record: VerificationLinkedRecord;
   audit: VerificationCleanupAudit | null;
+}
+
+export interface VerificationStateTransitionResult {
+  run: RunRecord;
+  accepted: boolean;
+  error_record: VerificationLinkedRecord | null;
+}
+
+export interface RecordVerificationAttemptInput {
+  action_id: string;
+  kind: VerificationActionKind;
+  lane: "backend" | "ui" | null;
+  check_id: string | null;
+  input_sha256: string;
+  evidence_record_ids: string[];
+}
+
+export interface RecordVerificationAttemptResult {
+  run: RunRecord;
+  reserved: boolean;
+  error_record: VerificationLinkedRecord | null;
+}
+
+export interface CompleteVerificationAttemptInput {
+  action_id: string;
+  evidence_record_ids: string[];
+  error_code: VerificationErrorCode | null;
+  message: string | null;
+}
+
+export interface CompleteVerificationAttemptResult {
+  run: RunRecord;
+  error_code: VerificationErrorCode | null;
+  error_record: VerificationLinkedRecord | null;
+}
+
+export interface RecordVerificationActionErrorInput {
+  action_id: string;
+  code: VerificationErrorCode;
+  message: string;
+}
+
+export interface RecordVerificationActionErrorResult {
+  run: RunRecord;
+  record: VerificationLinkedRecord;
+}
+
+export interface FinalizeVerificationInput {
+  lanes: VerificationLaneDecisionInput[];
 }
 
 export interface ListRunsInput {
@@ -335,6 +394,7 @@ export class RunStore {
     projectPath: string,
   ) => Promise<string | Uint8Array>;
   private readonly providerEnvironment: NodeJS.ProcessEnv;
+  #verificationCoordinatorAuthority: symbol | null = null;
   private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(options: RunStoreOptions = {}) {
@@ -351,6 +411,18 @@ export class RunStore {
       options.verification_package_loader ??
       ((projectPath) =>
         readFile(path.join(projectPath, "docs", "slices", "SLICE-017.md")));
+  }
+
+  claimVerificationCoordinatorAuthority(): symbol {
+    if (this.#verificationCoordinatorAuthority !== null) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "verification coordinator authority is already claimed",
+      );
+    }
+    const authority = Symbol("verification-coordinator-authority");
+    this.#verificationCoordinatorAuthority = authority;
+    return authority;
   }
 
   async providerSensitiveEnvironmentNames(
@@ -443,6 +515,16 @@ export class RunStore {
         verification_snapshot: null,
         verification_snapshot_sha256: null,
         verification_records: [],
+        verification_state:
+          parsedConfig.data.verification.coordinator?.schema_version === 2 &&
+          parsedConfig.data.verification.coordinator.enabled
+            ? {
+                schema_version: 1,
+                current_state: "integrated",
+                terminal_outcome: null,
+                attempts: [],
+              }
+            : null,
         model_bindings: {
           worker: workerBinding,
         },
@@ -480,18 +562,24 @@ export class RunStore {
   async recordVerificationSnapshot(
     runId: string,
     input: RecordVerificationSnapshotInput,
+    authority?: symbol,
   ): Promise<RunRecord> {
     return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
       const persisted = await this.readPersistedRun(runId);
       await this.assertApprovedVerificationPackage(
         persisted.run.project_path,
       );
       assertVerificationPackageFingerprint(input.package_fingerprint);
       if (persisted.run.verification_snapshot !== null) {
-        if (persisted.run.verification_snapshot.schema_version !== 2) {
+        if (
+          persisted.run.verification_snapshot.schema_version !== 2 ||
+          persisted.run.verification_snapshot.package.package_fingerprint !==
+            APPROVED_VERIFICATION_PACKAGE.package_fingerprint
+        ) {
           throw new ArkTeamError(
             "CONTRACT_VERSION_MISMATCH",
-            "contract-v1 verification evidence is read-only",
+            "earlier verification contracts are read-only",
           );
         }
         if (
@@ -536,6 +624,16 @@ export class RunStore {
         throw new ArkTeamError(
           "INVALID_TRANSITION",
           "verification coordinator is not enabled for this run",
+        );
+      }
+      const verificationState = persisted.run.verification_state;
+      if (
+        verificationState === null ||
+        verificationState.current_state !== "configured"
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification snapshot can only follow configured state",
         );
       }
 
@@ -638,6 +736,10 @@ export class RunStore {
         verification_snapshot: snapshot,
         verification_snapshot_sha256: snapshotSha256,
         verification_records: [...verificationRecords],
+        verification_state: {
+          ...verificationState,
+          current_state: "snapshotted",
+        },
       };
       await this.writePersistedRun({
         run,
@@ -655,8 +757,10 @@ export class RunStore {
   async appendVerificationRecord(
     runId: string,
     input: VerificationLinkedRecord,
+    authority?: symbol,
   ): Promise<RunRecord> {
     return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
       const persisted = await this.readPersistedRun(runId);
       const snapshot = persisted.run.verification_snapshot;
       if (snapshot === null) {
@@ -672,12 +776,38 @@ export class RunStore {
         );
       }
       if (
-        input.record_type === "artifact" ||
-        input.record_type === "cleanup"
+        ![
+          "capability",
+          "request",
+          "browser",
+          "agentic_browser",
+          "screenshot",
+          "review",
+          "comparison",
+        ].includes(input.record_type)
       ) {
         throw new ArkTeamError(
           "INVALID_TRANSITION",
-          "artifact and cleanup records are coordinator-owned",
+          "this verification record type is coordinator-owned",
+        );
+      }
+      if (
+        persisted.run.verification_state !== null &&
+        persisted.run.verification_state.terminal_outcome !== null
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "adapter evidence cannot be appended after the terminal outcome",
+        );
+      }
+      const expectedStage = verificationAdapterRecordStage(input.record_type);
+      if (
+        persisted.run.verification_state?.current_state !== expectedStage ||
+        input.stage !== expectedStage
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          `adapter ${input.record_type} evidence requires ${expectedStage} state`,
         );
       }
       await this.assertApprovedVerificationPackage(
@@ -729,11 +859,780 @@ export class RunStore {
     });
   }
 
+  async advanceVerificationState(
+    runId: string,
+    nextState: VerificationStage,
+    authority?: symbol,
+  ): Promise<VerificationStateTransitionResult> {
+    return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
+      const persisted = await this.readPersistedRun(runId);
+      const snapshot = persisted.run.verification_snapshot;
+      if (snapshot?.schema_version === 1) {
+        throw new ArkTeamError(
+          "CONTRACT_VERSION_MISMATCH",
+          "contract-v1 verification lifecycle is read-only",
+        );
+      }
+      if (snapshot !== null) {
+        await this.assertCurrentVerificationSnapshot(persisted.run);
+      }
+      const verificationState = persisted.run.verification_state;
+      if (verificationState === null) {
+        throw new ArkTeamError(
+          snapshot === null
+            ? "INVALID_TRANSITION"
+            : "CONTRACT_VERSION_MISMATCH",
+          snapshot === null
+            ? "verification lifecycle is not enabled for this run"
+            : "earlier verification runs are read-only",
+        );
+      }
+      if (
+        !isVerificationTransitionAllowed(
+          verificationState.current_state,
+          nextState,
+        ) ||
+        ["passed", "failed", "unavailable", "skipped", "error"].includes(
+          nextState,
+        )
+      ) {
+        if (snapshot === null) {
+          throw new ArkTeamError(
+            "INVALID_TRANSITION",
+            "invalid pre-snapshot verification transition",
+          );
+        }
+        const timestamp = this.now().toISOString();
+        const errorRecord = createVerificationCoordinatorErrorRecord({
+          run: { ...persisted.run, verification_state: verificationState },
+          timestamp,
+          code: "INVALID_RECORD",
+          message: `invalid verification transition from ${verificationState.current_state} to ${nextState}`,
+          attempt_count: 1,
+          evidence_record_ids: [],
+        });
+        const verificationRecords = appendVerificationLinkedRecord(
+          persisted.run.verification_records,
+          errorRecord,
+        );
+        const run: RunRecord = {
+          ...persisted.run,
+          updated_at: timestamp,
+          revision: persisted.run.revision + 1,
+          verification_state: verificationState,
+          verification_records: [...verificationRecords],
+        };
+        await this.writePersistedRun({ ...persisted, run });
+        return { run, accepted: false, error_record: errorRecord };
+      }
+
+      const timestamp = this.now().toISOString();
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        verification_state: {
+          ...verificationState,
+          current_state: nextState,
+        },
+      };
+      await this.writePersistedRun({ ...persisted, run });
+      return { run, accepted: true, error_record: null };
+    });
+  }
+
+  async recordVerificationAttempt(
+    runId: string,
+    input: RecordVerificationAttemptInput,
+    authority?: symbol,
+  ): Promise<RecordVerificationAttemptResult> {
+    return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
+      const persisted = await this.readPersistedRun(runId);
+      const snapshot = persisted.run.verification_snapshot;
+      if (snapshot === null || snapshot.schema_version !== 2) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification attempts require a contract-v2 snapshot",
+        );
+      }
+      const verificationState = persisted.run.verification_state;
+      if (verificationState === null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "earlier verification runs are read-only",
+        );
+      }
+      if (verificationState.terminal_outcome !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification attempts cannot follow a terminal outcome",
+        );
+      }
+      assertVerificationAttemptScope(snapshot, input);
+      if (
+        verificationState.current_state !==
+        verificationActionStage(input.kind)
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          `${input.kind} action requires ${verificationActionStage(input.kind)} state`,
+        );
+      }
+      if (!/^[a-f0-9]{64}$/.test(input.input_sha256)) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "verification attempt input hash is invalid",
+        );
+      }
+      if (input.evidence_record_ids.length !== 0) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "attempt reservation cannot claim evidence before execution",
+        );
+      }
+      const maxAttempts = snapshot.attempt_policy[input.kind];
+      const existingIndex = verificationState.attempts.findIndex(
+        (attempt) =>
+          verificationAttemptBudgetScopeKey(attempt) ===
+          verificationAttemptBudgetScopeKey(input),
+      );
+      const existing =
+        existingIndex === -1
+          ? null
+          : verificationState.attempts[existingIndex]!;
+      const rejectAttempt = async (
+        message: string,
+      ): Promise<RecordVerificationAttemptResult> => {
+        const timestamp = this.now().toISOString();
+        const errorRecord = createVerificationCoordinatorErrorRecord({
+          run: persisted.run,
+          timestamp,
+          code: "INVALID_RECORD",
+          message,
+          attempt_count: Math.max(existing?.attempt_count ?? 1, 1),
+          evidence_record_ids: [],
+        });
+        const verificationRecords = appendVerificationLinkedRecord(
+          persisted.run.verification_records,
+          errorRecord,
+        );
+        const run: RunRecord = {
+          ...persisted.run,
+          updated_at: timestamp,
+          revision: persisted.run.revision + 1,
+          verification_records: [...verificationRecords],
+        };
+        await this.writePersistedRun({ ...persisted, run });
+        return { run, reserved: false, error_record: errorRecord };
+      };
+      const actionIdAttempt = verificationState.attempts.find(
+        (attempt) => attempt.action_id === input.action_id,
+      );
+      if (
+        actionIdAttempt !== undefined &&
+        actionIdAttempt !== existing
+      ) {
+        return rejectAttempt(
+          "verification action ID is already bound to another durable scope",
+        );
+      }
+      if (
+        existing !== null &&
+        (existing.action_id !== input.action_id ||
+          existing.input_sha256 !== input.input_sha256 ||
+          existing.max_attempts !== maxAttempts)
+      ) {
+        return rejectAttempt(
+          "verification retry changed its durable action identity",
+        );
+      }
+      if (
+        existing !== null &&
+        (existing.status === "in_progress" ||
+          existing.status === "succeeded" ||
+          existing.status === "exhausted" ||
+          existing.status === "aborted" ||
+          existing.attempt_count >= maxAttempts)
+      ) {
+        return rejectAttempt(
+          "verification action is already active, complete, or exhausted",
+        );
+      }
+
+      try {
+        await this.assertCurrentVerificationSnapshot(persisted.run);
+      } catch (error) {
+        const code = verificationCoordinatorErrorCode(error);
+        const attemptCount = (existing?.attempt_count ?? 0) + 1;
+        const attempt = {
+          action_id: input.action_id,
+          kind: input.kind,
+          lane: input.lane,
+          check_id: input.check_id,
+          input_sha256: input.input_sha256,
+          attempt_count: attemptCount,
+          max_attempts: maxAttempts,
+          evidence_record_ids: existing?.evidence_record_ids ?? [],
+          decisive_evidence_record_ids: [],
+          status:
+            attemptCount >= maxAttempts
+              ? ("exhausted" as const)
+              : isTerminalVerificationActionError(code)
+                ? ("aborted" as const)
+                : ("failed" as const),
+          last_error_code: code,
+        };
+        const attempts = [...verificationState.attempts];
+        if (existingIndex === -1) {
+          attempts.push(attempt);
+        } else {
+          attempts[existingIndex] = attempt;
+        }
+        const stateRun: RunRecord = {
+          ...persisted.run,
+          verification_state: {
+            ...verificationState,
+            attempts,
+          },
+        };
+        const timestamp = this.now().toISOString();
+        const errorRecord = createVerificationCoordinatorErrorRecord({
+          run: stateRun,
+          timestamp,
+          action_id: input.action_id,
+          code,
+          message:
+            error instanceof Error
+              ? error.message
+              : "verification preflight failed",
+          attempt_count: attemptCount,
+          evidence_record_ids: attempt.evidence_record_ids,
+          lane: input.lane,
+          check_id: input.check_id,
+        });
+        const verificationRecords = appendVerificationLinkedRecord(
+          persisted.run.verification_records,
+          errorRecord,
+        );
+        const run: RunRecord = {
+          ...stateRun,
+          updated_at: timestamp,
+          revision: persisted.run.revision + 1,
+          verification_records: [...verificationRecords],
+        };
+        await this.writePersistedRun({ ...persisted, run });
+        return { run, reserved: false, error_record: errorRecord };
+      }
+
+      const nextAttempt = {
+        action_id: input.action_id,
+        kind: input.kind,
+        lane: input.lane,
+        check_id: input.check_id,
+        input_sha256: input.input_sha256,
+        attempt_count: (existing?.attempt_count ?? 0) + 1,
+        max_attempts: maxAttempts,
+        evidence_record_ids: [...(existing?.evidence_record_ids ?? [])],
+        decisive_evidence_record_ids: [],
+        status: "in_progress" as const,
+        last_error_code: null,
+      };
+      const attempts = [...verificationState.attempts];
+      if (existingIndex === -1) {
+        attempts.push(nextAttempt);
+      } else {
+        attempts[existingIndex] = nextAttempt;
+      }
+      const timestamp = this.now().toISOString();
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        verification_state: {
+          ...verificationState,
+          attempts,
+        },
+      };
+      await this.writePersistedRun({ ...persisted, run });
+      return { run, reserved: true, error_record: null };
+    });
+  }
+
+  async completeVerificationAttempt(
+    runId: string,
+    input: CompleteVerificationAttemptInput,
+    authority?: symbol,
+  ): Promise<CompleteVerificationAttemptResult> {
+    return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
+      const persisted = await this.readPersistedRun(runId);
+      const verificationState = persisted.run.verification_state;
+      if (
+        persisted.run.verification_snapshot?.schema_version !== 2 ||
+        verificationState === null
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification attempt completion requires coordinator state",
+        );
+      }
+      const attemptIndex = verificationState.attempts.findIndex(
+        (attempt) => attempt.action_id === input.action_id,
+      );
+      const attempt = verificationState.attempts[attemptIndex];
+      if (attempt === undefined || attempt.status !== "in_progress") {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification attempt is not reserved",
+        );
+      }
+      const recordById = new Map(
+        persisted.run.verification_records.map((record) => [
+          record.record_id,
+          record,
+        ]),
+      );
+      if (
+        new Set(input.evidence_record_ids).size !==
+          input.evidence_record_ids.length ||
+        input.evidence_record_ids.some((recordId) => {
+          const record = recordById.get(recordId);
+          return (
+            record === undefined ||
+            record.schema_version !== 2 ||
+            !verificationRecordMatchesAttempt(
+              attempt.kind,
+              attempt.lane,
+              attempt.check_id,
+              record,
+            )
+          );
+        })
+      ) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "verification attempt contains missing or mismatched evidence links",
+        );
+      }
+      let errorCode = input.error_code;
+      try {
+        await this.assertCurrentVerificationSnapshot(persisted.run);
+      } catch (error) {
+        errorCode = verificationCoordinatorErrorCode(error);
+      }
+      const completedAttempt = {
+        ...attempt,
+        evidence_record_ids: [
+          ...new Set([
+            ...attempt.evidence_record_ids,
+            ...input.evidence_record_ids,
+          ]),
+        ],
+        decisive_evidence_record_ids: [...input.evidence_record_ids],
+        status:
+          errorCode === null
+            ? ("succeeded" as const)
+            : attempt.attempt_count >= attempt.max_attempts
+              ? ("exhausted" as const)
+              : isTerminalVerificationActionError(errorCode)
+                ? ("aborted" as const)
+                : ("failed" as const),
+        last_error_code: errorCode,
+      };
+      const attempts = [...verificationState.attempts];
+      attempts[attemptIndex] = completedAttempt;
+      const timestamp = this.now().toISOString();
+      const stateRun: RunRecord = {
+        ...persisted.run,
+        verification_state: {
+          ...verificationState,
+          attempts,
+        },
+      };
+      let errorRecord: VerificationLinkedRecord | null = null;
+      let verificationRecords: readonly VerificationLinkedRecord[] =
+        persisted.run.verification_records;
+      if (
+        completedAttempt.status === "aborted" ||
+        completedAttempt.status === "exhausted"
+      ) {
+        const record = createVerificationCoordinatorErrorRecord({
+          run: stateRun,
+          timestamp,
+          action_id: input.action_id,
+          code: completedAttempt.last_error_code!,
+          message:
+            input.message ??
+            `verification action failed closed with ${completedAttempt.last_error_code}`,
+          attempt_count: completedAttempt.attempt_count,
+          evidence_record_ids: completedAttempt.evidence_record_ids,
+          lane: completedAttempt.lane,
+          check_id: completedAttempt.check_id,
+        });
+        errorRecord = {
+          ...record,
+          record_id: verificationActionErrorRecordId(input.action_id),
+        };
+        verificationRecords = appendVerificationLinkedRecord(
+          persisted.run.verification_records,
+          errorRecord,
+        );
+      }
+      const run: RunRecord = {
+        ...stateRun,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        verification_records: [...verificationRecords],
+      };
+      await this.writePersistedRun({ ...persisted, run });
+      return { run, error_code: errorCode, error_record: errorRecord };
+    });
+  }
+
+  async recordVerificationActionError(
+    runId: string,
+    input: RecordVerificationActionErrorInput,
+    authority?: symbol,
+  ): Promise<RecordVerificationActionErrorResult> {
+    return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
+      const persisted = await this.readPersistedRun(runId);
+      const snapshot = persisted.run.verification_snapshot;
+      const verificationState = persisted.run.verification_state;
+      if (
+        snapshot === null ||
+        snapshot.schema_version !== 2 ||
+        verificationState === null
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification action errors require persisted attempt state",
+        );
+      }
+      const attempt = verificationState.attempts.find(
+        (candidate) => candidate.action_id === input.action_id,
+      );
+      if (
+        attempt === undefined ||
+        (attempt.status !== "aborted" &&
+          attempt.status !== "exhausted") ||
+        attempt.last_error_code !== input.code
+      ) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "verification action error does not match a completed failed attempt",
+        );
+      }
+      const recordId = verificationActionErrorRecordId(input.action_id);
+      const existing = persisted.run.verification_records.find(
+        (record) => record.record_id === recordId,
+      );
+      if (existing !== undefined) {
+        if (existing.payload.kind !== "error") {
+          throw new ArkTeamError(
+            "CORRUPT_STATE",
+            "verification action error record ID is already occupied",
+          );
+        }
+        return { run: persisted.run, record: existing };
+      }
+      const timestamp = this.now().toISOString();
+      const record = createVerificationCoordinatorErrorRecord({
+        run: persisted.run,
+        timestamp,
+        action_id: input.action_id,
+        code: input.code,
+        message: input.message,
+        attempt_count: attempt.attempt_count,
+        evidence_record_ids: attempt.evidence_record_ids,
+        lane: attempt.lane,
+        check_id: attempt.check_id,
+      });
+      const errorRecord = { ...record, record_id: recordId };
+      const verificationRecords = appendVerificationLinkedRecord(
+        persisted.run.verification_records,
+        errorRecord,
+      );
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        verification_records: [...verificationRecords],
+      };
+      await this.writePersistedRun({ ...persisted, run });
+      return { run, record: errorRecord };
+    });
+  }
+
+  async finalizeVerification(
+    runId: string,
+    input: FinalizeVerificationInput,
+    authority?: symbol,
+  ): Promise<RunRecord> {
+    return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
+      const persisted = await this.readPersistedRun(runId);
+      const snapshot = persisted.run.verification_snapshot;
+      const verificationState = persisted.run.verification_state;
+      if (
+        snapshot === null ||
+        snapshot.schema_version !== 2 ||
+        verificationState === null
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification decision requires contract-v2 lifecycle state",
+        );
+      }
+      await this.assertCurrentVerificationSnapshot(persisted.run);
+      if (
+        verificationState.current_state !== "deciding" ||
+        verificationState.terminal_outcome !== null ||
+        verificationState.attempts.some(
+          (attempt) =>
+            attempt.status === "in_progress" ||
+            attempt.status === "failed",
+        )
+      ) {
+        const timestamp = this.now().toISOString();
+        const errorRecord = createVerificationCoordinatorErrorRecord({
+          run: persisted.run,
+          timestamp,
+          code: "INVALID_RECORD",
+          message:
+            "duplicate, out-of-order, or active-attempt terminal verification decision",
+          attempt_count: 1,
+          evidence_record_ids: [],
+        });
+        const verificationRecords = appendVerificationLinkedRecord(
+          persisted.run.verification_records,
+          errorRecord,
+        );
+        const run: RunRecord = {
+          ...persisted.run,
+          updated_at: timestamp,
+          revision: persisted.run.revision + 1,
+          verification_records: [...verificationRecords],
+        };
+        await this.writePersistedRun({ ...persisted, run });
+        return run;
+      }
+
+      const enabledLanes = [
+        ...(snapshot.backend_contract.enabled ? ["backend" as const] : []),
+        ...(snapshot.ui_contract.enabled ? ["ui" as const] : []),
+      ];
+      const recordById = new Map(
+        persisted.run.verification_records.map((record) => [
+          record.record_id,
+          record,
+        ]),
+      );
+      const supersededEvidenceIds =
+        supersededVerificationEvidenceRecordIds(
+          verificationState.attempts,
+        );
+      let lanes: VerificationLaneDecisionInput[];
+      try {
+        const parsedLanes = input.lanes
+          .map((lane) => verificationLaneDecisionInputSchema.parse(lane))
+          .map((lane) => ({
+            ...lane,
+            checks: [...lane.checks].sort((left, right) =>
+              left.check_id < right.check_id
+                ? -1
+                : left.check_id > right.check_id
+                  ? 1
+                  : 0,
+            ),
+          }))
+          .sort((left, right) =>
+            left.lane === right.lane
+              ? 0
+              : left.lane === "backend"
+                ? -1
+                : 1,
+          );
+        if (
+          parsedLanes.length !== enabledLanes.length ||
+          new Set(parsedLanes.map((lane) => lane.lane)).size !==
+            parsedLanes.length ||
+          enabledLanes.some(
+            (lane) =>
+              !parsedLanes.some((candidate) => candidate.lane === lane),
+          )
+        ) {
+          throw new ArkTeamError(
+            "INVALID_RECORD",
+            "verification decision must contain exactly one enabled-lane result",
+          );
+        }
+        lanes = parsedLanes.map((lane) =>
+          deriveVerificationLaneDecision(
+            snapshot,
+            lane,
+            recordById,
+            supersededEvidenceIds,
+          ),
+        );
+      } catch (error) {
+        const timestamp = this.now().toISOString();
+        const errorRecord = createVerificationCoordinatorErrorRecord({
+          run: persisted.run,
+          timestamp,
+          code: "INVALID_RECORD",
+          message:
+            error instanceof Error
+              ? error.message
+              : "verification decision is invalid",
+          attempt_count: 1,
+          evidence_record_ids: [],
+        });
+        const verificationRecords = appendVerificationLinkedRecord(
+          persisted.run.verification_records,
+          errorRecord,
+        );
+        const run: RunRecord = {
+          ...persisted.run,
+          updated_at: timestamp,
+          revision: persisted.run.revision + 1,
+          verification_records: [...verificationRecords],
+        };
+        await this.writePersistedRun({ ...persisted, run });
+        return run;
+      }
+
+      const timestamp = this.now().toISOString();
+      let records: readonly VerificationLinkedRecord[] = [
+        ...persisted.run.verification_records,
+      ];
+      const summaryRecords: VerificationLinkedRecord[] = [];
+      const laneOutcomes = new Map<"backend" | "ui", VerificationOutcome>();
+      for (const lane of lanes) {
+        const laneRequired =
+          lane.lane === "backend"
+            ? snapshot.backend_contract.enabled &&
+              snapshot.backend_contract.required
+            : snapshot.ui_contract.enabled && snapshot.ui_contract.required;
+        const outcome = aggregateVerificationChecks(lane.checks);
+        laneOutcomes.set(lane.lane, outcome);
+        const evidenceRecordIds = [
+          ...new Set(
+            lane.checks.flatMap((check) => check.evidence_record_ids),
+          ),
+        ];
+        const payload = {
+          kind: "lane_summary" as const,
+          lane: lane.lane,
+          outcome,
+          evidence_record_ids: evidenceRecordIds,
+          checks: lane.checks,
+        };
+        const summaryRecord: VerificationLinkedRecord = {
+          schema_version: 2,
+          contract_id: "verification_contract_v2",
+          record_id: `${runId}-${lane.lane}-summary`,
+          record_type: "lane_summary",
+          run_id: runId,
+          case_id: snapshot.case_id,
+          check_id: null,
+          snapshot_id: snapshot.snapshot_id,
+          lane: lane.lane,
+          stage: "deciding",
+          timestamp_utc: timestamp,
+          source_fingerprint: snapshot.source_fingerprint,
+          package_fingerprint: snapshot.package.package_fingerprint,
+          lane_required: laneRequired,
+          check_required: false,
+          previous_record_sha256: sha256CanonicalJson(records.at(-1)!),
+          payload_sha256: sha256CanonicalJson(payload),
+          payload,
+          adapter: null,
+          model: null,
+          artifact_references: [],
+        };
+        records = appendVerificationLinkedRecord(records, summaryRecord);
+        summaryRecords.push(summaryRecord);
+      }
+      const integrityFailure =
+        lanes.some((lane) =>
+          lane.checks.some((check) => check.integrity_failure),
+        ) ||
+        persisted.run.verification_records.some((record) => {
+          if (record.payload.kind !== "error") {
+            return false;
+          }
+          return verificationErrorDisposition(record.payload.code)
+            .integrity_failure;
+        });
+      const requiredLaneOutcomes = enabledLanes.flatMap((lane) => {
+        const required =
+          lane === "backend"
+            ? snapshot.backend_contract.enabled &&
+              snapshot.backend_contract.required
+            : snapshot.ui_contract.enabled && snapshot.ui_contract.required;
+        const outcome = laneOutcomes.get(lane);
+        return required && outcome !== undefined ? [outcome] : [];
+      });
+      const outcome = integrityFailure
+        ? "error"
+        : aggregateVerificationOutcomes(requiredLaneOutcomes);
+      const reportPayload = {
+        kind: "report" as const,
+        outcome,
+        evidence_record_ids: summaryRecords.map(
+          (record) => record.record_id,
+        ),
+      };
+      const reportRecord: VerificationLinkedRecord = {
+        schema_version: 2,
+        contract_id: "verification_contract_v2",
+        record_id: `${runId}-terminal-report`,
+        record_type: "report",
+        run_id: runId,
+        case_id: snapshot.case_id,
+        check_id: null,
+        snapshot_id: snapshot.snapshot_id,
+        lane: null,
+        stage: "deciding",
+        timestamp_utc: timestamp,
+        source_fingerprint: snapshot.source_fingerprint,
+        package_fingerprint: snapshot.package.package_fingerprint,
+        lane_required: null,
+        check_required: true,
+        previous_record_sha256: sha256CanonicalJson(records.at(-1)!),
+        payload_sha256: sha256CanonicalJson(reportPayload),
+        payload: reportPayload,
+        adapter: null,
+        model: null,
+        artifact_references: [],
+      };
+      records = appendVerificationLinkedRecord(records, reportRecord);
+      const run: RunRecord = {
+        ...persisted.run,
+        updated_at: timestamp,
+        revision: persisted.run.revision + 1,
+        verification_records: [...records],
+        verification_state: {
+          ...verificationState,
+          current_state: outcome,
+          terminal_outcome: outcome,
+        },
+      };
+      await this.writePersistedRun({ ...persisted, run });
+      return run;
+    });
+  }
+
   async writeVerificationArtifact(
     runId: string,
     input: WriteVerificationArtifactInput,
+    authority?: symbol,
   ): Promise<WriteVerificationArtifactResult> {
     return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
       const persisted = await this.readPersistedRun(runId);
       const snapshot = persisted.run.verification_snapshot;
       if (snapshot === null) {
@@ -746,6 +1645,15 @@ export class RunStore {
         throw new ArkTeamError(
           "CONTRACT_VERSION_MISMATCH",
           "contract-v1 verification artifacts are read-only",
+        );
+      }
+      if (
+        persisted.run.verification_state !== null &&
+        persisted.run.verification_state.terminal_outcome !== null
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "verification artifacts cannot be written after the terminal outcome",
         );
       }
       await this.assertApprovedVerificationPackage(
@@ -882,8 +1790,10 @@ export class RunStore {
 
   async cleanupVerificationArtifacts(
     runId: string,
+    authority?: symbol,
   ): Promise<CleanupVerificationArtifactsResult> {
     return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
       const persisted = await this.readPersistedRun(runId);
       let run = persisted.run;
       const snapshot = run.verification_snapshot;
@@ -4117,6 +5027,34 @@ export class RunStore {
     assertVerificationPackageBytes(packageBytes);
   }
 
+  private async assertCurrentVerificationSnapshot(
+    run: RunRecord,
+  ): Promise<void> {
+    const snapshot = run.verification_snapshot;
+    if (snapshot === null || snapshot.schema_version !== 2) {
+      throw new ArkTeamError(
+        "CONTRACT_VERSION_MISMATCH",
+        "a current contract-v2 verification snapshot is required",
+      );
+    }
+    if (
+      snapshot.package.package_fingerprint !==
+        APPROVED_VERIFICATION_PACKAGE.package_fingerprint ||
+      snapshot.package.package_id !==
+        APPROVED_VERIFICATION_PACKAGE.package_id
+    ) {
+      throw new ArkTeamError(
+        "CONTRACT_VERSION_MISMATCH",
+        "earlier verification package snapshots are read-only",
+      );
+    }
+    await this.assertApprovedVerificationPackage(run.project_path);
+    const currentSource = await this.verificationSourceLoader(
+      run.project_path,
+    );
+    assertVerificationSourceIdentity(currentSource, snapshot.source);
+  }
+
   private async readVerificationRollback(): Promise<VerificationRollbackRecord | null> {
     let raw: string;
     try {
@@ -4250,6 +5188,20 @@ export class RunStore {
     return path.join(this.runDirectory(runId), "run.json");
   }
 
+  private assertVerificationCoordinatorAuthority(
+    authority: symbol | undefined,
+  ): void {
+    if (
+      this.#verificationCoordinatorAuthority !== null &&
+      authority !== this.#verificationCoordinatorAuthority
+    ) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "verification mutation requires coordinator authority",
+      );
+    }
+  }
+
   private withMutation<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.mutationQueue.then(operation, operation);
     this.mutationQueue = result.then(
@@ -4258,6 +5210,488 @@ export class RunStore {
     );
     return result;
   }
+}
+
+type VerificationStateValue = VerificationStage | VerificationOutcome;
+type VerificationRunSnapshotV2 = Extract<
+  VerificationRunSnapshot,
+  { schema_version: 2 }
+>;
+type VerificationLinkedRecordV2 = Extract<
+  VerificationLinkedRecord,
+  { schema_version: 2 }
+>;
+
+function isVerificationTransitionAllowed(
+  current: VerificationStateValue,
+  next: VerificationStateValue,
+): boolean {
+  const transitions: Partial<
+    Record<VerificationStateValue, readonly VerificationStateValue[]>
+  > = {
+    integrated: ["configured"],
+    configured: ["snapshotted"],
+    snapshotted: ["capabilities"],
+    capabilities: ["ready"],
+    ready: ["executing"],
+    executing: ["collecting"],
+    collecting: ["deciding"],
+    deciding: ["passed", "failed", "unavailable", "skipped", "error"],
+    passed: ["pm_review_pending"],
+    pm_review_pending: ["original_pm_review"],
+  };
+  return transitions[current]?.includes(next) ?? false;
+}
+
+function verificationAdapterRecordStage(
+  recordType: VerificationLinkedRecord["record_type"],
+): "capabilities" | "executing" | "collecting" {
+  if (recordType === "capability") {
+    return "capabilities";
+  }
+  if (
+    recordType === "request" ||
+    recordType === "browser" ||
+    recordType === "agentic_browser"
+  ) {
+    return "executing";
+  }
+  if (
+    recordType === "screenshot" ||
+    recordType === "review" ||
+    recordType === "comparison"
+  ) {
+    return "collecting";
+  }
+  throw new ArkTeamError(
+    "INVALID_RECORD",
+    "record type is not adapter-owned",
+  );
+}
+
+function verificationActionStage(
+  kind: VerificationActionKind,
+): "capabilities" | "executing" | "collecting" {
+  if (kind === "readiness") {
+    return "capabilities";
+  }
+  if (
+    kind === "api" ||
+    kind === "browser" ||
+    kind === "agentic_browser"
+  ) {
+    return "executing";
+  }
+  if (
+    kind === "screenshot" ||
+    kind === "semantic_review" ||
+    kind === "comparison" ||
+    kind === "artifact_write"
+  ) {
+    return "collecting";
+  }
+  throw new ArkTeamError(
+    "INVALID_TRANSITION",
+    "cleanup attempts are post-terminal operational work",
+  );
+}
+
+function verificationRecordMatchesAttempt(
+  kind: VerificationActionKind,
+  lane: "backend" | "ui" | null,
+  checkId: string | null,
+  record: Extract<VerificationLinkedRecord, { schema_version: 2 }>,
+): boolean {
+  if (kind === "readiness") {
+    return (
+      record.record_type === "capability" &&
+      record.lane !== null &&
+      record.check_id === null
+    );
+  }
+  const expectedRecordType =
+    kind === "api"
+      ? "request"
+      : kind === "browser"
+        ? "browser"
+        : kind === "agentic_browser"
+          ? "agentic_browser"
+          : kind === "screenshot"
+            ? "screenshot"
+            : kind === "semantic_review"
+              ? "review"
+              : kind === "comparison"
+                ? "comparison"
+                : null;
+  return (
+    expectedRecordType !== null &&
+    record.record_type === expectedRecordType &&
+    record.lane === lane &&
+    record.check_id === checkId
+  );
+}
+
+function verificationCoordinatorErrorCode(
+  error: unknown,
+): VerificationErrorCode {
+  if (
+    error instanceof ArkTeamError &&
+    verificationErrorCodeSchema.safeParse(error.code).success
+  ) {
+    return error.code as VerificationErrorCode;
+  }
+  return "INVALID_RECORD";
+}
+
+function isTerminalVerificationActionError(
+  code: VerificationErrorCode,
+): boolean {
+  return (
+    code === "INVALID_RECORD" ||
+    verificationErrorDisposition(code).integrity_failure
+  );
+}
+
+function verificationAttemptBudgetScopeKey(input: {
+  kind: VerificationActionKind;
+  lane: "backend" | "ui" | null;
+  check_id: string | null;
+  input_sha256: string;
+}): string {
+  return [
+    input.kind,
+    input.lane ?? "",
+    input.check_id ?? "",
+    input.kind === "artifact_write" ? input.input_sha256 : "",
+  ].join("\0");
+}
+
+function assertVerificationAttemptScope(
+  snapshot: VerificationRunSnapshotV2,
+  input: RecordVerificationAttemptInput,
+): void {
+  const mustBeBackend = input.kind === "api";
+  const mustBeUi = [
+    "browser",
+    "agentic_browser",
+    "screenshot",
+    "semantic_review",
+    "comparison",
+  ].includes(input.kind);
+  const mustBeCommon = input.kind === "readiness" || input.kind === "cleanup";
+  if (
+    (mustBeBackend && input.lane !== "backend") ||
+    (mustBeUi && input.lane !== "ui") ||
+    ((mustBeBackend || mustBeUi) && input.check_id === null) ||
+    (mustBeCommon && (input.lane !== null || input.check_id !== null))
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "verification action does not match its immutable lane scope",
+    );
+  }
+  if (
+    input.lane === "backend" &&
+    !snapshot.backend_contract.enabled
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "backend verification action targets a disabled lane",
+    );
+  }
+  if (input.lane === "ui" && !snapshot.ui_contract.enabled) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "UI verification action targets a disabled lane",
+    );
+  }
+  if (
+    input.check_id !== null &&
+    expectedVerificationCheckRequired(
+      snapshot,
+      input.lane,
+      input.check_id,
+    ) === null
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "verification action targets an unknown snapshotted check",
+    );
+  }
+}
+
+function expectedVerificationCheckRequired(
+  snapshot: VerificationRunSnapshotV2,
+  lane: "backend" | "ui" | null,
+  checkId: string,
+): boolean | null {
+  if (lane === "backend" && snapshot.backend_contract.enabled) {
+    return (
+      snapshot.backend_contract.api_probes.find(
+        (probe) => probe.id === checkId,
+      )?.required ?? null
+    );
+  }
+  if (lane === "ui" && snapshot.ui_contract.enabled) {
+    return (
+      snapshot.ui_contract.browser_cases.find(
+        (browserCase) => browserCase.id === checkId,
+      )?.required ??
+      snapshot.ui_contract.agentic_tasks.find(
+        (task) => task.id === checkId,
+      )?.required ??
+      null
+    );
+  }
+  return null;
+}
+
+function deriveVerificationLaneDecision(
+  snapshot: VerificationRunSnapshotV2,
+  lane: VerificationLaneDecisionInput,
+  records: Map<string, VerificationLinkedRecord>,
+  supersededEvidenceIds: ReadonlySet<string>,
+): VerificationLaneDecisionInput {
+  const expectedChecks =
+    lane.lane === "backend"
+      ? snapshot.backend_contract.enabled
+        ? snapshot.backend_contract.api_probes.map((probe) => ({
+            id: probe.id,
+            required: probe.required,
+          }))
+        : []
+      : snapshot.ui_contract.enabled
+        ? [
+            ...snapshot.ui_contract.browser_cases.map((browserCase) => ({
+              id: browserCase.id,
+              required: browserCase.required,
+            })),
+            ...snapshot.ui_contract.agentic_tasks.map((task) => ({
+              id: task.id,
+              required: task.required,
+            })),
+          ]
+        : [];
+  if (
+    lane.checks.length !== expectedChecks.length ||
+    new Set(lane.checks.map((check) => check.check_id)).size !==
+      lane.checks.length ||
+    expectedChecks.some(
+      (expected) =>
+        !lane.checks.some(
+          (check) =>
+            check.check_id === expected.id &&
+            check.required === expected.required,
+        ),
+    )
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "lane decision does not match the exact snapshotted check set",
+    );
+  }
+  const checks = lane.checks.map((check) => {
+    const matchingEvidence = [...records.values()].filter(
+      (record): record is VerificationLinkedRecordV2 =>
+        record.schema_version === 2 &&
+        record.lane === lane.lane &&
+        record.check_id === check.check_id &&
+        !supersededEvidenceIds.has(record.record_id) &&
+        verificationEvidenceDisposition(record) !== null,
+    );
+    if (matchingEvidence.length === 0) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "lane decision requires check-scoped persisted evidence",
+      );
+    }
+    const evidenceRecordIds = matchingEvidence
+      .map((record) => record.record_id)
+      .sort();
+    const submittedRecordIds = [...check.evidence_record_ids].sort();
+    if (
+      evidenceRecordIds.length !== submittedRecordIds.length ||
+      evidenceRecordIds.some(
+        (recordId, index) => recordId !== submittedRecordIds[index],
+      )
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "lane decision must link every persisted record for its check",
+      );
+    }
+    const dispositions = matchingEvidence.map((record) => {
+      const disposition = verificationEvidenceDisposition(record);
+      if (disposition === null) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "lane decision linked non-outcome evidence",
+        );
+      }
+      if (
+        record.payload.kind === "error" &&
+        (record.payload.outcome !== disposition.outcome ||
+          record.payload.integrity_failure !==
+            disposition.integrity_failure)
+      ) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "verification error disposition does not match its closed code",
+        );
+      }
+      return disposition;
+    });
+    const integrityFailure = dispositions.some(
+      (disposition) => disposition.integrity_failure,
+    );
+    const outcome = integrityFailure
+      ? "error"
+      : aggregateVerificationOutcomes(
+          dispositions.map((disposition) => disposition.outcome),
+        );
+    if (
+      check.outcome !== outcome ||
+      check.integrity_failure !== integrityFailure
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "lane decision outcome does not match persisted evidence",
+      );
+    }
+    return {
+      ...check,
+      outcome,
+      integrity_failure: integrityFailure,
+      evidence_record_ids: evidenceRecordIds,
+    };
+  });
+  return { lane: lane.lane, checks };
+}
+
+function supersededVerificationEvidenceRecordIds(
+  attempts: NonNullable<RunRecord["verification_state"]>["attempts"],
+): ReadonlySet<string> {
+  return new Set(
+    attempts.flatMap((attempt) =>
+      attempt.evidence_record_ids.filter(
+        (recordId) =>
+          !attempt.decisive_evidence_record_ids.includes(recordId),
+      ),
+    ),
+  );
+}
+
+function aggregateVerificationChecks(
+  checks: VerificationLaneDecisionInput["checks"],
+): VerificationOutcome {
+  if (checks.some((check) => check.integrity_failure)) {
+    return "error";
+  }
+  const requiredOutcomes = checks.flatMap((check) =>
+    check.required ? [check.outcome] : [],
+  );
+  return aggregateVerificationOutcomes(requiredOutcomes);
+}
+
+function aggregateVerificationOutcomes(
+  outcomes: VerificationOutcome[],
+): VerificationOutcome {
+  for (const outcome of [
+    "error",
+    "unavailable",
+    "failed",
+    "skipped",
+  ] as const) {
+    if (outcomes.includes(outcome)) {
+      return outcome;
+    }
+  }
+  return "passed";
+}
+
+function createVerificationCoordinatorErrorRecord(input: {
+  run: RunRecord;
+  timestamp: string;
+  action_id?: string;
+  code: VerificationErrorCode;
+  message: string;
+  attempt_count: number;
+  evidence_record_ids: string[];
+  lane?: "backend" | "ui" | null;
+  check_id?: string | null;
+}): VerificationLinkedRecord {
+  const snapshot = input.run.verification_snapshot;
+  if (snapshot === null || snapshot.schema_version !== 2) {
+    throw new ArkTeamError(
+      "INVALID_TRANSITION",
+      "verification error records require a contract-v2 snapshot",
+    );
+  }
+  const lane = input.lane ?? null;
+  const checkId = input.check_id ?? null;
+  const checkRequired =
+    checkId === null
+      ? false
+      : (expectedVerificationCheckRequired(snapshot, lane, checkId) ?? false);
+  const disposition = verificationErrorDisposition(input.code);
+  const payload = {
+    kind: "error" as const,
+    code: input.code,
+    message: input.message.trim().slice(0, 1_000),
+    ...(input.action_id === undefined
+      ? {}
+      : { action_id: input.action_id }),
+    attempt_count: input.attempt_count,
+    evidence_record_ids: input.evidence_record_ids,
+    outcome: disposition.outcome,
+    integrity_failure: disposition.integrity_failure,
+  };
+  const current = input.run.verification_state?.current_state;
+  const stage: VerificationStage =
+    current !== undefined &&
+    !["passed", "failed", "unavailable", "skipped", "error"].includes(
+      current,
+    )
+      ? (current as VerificationStage)
+      : "deciding";
+  return {
+    schema_version: 2,
+    contract_id: "verification_contract_v2",
+    record_id: `verification-error-${randomUUID()}`,
+    record_type: "error",
+    run_id: input.run.run_id,
+    case_id: snapshot.case_id,
+    check_id: checkId,
+    snapshot_id: snapshot.snapshot_id,
+    lane,
+    stage,
+    timestamp_utc: input.timestamp,
+    source_fingerprint: snapshot.source_fingerprint,
+    package_fingerprint: snapshot.package.package_fingerprint,
+    lane_required:
+      lane === null
+        ? null
+        : lane === "backend"
+          ? snapshot.backend_contract.enabled
+            ? snapshot.backend_contract.required
+            : null
+          : snapshot.ui_contract.enabled
+            ? snapshot.ui_contract.required
+            : null,
+    check_required: checkRequired,
+    previous_record_sha256: sha256CanonicalJson(
+      input.run.verification_records.at(-1)!,
+    ),
+    payload_sha256: sha256CanonicalJson(payload),
+    payload,
+    adapter: null,
+    model: null,
+    artifact_references: [],
+  };
+}
+
+function verificationActionErrorRecordId(actionId: string): string {
+  return `error-${sha256CanonicalJson(actionId).slice(0, 24)}`;
 }
 
 function createVerificationCleanupRecord(

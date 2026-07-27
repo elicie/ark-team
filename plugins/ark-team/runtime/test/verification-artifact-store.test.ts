@@ -272,6 +272,15 @@ test("TEST-1706 registers one exact root and rejects unsafe or invalid writes", 
       validVerificationCoordinatorConfig(),
     ),
   });
+  assert.equal(
+    (
+      await checkoutStore.advanceVerificationState(
+        checkoutRun.run_id,
+        "configured",
+      )
+    ).accepted,
+    true,
+  );
   await assert.rejects(
     () =>
       checkoutStore.recordVerificationSnapshot(checkoutRun.run_id, {
@@ -530,7 +539,7 @@ test("TEST-1706 retains before the boundary and cleans only the registered root"
   );
   assert.equal(cleaned.audit?.status, "cleaned");
   assert.equal(cleaned.audit?.destructive_attempt, 1);
-  assert.equal(cleaned.audit?.terminal_outcome, "failed");
+  assert.equal(cleaned.audit?.terminal_outcome, "passed");
   assert.equal(await pathExists(successSnapshot.artifact_root), false);
   assert.equal(
     await pathExists(`${successSnapshot.artifact_root}.cleanup-pending`),
@@ -682,6 +691,11 @@ async function createSnapshottedRun(options: {
     project_path: project,
     project_config: verificationProjectConfig(config),
   });
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "configured"))
+      .accepted,
+    true,
+  );
   const run = await store.recordVerificationSnapshot(created.run_id, {
     package_fingerprint:
       APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
@@ -795,8 +809,13 @@ async function createCleanupRun(
   label: string,
 ) {
   const clock = { value: new Date(TERMINAL_REPORT_AT) };
+  const cleanupConfig = structuredClone(config);
+  if (cleanupConfig.ui.enabled) {
+    cleanupConfig.ui.agentic_tasks = [];
+    cleanupConfig.ui.optional_capabilities = [];
+  }
   const fixture = await createSnapshottedRun({
-    config: structuredClone(config),
+    config: cleanupConfig,
     clock,
   });
   const artifactBytes = Buffer.from(`${label} artifact\n`, "utf8");
@@ -812,40 +831,133 @@ async function createCleanupRun(
     },
   );
   const snapshot = requireV2Snapshot(written.run);
-  const payload = {
-    kind: "report" as const,
-    outcome: "failed" as const,
-    evidence_record_ids: [written.record.record_id],
+  for (const stage of ["capabilities", "ready", "executing"] as const) {
+    const advanced = await fixture.store.advanceVerificationState(
+      written.run.run_id,
+      stage,
+    );
+    assert.equal(advanced.accepted, true);
+  }
+  assert.equal(snapshot.backend_contract.enabled, true);
+  assert.equal(snapshot.ui_contract.enabled, true);
+  if (!snapshot.backend_contract.enabled || !snapshot.ui_contract.enabled) {
+    assert.fail("cleanup fixture requires both verification lanes");
+  }
+  const backendProbe = snapshot.backend_contract.api_probes[0];
+  const browserCase = snapshot.ui_contract.browser_cases[0];
+  if (backendProbe === undefined || browserCase === undefined) {
+    assert.fail("cleanup fixture requires one check per lane");
+  }
+  const backendPayload = {
+    kind: "request" as const,
+    method: backendProbe.method,
+    path: backendProbe.path,
+    expected_status: backendProbe.expected_status,
+    actual_status: backendProbe.expected_status,
+    request_sha256: "c".repeat(64),
+    response_sha256: "d".repeat(64),
   };
-  const report: VerificationLinkedRecord = {
+  const backendRecord: VerificationLinkedRecord = {
     schema_version: 2,
     contract_id: "verification_contract_v2",
-    record_id: `${label}-terminal-report`,
-    record_type: "report",
+    record_id: `${label}-backend-request`,
+    record_type: "request",
     run_id: written.run.run_id,
     case_id: snapshot.case_id,
-    check_id: null,
+    check_id: backendProbe.id,
     snapshot_id: snapshot.snapshot_id,
-    lane: null,
-    stage: "deciding",
+    lane: "backend",
+    stage: "executing",
     timestamp_utc: new Date(TERMINAL_REPORT_AT).toISOString(),
     source_fingerprint: snapshot.source_fingerprint,
     package_fingerprint: snapshot.package.package_fingerprint,
-    lane_required: null,
-    check_required: true,
+    lane_required: snapshot.backend_contract.required,
+    check_required: backendProbe.required,
     previous_record_sha256: sha256CanonicalJson(
       written.run.verification_records.at(-1),
     ),
-    payload_sha256: sha256CanonicalJson(payload),
-    payload,
-    adapter: null,
+    payload_sha256: sha256CanonicalJson(backendPayload),
+    payload: backendPayload,
+    adapter: {
+      name: snapshot.backend_contract.api_adapter,
+      version: snapshot.backend_contract.api_adapter_version,
+    },
     model: null,
-    artifact_references: written.record.artifact_references,
+    artifact_references: [],
   };
-  const reported = await fixture.store.appendVerificationRecord(
+  const withBackend = await fixture.store.appendVerificationRecord(
     written.run.run_id,
-    report,
+    backendRecord,
   );
+  const uiPayload = {
+    kind: "browser" as const,
+    case_sha256: sha256CanonicalJson(browserCase),
+    action_count: browserCase.actions.length,
+    assertion_count: browserCase.assertions.length,
+  };
+  const uiRecord: VerificationLinkedRecord = {
+    ...backendRecord,
+    record_id: `${label}-ui-browser`,
+    record_type: "browser",
+    lane: "ui",
+    check_id: browserCase.id,
+    lane_required: snapshot.ui_contract.required,
+    check_required: browserCase.required,
+    previous_record_sha256: sha256CanonicalJson(
+      withBackend.verification_records.at(-1),
+    ),
+    payload_sha256: sha256CanonicalJson(uiPayload),
+    payload: uiPayload,
+    adapter: {
+      name: snapshot.ui_contract.deterministic_adapter,
+      version: snapshot.ui_contract.deterministic_adapter_version,
+    },
+  };
+  const withEvidence = await fixture.store.appendVerificationRecord(
+    written.run.run_id,
+    uiRecord,
+  );
+  for (const stage of ["collecting", "deciding"] as const) {
+    const advanced = await fixture.store.advanceVerificationState(
+      written.run.run_id,
+      stage,
+    );
+    assert.equal(advanced.accepted, true);
+  }
+  const reported = await fixture.store.finalizeVerification(
+    written.run.run_id,
+    {
+      lanes: [
+        {
+          lane: "backend",
+          checks: snapshot.backend_contract.enabled
+            ? snapshot.backend_contract.api_probes.map((probe) => ({
+                check_id: probe.id,
+                required: probe.required,
+                outcome: "passed" as const,
+                evidence_record_ids: [backendRecord.record_id],
+                integrity_failure: false,
+              }))
+            : [],
+        },
+        {
+          lane: "ui",
+          checks: snapshot.ui_contract.enabled
+            ? [
+                ...snapshot.ui_contract.browser_cases.map((browserCase) => ({
+                  check_id: browserCase.id,
+                  required: browserCase.required,
+                  outcome: "passed" as const,
+                  evidence_record_ids: [uiRecord.record_id],
+                  integrity_failure: false,
+                })),
+              ]
+            : [],
+        },
+      ],
+    },
+  );
+  assert.equal(withEvidence.verification_state?.current_state, "executing");
   return { ...fixture, reported };
 }
 
