@@ -110,7 +110,7 @@ test("TEST-1703 accepts only the closed lifecycle and persists one terminal repo
   assert.equal(duplicate.verification_records.at(-1)?.payload.kind, "error");
 });
 
-test("TEST-1703 covers executable terminal branches and the passed PM-review edges", async (t) => {
+test("TEST-1703 covers terminal branches and rejects incomplete PM handoff", async (t) => {
   for (const outcome of [
     "passed",
     "failed",
@@ -141,16 +141,15 @@ test("TEST-1703 covers executable terminal branches and the passed PM-review edg
         fixture.run_id,
         "pm_review_pending",
       );
-      assert.equal(pending.accepted, true);
-      const reviewed = await fixture.coordinator.advance(
-        fixture.run_id,
-        "original_pm_review",
-      );
-      assert.equal(reviewed.accepted, true);
+      assert.equal(pending.accepted, false);
       assert.equal(
-        reviewed.run.verification_state?.terminal_outcome,
+        pending.run.verification_state?.current_state,
         "passed",
       );
+      assert.equal(pending.error_record?.payload.kind, "error");
+      if (pending.error_record?.payload.kind === "error") {
+        assert.equal(pending.error_record.payload.code, "INVALID_RECORD");
+      }
     }
   }
 });

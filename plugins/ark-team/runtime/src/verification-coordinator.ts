@@ -53,10 +53,13 @@ import type {
   VerificationLaneDecisionInput,
   VerificationLinkedRecord,
   VerificationOutcome,
+  VerificationRollbackRecord,
   VerificationRunSnapshot,
+  VerificationSpecDeltaRecord,
   VerificationStage,
 } from "./verification-contract.js";
 import {
+  VERIFICATION_SECRET_TEXT_PATTERN,
   canonicalJson,
   sha256CanonicalJson,
   verificationEvidenceDisposition,
@@ -68,6 +71,7 @@ import type {
   RecordVerificationActionErrorResult,
   RecordVerificationAttemptInput,
   RecordVerificationSnapshotInput,
+  RecordVerificationSpecDeltaInput,
   RunStore,
   TerminateVerificationForApprovalResult,
   VerificationStateTransitionResult,
@@ -85,8 +89,6 @@ const ADAPTER_RECORD_TYPES = new Set<VerificationLinkedRecord["record_type"]>([
   "comparison",
 ]);
 
-const SECRET_DIAGNOSTIC_PATTERN =
-  /\b(?:authorization|bearer|cookie|password|secret|token|api[_-]?key)\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9]{20,}\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b|\b[A-Za-z0-9_-]{48,}\b|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
 const REDACTED_DIAGNOSTIC =
   "verification action failed; diagnostic was redacted";
 const MAX_DIAGNOSTIC_CHARACTERS = 1_000;
@@ -163,7 +165,34 @@ export type VerificationCoordinatorStore = Pick<
   | "writeVerificationArtifact"
   | "cleanupVerificationArtifacts"
   | "verifyApprovedBaseline"
+  | "recordVerificationRollback"
+  | "getVerificationRollback"
+  | "recordVerificationSpecDelta"
+  | "getVerificationSpecDelta"
+  | "revalidateVerificationArtifacts"
 >;
+
+export const VERIFICATION_ROLLOUT_STAGES = Object.freeze([
+  "source_config_snapshot",
+  "artifacts_baselines",
+  "coordinator_lane_aggregation",
+  "capability_server",
+  "backend_api",
+  "deterministic_ui",
+  "visual_checks",
+  "agentic_ui",
+  "bootstrap",
+] as const);
+
+export interface VerificationRolloutAnnouncement {
+  contract_id: "verification_contract_v2";
+  schema_version: 2;
+  package_id: "verification-spec-v4";
+  package_fingerprint: string;
+  source_fingerprint: string;
+  snapshot_id: string;
+  stages: typeof VERIFICATION_ROLLOUT_STAGES;
+}
 
 export type DeepReadonly<T> = T extends
   | string
@@ -312,6 +341,55 @@ export interface RunVerificationAgenticBrowserInput {
   action_id: string;
   task_id: string;
 }
+
+type VerificationBootstrapViewport = "375x812" | "768x1024" | "1440x900";
+
+export interface RunVerificationBootstrapInput {
+  package_fingerprint: string;
+  server: Omit<VerificationServerRegistration, "registration_id">;
+  api_body_base64_by_probe?: Readonly<Record<string, string>>;
+  semantic_checklist_by_case?: Readonly<
+    Record<string, VerificationSemanticReviewChecklistIdentity>
+  >;
+  baseline_png_bytes_by_case?: Readonly<
+    Record<
+      string,
+      Readonly<Record<VerificationBootstrapViewport, Uint8Array>>
+    >
+  >;
+}
+
+export interface VerificationBootstrapStep {
+  sequence: number;
+  name:
+    | "identity"
+    | "config"
+    | "snapshot"
+    | "capabilities"
+    | "server"
+    | "backend"
+    | "deterministic_ui"
+    | "visual"
+    | "agentic_ui"
+    | "lane_summaries"
+    | "terminal_handoff";
+  status: "completed" | "not_applicable";
+  evidence_record_ids: string[];
+}
+
+export type VerificationBootstrapResult =
+  | {
+      status: "completed";
+      case_id: "BOOTSTRAP-1701";
+      steps: VerificationBootstrapStep[];
+      run: RunRecord;
+    }
+  | {
+      status: "SPEC_DELTA_REQUIRED";
+      case_id: "BOOTSTRAP-1701";
+      steps: VerificationBootstrapStep[];
+      delta: VerificationSpecDeltaRecord;
+    };
 
 export interface VerificationApiProbeValue {
   evidence: VerificationApiEvidence;
@@ -543,6 +621,603 @@ export class VerificationCoordinator {
     });
   }
 
+  async announceRollout(
+    runId: string,
+  ): Promise<VerificationRolloutAnnouncement> {
+    const run = await this.store.assertCurrentVerification(
+      runId,
+      this.#authority,
+    );
+    const snapshot = requireV2Snapshot(run);
+    if (snapshot.package.package_id !== "verification-spec-v4") {
+      throw new ArkTeamError(
+        "CONTRACT_VERSION_MISMATCH",
+        "only verification-spec-v4 can announce a contract-v2 rollout",
+      );
+    }
+    return Object.freeze({
+      contract_id: "verification_contract_v2",
+      schema_version: 2,
+      package_id: "verification-spec-v4",
+      package_fingerprint: snapshot.package.package_fingerprint,
+      source_fingerprint: snapshot.source_fingerprint,
+      snapshot_id: snapshot.snapshot_id,
+      stages: VERIFICATION_ROLLOUT_STAGES,
+    });
+  }
+
+  disableLocalVerification(
+    reason: string,
+  ): Promise<VerificationRollbackRecord> {
+    return this.store.recordVerificationRollback({ reason });
+  }
+
+  getLocalVerificationRollback(): Promise<VerificationRollbackRecord | null> {
+    return this.store.getVerificationRollback();
+  }
+
+  async recordSpecDelta(
+    runId: string,
+    input: RecordVerificationSpecDeltaInput,
+  ): Promise<VerificationSpecDeltaRecord> {
+    this.abortActiveActions(runId);
+    return this.store.recordVerificationSpecDelta(
+      runId,
+      input,
+      this.#authority,
+    );
+  }
+
+  getSpecDelta(
+    runId: string,
+  ): Promise<VerificationSpecDeltaRecord | null> {
+    return this.store.getVerificationSpecDelta(runId);
+  }
+
+  getCurrentRun(runId: string): Promise<RunRecord> {
+    return this.store.getRun(runId);
+  }
+
+  async recoverLocal(runId: string): Promise<RunRecord> {
+    const initial = await this.store.getRun(runId);
+    const snapshot = initial.verification_snapshot;
+    if (snapshot === null || snapshot.schema_version !== 2) {
+      throw new ArkTeamError(
+        "CONTRACT_VERSION_MISMATCH",
+        "contract-v1 verification runs are read-only",
+      );
+    }
+    if (initial.verification_state?.terminal_outcome !== null) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "terminal verification runs never resume",
+      );
+    }
+    const run = await this.store.revalidateVerificationArtifacts(
+      runId,
+      this.#authority,
+    );
+    const state = run.verification_state?.current_state;
+    if (
+      state === undefined ||
+      verificationStageIndex(state) <
+        verificationStageIndex("capabilities")
+    ) {
+      return run;
+    }
+    const runtime = this.requireLocalRuntime();
+    const demands = verificationCapabilityDemands(snapshot);
+    const recordedCapabilities = run.verification_records.filter(
+      (
+        record,
+      ): record is Extract<VerificationLinkedRecord, { schema_version: 2 }> =>
+        record.schema_version === 2 &&
+        record.payload.kind === "capability",
+    );
+    for (const capability of [
+      ...new Set(demands.map((demand) => demand.capability)),
+    ].sort()) {
+      const records = recordedCapabilities.filter(
+        (record) =>
+          record.payload.kind === "capability" &&
+          record.payload.capability === capability,
+      );
+      if (
+        records.length === 0 &&
+        verificationStageIndex(state) >
+          verificationStageIndex("capabilities")
+      ) {
+        throw new ArkTeamError(
+          "ENVIRONMENT_UNAVAILABLE",
+          `recovery cannot revalidate missing ${capability} capability evidence`,
+        );
+      }
+      let discovered: VerificationCapabilityProbeResult;
+      try {
+        discovered = validateCapabilityProbeResult(
+          await runtime.capability_probe(
+            capability,
+            AbortSignal.timeout(snapshot.timeouts_ms.server_ms),
+          ),
+          runtime.capability_adapters[capability],
+        );
+      } catch (error) {
+        throw new ArkTeamError(
+          "ENVIRONMENT_UNAVAILABLE",
+          `recovery capability probe failed for ${capability}`,
+          { cause: error },
+        );
+      }
+      const effectivelyRequired = demands.some(
+        (demand) =>
+          demand.capability === capability &&
+          demand.lane_required &&
+          demand.capability_required,
+      );
+      if (
+        (effectivelyRequired && !discovered.available) ||
+        records.some(
+          (record) =>
+            record.adapter?.name !== discovered.adapter.name ||
+            record.adapter.version !== discovered.adapter.version ||
+            (record.payload.kind === "capability" &&
+              record.payload.available &&
+              (!discovered.available ||
+                record.payload.version !== discovered.version)),
+        )
+      ) {
+        throw new ArkTeamError(
+          "ENVIRONMENT_UNAVAILABLE",
+          `recovery environment no longer matches ${capability} capability evidence`,
+        );
+      }
+    }
+    if (
+      verificationStageIndex(state) >= verificationStageIndex("ready")
+    ) {
+      const registration = {
+        registration_id: `recovery-${sha256CanonicalJson({
+          run_id: runId,
+          snapshot_id: snapshot.snapshot_id,
+        }).slice(0, 24)}`,
+        framework: "other" as const,
+        allowed_dev_origins: [] as const,
+      };
+      const request = verificationServerStartRequest(snapshot, registration);
+      try {
+        const response = validateReadinessResponse(
+          await runtime.probe_http(
+            deepFreeze(structuredClone(request)),
+            AbortSignal.timeout(snapshot.timeouts_ms.server_ms),
+          ),
+        );
+        if (response.status !== request.readiness.expected_status) {
+          throw new Error(
+            `unexpected recovery readiness status ${response.status}`,
+          );
+        }
+      } catch (error) {
+        throw new ArkTeamError(
+          "ENVIRONMENT_UNAVAILABLE",
+          "registered local verification server is unavailable during recovery",
+          { cause: error },
+        );
+      }
+    }
+    return run;
+  }
+
+  async runBootstrap(
+    runId: string,
+    input: RunVerificationBootstrapInput,
+  ): Promise<VerificationBootstrapResult> {
+    const steps: VerificationBootstrapStep[] = [];
+    const initial = await this.store.getRun(runId);
+    const inputProblem = verificationBootstrapInputProblem(initial, input);
+    if (inputProblem !== null) {
+      return {
+        status: "SPEC_DELTA_REQUIRED",
+        case_id: "BOOTSTRAP-1701",
+        steps,
+        delta: await this.recordSpecDelta(runId, inputProblem),
+      };
+    }
+    try {
+      this.requireLocalRuntime();
+    } catch {
+      return {
+        status: "SPEC_DELTA_REQUIRED",
+        case_id: "BOOTSTRAP-1701",
+        steps,
+        delta: await this.recordSpecDelta(runId, {
+          affected_ids: [
+            "OBJ-1709",
+            "REQ-1719",
+            "AC-1719",
+            "TEST-1719",
+            "IS-1707",
+          ],
+          classification: "environment_mismatch",
+          evidence: [
+            {
+              kind: "runtime",
+              value: "registered local verification runtime is unavailable",
+            },
+          ],
+          impact: "BOOTSTRAP-1701 cannot discover local capabilities",
+          proposed_resolution:
+            "register one exact local verification runtime and start a new snapshot",
+          blocking_stage: "IS-1707",
+        }),
+      };
+    }
+
+    requireAcceptedVerificationTransition(
+      await this.advance(runId, "configured"),
+      "configured",
+    );
+    const snapshotted = await this.configureLocal(runId, {
+      package_fingerprint: input.package_fingerprint,
+    });
+    const snapshot = requireV2Snapshot(snapshotted);
+    const setupRecords = snapshotted.verification_records.filter(
+      (record) =>
+        record.schema_version === 2 &&
+        ["source", "config", "snapshot"].includes(record.payload.kind),
+    );
+    for (const [sequence, name, kind] of [
+      [1, "identity", "source"],
+      [2, "config", "config"],
+      [3, "snapshot", "snapshot"],
+    ] as const) {
+      steps.push({
+        sequence,
+        name,
+        status: "completed",
+        evidence_record_ids: setupRecords
+          .filter((record) => record.payload.kind === kind)
+          .map((record) => record.record_id),
+      });
+    }
+    await this.announceRollout(runId);
+
+    if (snapshot.ui_contract.enabled) {
+      try {
+        await this.store.verifyApprovedBaseline(runId);
+      } catch (error) {
+        if (
+          error instanceof ArkTeamError &&
+          error.code === "BASELINE_NOT_APPROVED"
+        ) {
+          return {
+            status: "SPEC_DELTA_REQUIRED",
+            case_id: "BOOTSTRAP-1701",
+            steps,
+            delta: await this.recordSpecDelta(runId, {
+              affected_ids: [
+                "OBJ-1709",
+                "REQ-1719",
+                "AC-1719",
+                "TEST-1719",
+                "IS-1707",
+              ],
+              classification: "unverifiable",
+              evidence: [
+                {
+                  kind: "baseline",
+                  value: "approved baseline manifest could not be verified",
+                },
+              ],
+              impact:
+                "UI visual comparison cannot start without immutable baseline evidence",
+              proposed_resolution:
+                "supply the approved content-addressed baseline and start a new snapshot",
+              blocking_stage: "IS-1707",
+            }),
+          };
+        }
+        throw error;
+      }
+    }
+
+    requireAcceptedVerificationTransition(
+      await this.advance(runId, "capabilities"),
+      "capabilities",
+    );
+    const readiness = await this.runReadiness(runId, {
+      action_id: bootstrapActionId("readiness", snapshot.case_id),
+      server: input.server,
+    });
+    steps.push({
+      sequence: 4,
+      name: "capabilities",
+      status: "completed",
+      evidence_record_ids: [...readiness.evidence_record_ids],
+    });
+    steps.push({
+      sequence: 5,
+      name: "server",
+      status: "completed",
+      evidence_record_ids: [...readiness.evidence_record_ids],
+    });
+    requireAcceptedVerificationTransition(
+      await this.advance(runId, "ready"),
+      "ready",
+    );
+    requireAcceptedVerificationTransition(
+      await this.advance(runId, "executing"),
+      "executing",
+    );
+
+    const backendEvidence: string[] = [];
+    if (snapshot.backend_contract.enabled) {
+      for (const probe of snapshot.backend_contract.api_probes) {
+        const bodyBase64 =
+          probe.body_digest === "none"
+            ? undefined
+            : input.api_body_base64_by_probe?.[probe.id];
+        if (probe.body_digest !== "none" && bodyBase64 === undefined) {
+          throw new ArkTeamError(
+            "INVALID_RECORD",
+            "prevalidated API request body disappeared",
+          );
+        }
+        const result = await this.runApiProbe(runId, {
+          action_id: bootstrapActionId("api", probe.id),
+          probe_id: probe.id,
+          ...(probe.body_digest === "none"
+            ? {}
+            : { body_base64: bodyBase64! }),
+        });
+        backendEvidence.push(...result.evidence_record_ids);
+      }
+    }
+    steps.push({
+      sequence: 6,
+      name: "backend",
+      status: snapshot.backend_contract.enabled
+        ? "completed"
+        : "not_applicable",
+      evidence_record_ids: backendEvidence,
+    });
+
+    const browserSucceeded = new Map<string, boolean>();
+    const deterministicEvidence: string[] = [];
+    if (snapshot.ui_contract.enabled) {
+      for (const browserCase of snapshot.ui_contract.browser_cases) {
+        const result = await this.runBrowserCase(runId, {
+          action_id: bootstrapActionId("browser", browserCase.id),
+          case_id: browserCase.id,
+        });
+        browserSucceeded.set(browserCase.id, result.ok);
+        deterministicEvidence.push(...result.evidence_record_ids);
+      }
+    }
+    steps.push({
+      sequence: 7,
+      name: "deterministic_ui",
+      status: snapshot.ui_contract.enabled
+        ? "completed"
+        : "not_applicable",
+      evidence_record_ids: deterministicEvidence,
+    });
+    requireAcceptedVerificationTransition(
+      await this.advance(runId, "collecting"),
+      "collecting",
+    );
+
+    const visualEvidence: string[] = [];
+    if (snapshot.ui_contract.enabled) {
+      for (const browserCase of snapshot.ui_contract.browser_cases) {
+        if (!browserSucceeded.get(browserCase.id)) {
+          continue;
+        }
+        const screenshots = await this.runScreenshots(runId, {
+          action_id: bootstrapActionId("screenshot", browserCase.id),
+          case_id: browserCase.id,
+        });
+        visualEvidence.push(...screenshots.evidence_record_ids);
+        if (!screenshots.ok) {
+          continue;
+        }
+        const checklist =
+          input.semantic_checklist_by_case?.[browserCase.id];
+        if (checklist === undefined) {
+          throw new ArkTeamError(
+            "INVALID_RECORD",
+            "prevalidated semantic checklist disappeared",
+          );
+        }
+        const semantic = await this.runSemanticReview(runId, {
+          action_id: bootstrapActionId(
+            "semantic-review",
+            browserCase.id,
+          ),
+          case_id: browserCase.id,
+          screenshot_paths: screenshots.value.images.map((image) =>
+            path.join(snapshot.artifact_root, image.artifact.relative_path),
+          ),
+          checklist,
+        });
+        visualEvidence.push(...semantic.evidence_record_ids);
+        const baselines =
+          input.baseline_png_bytes_by_case?.[browserCase.id];
+        if (baselines === undefined) {
+          throw new ArkTeamError(
+            "INVALID_RECORD",
+            "prevalidated baseline bytes disappeared",
+          );
+        }
+        const comparison = await this.runComparison(runId, {
+          action_id: bootstrapActionId("comparison", browserCase.id),
+          case_id: browserCase.id,
+          actuals: screenshots.value.images.map((image) => ({
+            evidence: image.evidence,
+            png_bytes: image.png_bytes,
+          })),
+          baseline_png_bytes: baselines,
+          semantic_review_outcome: semantic.ok
+            ? semantic.value.outcome
+            : null,
+        });
+        visualEvidence.push(...comparison.evidence_record_ids);
+      }
+    }
+    steps.push({
+      sequence: 8,
+      name: "visual",
+      status: snapshot.ui_contract.enabled
+        ? "completed"
+        : "not_applicable",
+      evidence_record_ids: visualEvidence,
+    });
+
+    const agenticEvidence: string[] = [];
+    if (snapshot.ui_contract.enabled) {
+      for (const task of snapshot.ui_contract.agentic_tasks) {
+        const recheckCase = snapshot.ui_contract.browser_cases.find(
+          (browserCase) =>
+            browserCase.path === task.start_path &&
+            canonicalJson(browserCase.assertions) ===
+              canonicalJson(task.success_criteria),
+        );
+        const result =
+          recheckCase !== undefined &&
+          browserSucceeded.get(recheckCase.id)
+            ? await this.runAgenticBrowser(runId, {
+                action_id: bootstrapActionId("agentic", task.id),
+                task_id: task.id,
+              })
+            : await this.runAction(runId, {
+                action_id: bootstrapActionId("agentic", task.id),
+                kind: "agentic_browser",
+                lane: "ui",
+                check_id: task.id,
+                input: {
+                  task_id: task.id,
+                  deterministic_recheck_available: false,
+                },
+                adapter: async () => ({
+                  ok: false,
+                  code: "BROWSER_CONTRACT_MISMATCH",
+                  message:
+                    "agentic exploration skipped because deterministic UI evidence did not pass",
+                }),
+              });
+        agenticEvidence.push(...result.evidence_record_ids);
+      }
+    }
+    steps.push({
+      sequence: 9,
+      name: "agentic_ui",
+      status:
+        snapshot.ui_contract.enabled &&
+        snapshot.ui_contract.agentic_tasks.length > 0
+          ? "completed"
+          : "not_applicable",
+      evidence_record_ids: agenticEvidence,
+    });
+
+    requireAcceptedVerificationTransition(
+      await this.advance(runId, "deciding"),
+      "deciding",
+    );
+    const beforeDecision = await this.store.getRun(runId);
+    const terminal = await this.finalize(
+      runId,
+      deriveBootstrapLaneDecisions(beforeDecision),
+    );
+    if (terminal.verification_state?.terminal_outcome === null) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "BOOTSTRAP-1701 did not produce one terminal outcome",
+      );
+    }
+    const laneSummaries = terminal.verification_records.filter(
+      (record) =>
+        record.schema_version === 2 &&
+        record.payload.kind === "lane_summary",
+    );
+    steps.push({
+      sequence: 10,
+      name: "lane_summaries",
+      status: "completed",
+      evidence_record_ids: laneSummaries.map((record) => record.record_id),
+    });
+    const reports = terminal.verification_records.filter(
+      (record) =>
+        record.schema_version === 2 && record.payload.kind === "report",
+    );
+    steps.push({
+      sequence: 11,
+      name: "terminal_handoff",
+      status: "completed",
+      evidence_record_ids: reports.map((record) => record.record_id),
+    });
+    let handoff = terminal;
+    if (terminal.verification_state?.terminal_outcome === "passed") {
+      const pending = await this.advance(runId, "pm_review_pending");
+      if (!pending.accepted) {
+        return {
+          status: "SPEC_DELTA_REQUIRED",
+          case_id: "BOOTSTRAP-1701",
+          steps,
+          delta: await this.recordSpecDelta(runId, {
+            affected_ids: [
+              "OBJ-1709",
+              "REQ-1720",
+              "AC-1720",
+              "TEST-1720",
+              "IS-1707",
+            ],
+            classification: "contradiction",
+            evidence: [
+              {
+                kind: "pm_gate",
+                value: "passed report lacks complete PM handoff evidence",
+              },
+            ],
+            impact: "original PM review cannot start",
+            proposed_resolution:
+              "repair the missing deterministic handoff evidence and start a new snapshot",
+            blocking_stage: "IS-1707",
+          }),
+        };
+      }
+      handoff = pending.run;
+    }
+    return {
+      status: "completed",
+      case_id: "BOOTSTRAP-1701",
+      steps,
+      run: handoff,
+    };
+  }
+
+  async beginOriginalPmReview(runId: string): Promise<RunRecord> {
+    const current = await this.store.assertCurrentVerification(
+      runId,
+      this.#authority,
+    );
+    if (
+      current.verification_state?.current_state !== "pm_review_pending" ||
+      current.verification_state.terminal_outcome !== "passed"
+    ) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "original PM review requires one complete passed verification handoff",
+      );
+    }
+    const reviewed = await this.advance(runId, "original_pm_review");
+    if (!reviewed.accepted) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "complete verification handoff could not enter original PM review",
+      );
+    }
+    return reviewed.run;
+  }
+
   async runReadiness(
     runId: string,
     input: RunVerificationReadinessInput,
@@ -583,6 +1258,48 @@ export class VerificationCoordinator {
           VerificationCapability,
           VerificationCapabilityProbeResult
         >();
+        const submitCapability = async (
+          demand: (typeof demands)[number],
+          capability: VerificationCapabilityProbeResult,
+          phase: "discovery" | "readiness",
+        ): Promise<void> => {
+          const payload = {
+            kind: "capability" as const,
+            capability: demand.capability,
+            available: capability.available,
+            version: capability.version,
+            diagnostic: capability.diagnostic,
+          };
+          await context.submit({
+            schema_version: 2,
+            contract_id: "verification_contract_v2",
+            record_id: `capability-${sha256CanonicalJson({
+              action_id: parsedInput.action_id,
+              attempt: attemptNumber,
+              phase,
+              lane: demand.lane,
+              capability: demand.capability,
+            }).slice(0, 24)}`,
+            record_type: "capability",
+            run_id: snapshot.run_id,
+            case_id: snapshot.case_id,
+            check_id: null,
+            snapshot_id: snapshot.snapshot_id,
+            lane: demand.lane,
+            stage: "capabilities",
+            timestamp_utc: new Date().toISOString(),
+            source_fingerprint: snapshot.source_fingerprint,
+            package_fingerprint: snapshot.package.package_fingerprint,
+            lane_required: demand.lane_required,
+            check_required: demand.capability_required,
+            previous_record_sha256: "0".repeat(64),
+            payload_sha256: sha256CanonicalJson(payload),
+            payload,
+            adapter: capability.adapter,
+            model: null,
+            artifact_references: [],
+          });
+        };
         for (const capability of [
           ...new Set(demands.map((demand) => demand.capability)),
         ].sort()) {
@@ -608,6 +1325,17 @@ export class VerificationCoordinator {
               adapter: registeredAdapter,
             });
           }
+        }
+
+        for (const demand of demands) {
+          const capability = capabilities.get(demand.capability);
+          if (capability === undefined) {
+            throw new ArkTeamError(
+              "INVALID_RECORD",
+              `capability probe omitted ${demand.capability}`,
+            );
+          }
+          await submitCapability(demand, capability, "discovery");
         }
 
         const server = capabilities.get("server");
@@ -655,6 +1383,14 @@ export class VerificationCoordinator {
             });
           }
         }
+        const settledServer = capabilities.get("server");
+        if (settledServer !== undefined) {
+          for (const demand of demands.filter(
+            (candidate) => candidate.capability === "server",
+          )) {
+            await submitCapability(demand, settledServer, "readiness");
+          }
+        }
 
         const unavailable: VerificationReadinessValue["unavailable"] = [];
         for (const demand of demands) {
@@ -676,41 +1412,6 @@ export class VerificationCoordinator {
               outcome,
             });
           }
-          const payload = {
-            kind: "capability" as const,
-            capability: demand.capability,
-            available: capability.available,
-            version: capability.version,
-            diagnostic: capability.diagnostic,
-          };
-          await context.submit({
-            schema_version: 2,
-            contract_id: "verification_contract_v2",
-            record_id: `capability-${sha256CanonicalJson({
-              action_id: parsedInput.action_id,
-              attempt: attemptNumber,
-              lane: demand.lane,
-              capability: demand.capability,
-            }).slice(0, 24)}`,
-            record_type: "capability",
-            run_id: snapshot.run_id,
-            case_id: snapshot.case_id,
-            check_id: null,
-            snapshot_id: snapshot.snapshot_id,
-            lane: demand.lane,
-            stage: "capabilities",
-            timestamp_utc: new Date().toISOString(),
-            source_fingerprint: snapshot.source_fingerprint,
-            package_fingerprint: snapshot.package.package_fingerprint,
-            lane_required: demand.lane_required,
-            check_required: demand.capability_required,
-            previous_record_sha256: "0".repeat(64),
-            payload_sha256: sha256CanonicalJson(payload),
-            payload,
-            adapter: capability.adapter,
-            model: null,
-            artifact_references: [],
-          });
         }
         if (unavailable.length > 0 && attemptNumber < 2) {
           const serverUnavailable = unavailable.some(
@@ -2358,6 +3059,356 @@ export class VerificationCoordinator {
   }
 }
 
+export class VerificationBootstrapPmGate {
+  constructor(
+    private readonly coordinator: VerificationCoordinator,
+    private readonly inputResolver: (
+      runId: string,
+    ) => Promise<RunVerificationBootstrapInput>,
+  ) {}
+
+  async prepareOriginalPmReview(runId: string): Promise<RunRecord> {
+    const current = await this.coordinator.getCurrentRun(runId);
+    if (
+      current.verification_state?.current_state === "original_pm_review" &&
+      current.verification_state.terminal_outcome === "passed"
+    ) {
+      return current;
+    }
+    if (
+      current.verification_state?.terminal_outcome !== null &&
+      (current.verification_state?.current_state !== "pm_review_pending" ||
+        current.verification_state.terminal_outcome !== "passed")
+    ) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "terminal local verification non-pass cannot be retried by the PM gate",
+      );
+    }
+    if (current.verification_state?.current_state !== "pm_review_pending") {
+      const result = await this.coordinator.runBootstrap(
+        runId,
+        await this.inputResolver(runId),
+      );
+      if (
+        result.status !== "completed" ||
+        result.run.verification_state?.current_state !== "pm_review_pending"
+      ) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "local verification did not produce a passed PM handoff",
+        );
+      }
+    }
+    return this.coordinator.beginOriginalPmReview(runId);
+  }
+}
+
+function verificationBootstrapInputProblem(
+  run: RunRecord,
+  input: RunVerificationBootstrapInput,
+): RecordVerificationSpecDeltaInput | null {
+  const affectedIds = [
+    "OBJ-1709",
+    "REQ-1719",
+    "AC-1719",
+    "TEST-1719",
+    "IS-1707",
+  ];
+  const problem = (
+    classification: RecordVerificationSpecDeltaInput["classification"],
+    value: string,
+    impact: string,
+    resolution: string,
+  ): RecordVerificationSpecDeltaInput => ({
+    affected_ids: affectedIds,
+    classification,
+    evidence: [{ kind: "bootstrap_input", value }],
+    impact,
+    proposed_resolution: resolution,
+    blocking_stage: "IS-1707",
+  });
+  if (
+    run.verification_snapshot !== null ||
+    run.verification_state?.current_state !== "integrated"
+  ) {
+    return problem(
+      "contradiction",
+      "BOOTSTRAP-1701 was requested for an already-started verification run",
+      "a second bootstrap could reinterpret or repeat immutable work",
+      "use exact recovery for a nonterminal snapshot or create a new run",
+    );
+  }
+  const config = run.project_config.verification.coordinator;
+  if (
+    config === null ||
+    config.schema_version !== 2 ||
+    !config.enabled
+  ) {
+    return problem(
+      "omission",
+      "enabled verification_contract_v2 configuration is missing",
+      "the bootstrap snapshot cannot resolve its QA lanes",
+      "supply one approved enabled contract-v2 project configuration",
+    );
+  }
+  try {
+    parseReadinessInput({
+      action_id: "bootstrap-readiness-input",
+      server: input.server,
+    });
+  } catch {
+    return problem(
+      "unsafe_input",
+      "registered local server declaration is invalid",
+      "the local server cannot start within the approved host boundary",
+      "supply one registered server declaration that satisfies the local contract",
+    );
+  }
+  if (config.backend.enabled) {
+    const bodyProbeIds = config.backend.api_probes
+      .filter((probe) => probe.body_digest !== "none")
+      .map((probe) => probe.id)
+      .sort();
+    const suppliedBodyIds = Object.keys(
+      input.api_body_base64_by_probe ?? {},
+    ).sort();
+    if (
+      bodyProbeIds.length !== suppliedBodyIds.length ||
+      bodyProbeIds.some(
+        (probeId, index) => probeId !== suppliedBodyIds[index],
+      )
+    ) {
+      return problem(
+        "omission",
+        "API request bodies do not match the exact snapshotted probes",
+        "declared Backend probes cannot reproduce their request bytes",
+        "supply base64 bytes for exactly the probes with a non-empty body digest",
+      );
+    }
+  } else if (
+    Object.keys(input.api_body_base64_by_probe ?? {}).length !== 0
+  ) {
+    return problem(
+      "contradiction",
+      "Backend request bodies were supplied for a disabled lane",
+      "disabled-lane work would be synthesized",
+      "remove all Backend inputs for the disabled lane",
+    );
+  }
+  if (config.ui.enabled) {
+    const caseIds = config.ui.browser_cases.map((browserCase) =>
+      browserCase.id,
+    ).sort();
+    const checklistIds = Object.keys(
+      input.semantic_checklist_by_case ?? {},
+    ).sort();
+    const baselineIds = Object.keys(
+      input.baseline_png_bytes_by_case ?? {},
+    ).sort();
+    if (
+      caseIds.length !== checklistIds.length ||
+      caseIds.some((caseId, index) => caseId !== checklistIds[index]) ||
+      caseIds.length !== baselineIds.length ||
+      caseIds.some((caseId, index) => caseId !== baselineIds[index])
+    ) {
+      return problem(
+        "omission",
+        "UI checklist or baseline bytes do not cover the exact browser cases",
+        "semantic and deterministic visual verification cannot reproduce every enabled case",
+        "supply one checklist and the approved three baseline PNGs for each UI case",
+      );
+    }
+    for (const caseId of caseIds) {
+      const baselines = input.baseline_png_bytes_by_case?.[caseId];
+      if (
+        baselines === undefined ||
+        !["375x812", "768x1024", "1440x900"].every(
+          (viewport) =>
+            baselines[viewport as VerificationBootstrapViewport] instanceof
+              Uint8Array &&
+            baselines[viewport as VerificationBootstrapViewport].byteLength >
+              0,
+        )
+      ) {
+        return problem(
+          "omission",
+          "UI baseline bytes omit an exact required viewport",
+          "the three-viewport comparison matrix is incomplete",
+          "supply non-empty approved PNG bytes for all three fixed viewports",
+        );
+      }
+    }
+  } else if (
+    Object.keys(input.semantic_checklist_by_case ?? {}).length !== 0 ||
+    Object.keys(input.baseline_png_bytes_by_case ?? {}).length !== 0
+  ) {
+    return problem(
+      "contradiction",
+      "UI evidence inputs were supplied for a disabled lane",
+      "disabled-lane work would be synthesized",
+      "remove all UI inputs for the disabled lane",
+    );
+  }
+  return null;
+}
+
+function bootstrapActionId(kind: string, identifier: string): string {
+  return `bootstrap-${kind}-${sha256CanonicalJson({
+    kind,
+    identifier,
+  }).slice(0, 24)}`;
+}
+
+function requireAcceptedVerificationTransition(
+  transition: VerificationStateTransitionResult,
+  expectedStage: VerificationStage,
+): void {
+  if (
+    !transition.accepted ||
+    transition.run.verification_state?.current_state !== expectedStage
+  ) {
+    throw new ArkTeamError(
+      "INVALID_TRANSITION",
+      `BOOTSTRAP-1701 could not enter ${expectedStage}`,
+    );
+  }
+}
+
+function deriveBootstrapLaneDecisions(
+  run: RunRecord,
+): VerificationLaneDecisionInput[] {
+  const snapshot = requireV2Snapshot(run);
+  const attempts = run.verification_state?.attempts ?? [];
+  const superseded = new Set(
+    attempts.flatMap((attempt) =>
+      attempt.evidence_record_ids.filter(
+        (recordId) =>
+          !attempt.decisive_evidence_record_ids.includes(recordId),
+      ),
+    ),
+  );
+  const lanes: Array<{
+    lane: "backend" | "ui";
+    checks: Array<{ id: string; required: boolean }>;
+  }> = [
+    ...(snapshot.backend_contract.enabled
+      ? [
+          {
+            lane: "backend" as const,
+            checks: snapshot.backend_contract.api_probes.map((probe) => ({
+              id: probe.id,
+              required: probe.required,
+            })),
+          },
+        ]
+      : []),
+    ...(snapshot.ui_contract.enabled
+      ? [
+          {
+            lane: "ui" as const,
+            checks: [
+              ...snapshot.ui_contract.browser_cases.map((browserCase) => ({
+                id: browserCase.id,
+                required: browserCase.required,
+              })),
+              ...snapshot.ui_contract.agentic_tasks.map((task) => ({
+                id: task.id,
+                required: task.required,
+              })),
+            ],
+          },
+        ]
+      : []),
+  ];
+  return lanes.map((lane) => ({
+    lane: lane.lane,
+    checks: lane.checks.map((check) => {
+      const matching = run.verification_records.filter(
+        (
+          record,
+        ): record is Extract<
+          VerificationLinkedRecord,
+          { schema_version: 2 }
+        > =>
+          record.schema_version === 2 &&
+          record.lane === lane.lane &&
+          record.check_id === check.id &&
+          !superseded.has(record.record_id) &&
+          verificationEvidenceDisposition(record) !== null,
+      );
+      if (matching.length === 0) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          `BOOTSTRAP-1701 has no evidence for ${lane.lane}/${check.id}`,
+        );
+      }
+      const dispositions = matching.flatMap((record) => {
+        const disposition = verificationEvidenceDisposition(record);
+        if (disposition === null) {
+          return [];
+        }
+        const semanticActionId =
+          record.payload.kind === "error"
+            ? record.payload.action_id
+            : undefined;
+        const optionalSemantic =
+          lane.lane === "ui" &&
+          snapshot.ui_contract.enabled &&
+          !snapshot.ui_contract.semantic_review_required &&
+          (record.payload.kind === "review" ||
+            (semanticActionId !== undefined &&
+              attempts.some(
+                (attempt) =>
+                  attempt.action_id === semanticActionId &&
+                  attempt.kind === "semantic_review",
+              )));
+        return optionalSemantic && !disposition.integrity_failure
+          ? []
+          : [disposition];
+      });
+      if (dispositions.length === 0) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          `BOOTSTRAP-1701 has no authoritative evidence for ${lane.lane}/${check.id}`,
+        );
+      }
+      const integrityFailure = dispositions.some(
+        (disposition) => disposition.integrity_failure,
+      );
+      return {
+        check_id: check.id,
+        required: check.required,
+        outcome: integrityFailure
+          ? ("error" as const)
+          : aggregateBootstrapOutcomes(
+              dispositions.map((disposition) => disposition.outcome),
+            ),
+        evidence_record_ids: matching
+          .map((record) => record.record_id)
+          .sort(),
+        integrity_failure: integrityFailure,
+      };
+    }),
+  }));
+}
+
+function aggregateBootstrapOutcomes(
+  outcomes: readonly VerificationOutcome[],
+): VerificationOutcome {
+  for (const outcome of [
+    "error",
+    "unavailable",
+    "failed",
+    "skipped",
+  ] as const) {
+    if (outcomes.includes(outcome)) {
+      return outcome;
+    }
+  }
+  return "passed";
+}
+
 export async function selectVerificationServerPort(
   isAvailable: VerificationPortAvailabilityProbe,
   floor = 10_001,
@@ -3224,7 +4275,7 @@ function localEffectDenial(
       target.origin !== snapshot.server.api_origin ||
       target.username !== "" ||
       target.password !== "" ||
-      SECRET_DIAGNOSTIC_PATTERN.test(
+      VERIFICATION_SECRET_TEXT_PATTERN.test(
         `${target.search}${target.hash}`,
       )
     ) {
@@ -3273,7 +4324,7 @@ function localEffectDenial(
   if (
     request.argv.some(
       (argument) =>
-        SECRET_DIAGNOSTIC_PATTERN.test(argument) ||
+        VERIFICATION_SECRET_TEXT_PATTERN.test(argument) ||
         /^(?:https?|wss?):\/\//i.test(argument) ||
         argument === "3000" ||
         /^--?port(?:=|:)3000$/i.test(argument),
@@ -3392,15 +4443,16 @@ function unavailableCapabilitiesForAction(
     if (dynamicallyUnavailable.has(capability)) {
       return true;
     }
-    const record = readiness.decisive_evidence_record_ids
+    const matchingRecords = readiness.decisive_evidence_record_ids
       .map((recordId) => records.get(recordId))
-      .find(
+      .filter(
         (candidate) =>
           candidate?.schema_version === 2 &&
           candidate.lane === lane &&
           candidate.payload.kind === "capability" &&
           candidate.payload.capability === capability,
       );
+    const record = matchingRecords.at(-1);
     return (
       record === undefined ||
       record.payload.kind !== "capability" ||
@@ -3861,11 +4913,34 @@ function isVerificationErrorCode(
   ]).has(code as VerificationActionErrorCode);
 }
 
+function verificationStageIndex(stage: string): number {
+  const orderedStages: readonly VerificationStage[] = [
+    "integrated",
+    "configured",
+    "snapshotted",
+    "capabilities",
+    "ready",
+    "executing",
+    "collecting",
+    "deciding",
+    "pm_review_pending",
+    "original_pm_review",
+  ];
+  const index = orderedStages.indexOf(stage as VerificationStage);
+  if (index === -1) {
+    throw new ArkTeamError(
+      "CORRUPT_STATE",
+      `unknown nonterminal verification stage: ${stage}`,
+    );
+  }
+  return index;
+}
+
 function sanitizeDiagnostic(message: string): string {
   const normalized = message.trim() || "verification action failed";
   if (
     normalized.length > MAX_DIAGNOSTIC_CHARACTERS ||
-    SECRET_DIAGNOSTIC_PATTERN.test(normalized)
+    VERIFICATION_SECRET_TEXT_PATTERN.test(normalized)
   ) {
     return REDACTED_DIAGNOSTIC;
   }

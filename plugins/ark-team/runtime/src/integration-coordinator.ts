@@ -31,6 +31,10 @@ export interface PmReviewLauncher {
   run(request: ManagedSessionRequest): Promise<ManagedSessionResult>;
 }
 
+export interface VerificationPmGate {
+  prepareOriginalPmReview(runId: string): Promise<RunRecord>;
+}
+
 export interface IntegrationCoordinatorOptions {
   materializer?: IntegrationMaterializer;
   pm_launcher?: PmReviewLauncher;
@@ -40,6 +44,7 @@ export interface IntegrationCoordinatorOptions {
   worktree_root?: string;
   remote_actions?: RemoteActionCoordinator;
   cleanup?: WorktreeCleanupCoordinator;
+  verification_gate?: VerificationPmGate;
 }
 
 export interface RunCoordinatorResult extends TeamCoordinatorResult {
@@ -55,6 +60,7 @@ export class IntegrationCoordinator {
   private readonly correctionRounds: number | null;
   private readonly remoteActions: RemoteActionCoordinator;
   private readonly cleanup: WorktreeCleanupCoordinator;
+  private readonly verificationGate: VerificationPmGate | null;
   private operationQueue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -102,6 +108,7 @@ export class IntegrationCoordinator {
           ? {}
           : { worktree_root: options.worktree_root }),
       });
+    this.verificationGate = options.verification_gate ?? null;
   }
 
   async advance(runId: string): Promise<RunCoordinatorResult> {
@@ -278,12 +285,14 @@ export class IntegrationCoordinator {
           refreshed.integration?.state === "local_merged" ||
           refreshed.integration?.state === "remote_completed"
         ) {
+          await this.prepareVerificationPmReview(refreshed.run);
+          const gated = await this.store.getRunContext(runId);
           await this.completePmReview(
-            refreshed.run,
-            refreshed.integration,
+            gated.run,
+            gated.integration ?? refreshed.integration,
             (await this.store.listTeams(runId)).teams,
             assignments,
-            refreshed.pm_session?.session_id ?? null,
+            gated.pm_session?.session_id ?? null,
           );
           progressed = true;
           continue;
@@ -303,6 +312,37 @@ export class IntegrationCoordinator {
     return decision === "approve_once"
       ? this.advance(runId)
       : this.snapshot(runId, true);
+  }
+
+  private async prepareVerificationPmReview(run: RunRecord): Promise<void> {
+    const config = run.project_config.verification.coordinator;
+    if (
+      config === null ||
+      config.schema_version !== 2 ||
+      !config.enabled ||
+      (run.verification_state?.current_state === "original_pm_review" &&
+        run.verification_state.terminal_outcome === "passed")
+    ) {
+      return;
+    }
+    if (this.verificationGate === null) {
+      throw new ArkTeamError(
+        "ENVIRONMENT_UNAVAILABLE",
+        "enabled local verification requires a registered PM gate",
+      );
+    }
+    const gated = await this.verificationGate.prepareOriginalPmReview(
+      run.run_id,
+    );
+    if (
+      gated.verification_state?.current_state !== "original_pm_review" ||
+      gated.verification_state.terminal_outcome !== "passed"
+    ) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "original PM review is blocked by local verification",
+      );
+    }
   }
 
   private async correctOrWait(
@@ -372,6 +412,8 @@ export class IntegrationCoordinator {
       await this.store.providerSensitiveEnvironmentNames(
         run.model_bindings.worker,
       );
+    const verificationHandoff =
+      serializeVerificationPmHandoff(run);
     const result = await this.pmLauncher.run({
       role: "pm",
       assignment: [
@@ -381,8 +423,11 @@ export class IntegrationCoordinator {
         `Team reports: ${JSON.stringify(teamReports)}`,
         `Integration record: ${JSON.stringify(integration)}`,
         `Integration report: ${JSON.stringify(integrationAssignment?.structured_report)}`,
+        ...(verificationHandoff === null
+          ? []
+          : [`Local verification handoff: ${verificationHandoff}`]),
         "Review the observable evidence read-only and return one strict pm_report.",
-        "Return completed only when every team and integration verification passed. Do not edit, merge, push, or create a PR.",
+        "Return completed only when every team, integration, and enabled local verification passed. Do not edit, merge, push, or create a PR.",
       ].join("\n"),
       working_directory: run.project_path,
       resume_session_id: pmSessionId,
@@ -458,6 +503,169 @@ export class IntegrationCoordinator {
       release();
     }
   }
+}
+
+function serializeVerificationPmHandoff(run: RunRecord): string | null {
+  const config = run.project_config.verification.coordinator;
+  if (
+    config === null ||
+    config.schema_version !== 2 ||
+    !config.enabled
+  ) {
+    return null;
+  }
+  const snapshot = run.verification_snapshot;
+  const state = run.verification_state;
+  if (
+    snapshot === null ||
+    snapshot.schema_version !== 2 ||
+    state?.current_state !== "original_pm_review" ||
+    state.terminal_outcome !== "passed" ||
+    run.verification_snapshot_sha256 === null
+  ) {
+    throw new ArkTeamError(
+      "INVALID_TRANSITION",
+      "local verification handoff is not ready for original PM review",
+    );
+  }
+  const reportRecords = run.verification_records.filter(
+    (record) =>
+      record.schema_version === 2 &&
+      record.payload.kind === "report" &&
+      record.payload.outcome === "passed",
+  );
+  const report = reportRecords[0];
+  if (
+    reportRecords.length !== 1 ||
+    report?.schema_version !== 2 ||
+    report.payload.kind !== "report"
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "local verification handoff requires one passed terminal report",
+    );
+  }
+  const summaryIds = new Set(report.payload.evidence_record_ids);
+  const summaries = run.verification_records.filter(
+    (record) =>
+      record.schema_version === 2 &&
+      record.payload.kind === "lane_summary" &&
+      summaryIds.has(record.record_id),
+  );
+  const evidenceIds = new Set(
+    summaries.flatMap((summary) =>
+      summary.schema_version === 2 &&
+      summary.payload.kind === "lane_summary"
+        ? (summary.payload.checks ?? []).flatMap(
+            (check) => check.evidence_record_ids,
+          )
+        : [],
+    ),
+  );
+  const evidence = run.verification_records.flatMap((record) =>
+    record.schema_version === 2 && evidenceIds.has(record.record_id)
+      ? [record]
+      : [],
+  );
+  const referencedArtifacts = new Set(
+    evidence.flatMap((record) =>
+      record.schema_version === 2
+        ? record.artifact_references.map(
+            (reference) =>
+              `${reference.artifact_id}\0${reference.relative_path}\0${reference.sha256}`,
+          )
+        : [],
+    ),
+  );
+  const artifacts = run.verification_records.filter(
+    (record) =>
+      record.schema_version === 2 &&
+      record.payload.kind === "artifact" &&
+      referencedArtifacts.has(
+        `${record.payload.artifact_id}\0${record.payload.relative_path}\0${record.payload.sha256}`,
+      ),
+  );
+  const errors = run.verification_records.filter(
+    (record) =>
+      record.schema_version === 2 && record.payload.kind === "error",
+  );
+  const handoff = {
+    contract_id: "verification_contract_v2" as const,
+    source: {
+      fingerprint: snapshot.source_fingerprint,
+      commit: snapshot.source.source_commit,
+      tree: snapshot.source.source_tree,
+    },
+    package: snapshot.package,
+    snapshot: {
+      id: snapshot.snapshot_id,
+      sha256: run.verification_snapshot_sha256,
+      resolved_config_sha256: snapshot.resolved_config_sha256,
+    },
+    lane_matrix: {
+      backend: {
+        enabled: snapshot.backend_contract.enabled,
+        required: snapshot.backend_contract.enabled
+          ? snapshot.backend_contract.required
+          : false,
+      },
+      ui: {
+        enabled: snapshot.ui_contract.enabled,
+        required: snapshot.ui_contract.enabled
+          ? snapshot.ui_contract.required
+          : false,
+      },
+    },
+    baseline_identity: snapshot.ui_contract.enabled
+      ? snapshot.ui_contract.baseline_identity
+      : null,
+    report: {
+      record_id: report.record_id,
+      payload: report.payload,
+    },
+    lane_summaries: summaries.map((summary) => ({
+      record_id: summary.record_id,
+      payload: summary.payload,
+    })),
+    attempts: state.attempts.map((attempt) => ({
+      action_id: attempt.action_id,
+      kind: attempt.kind,
+      lane: attempt.lane,
+      check_id: attempt.check_id,
+      attempt_count: attempt.attempt_count,
+      max_attempts: attempt.max_attempts,
+      status: attempt.status,
+      last_error_code: attempt.last_error_code,
+      decisive_evidence_record_ids:
+        attempt.decisive_evidence_record_ids,
+    })),
+    evidence: evidence.map((record) => ({
+      record_id: record.record_id,
+      record_type: record.record_type,
+      lane: record.lane,
+      check_id: record.check_id,
+      payload: record.payload,
+      adapter: record.adapter,
+      model: record.model,
+      artifact_references: record.artifact_references,
+    })),
+    artifacts: artifacts.map((record) => ({
+      record_id: record.record_id,
+      payload: record.payload,
+    })),
+    redacted_errors: errors.map((record) => ({
+      record_id: record.record_id,
+      payload: record.payload,
+    })),
+  };
+  const serialized = JSON.stringify(handoff);
+  if (Buffer.byteLength(serialized, "utf8") > 100_000) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "local verification PM handoff exceeds its bounded size",
+    );
+  }
+  return serialized;
 }
 
 export class ArkTeamRunCoordinator {

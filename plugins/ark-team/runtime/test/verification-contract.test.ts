@@ -329,7 +329,13 @@ test("TEST-1704 validates schema-2 records, legacy readability, and chain isolat
       kind: "spec_delta",
       status: "SPEC_DELTA_REQUIRED",
       runtime_status: "not_started",
-      affected_ids: ["REQ-1704"],
+      affected_ids: [
+        "OBJ-1702",
+        "REQ-1704",
+        "AC-1704",
+        "TEST-1704",
+        "IS-1701",
+      ],
       classification: "omission",
       source_snapshot: {
         worktree_root: "/tmp/project",

@@ -70,11 +70,13 @@ import {
 import { assertRunId, createRunId } from "./run-id.js";
 import {
   APPROVED_VERIFICATION_PACKAGE,
+  VERIFICATION_PM_HANDOFF_TRACEABILITY,
   appendVerificationLinkedRecord,
   assertVerificationPackageBytes,
   assertVerificationPackageFingerprint,
   assertVerificationSourceIdentity,
   buildVerificationRunSnapshot,
+  canonicalJson,
   captureVerificationSource,
   sha256CanonicalJson,
   type VerificationApprovedBaselineManifest,
@@ -88,6 +90,7 @@ import {
   type VerificationRollbackRecord,
   type VerificationRunSnapshot,
   type VerificationSourceIdentity,
+  type VerificationSpecDeltaRecord,
   type VerificationStage,
   verificationLaneDecisionInputSchema,
   verificationEvidenceDisposition,
@@ -96,6 +99,7 @@ import {
   verificationRecordMatchesSnapshot,
   verificationRollbackRecordSchema,
   verificationRunSnapshotSha256,
+  verificationSpecDeltaRecordSchema,
 } from "./verification-contract.js";
 import { VerificationArtifactStore } from "./verification-artifact-store.js";
 import type { PreparedTeamWorkspace } from "./worktree-manager.js";
@@ -129,6 +133,23 @@ export interface RecordVerificationSnapshotInput {
 
 export interface RecordVerificationRollbackInput {
   reason: string;
+}
+
+export interface RecordVerificationSpecDeltaInput {
+  affected_ids: string[];
+  classification:
+    | "omission"
+    | "contradiction"
+    | "unsafe_input"
+    | "environment_mismatch"
+    | "unverifiable";
+  evidence: Array<{
+    kind: string;
+    value: string;
+  }>;
+  impact: string;
+  proposed_resolution: string;
+  blocking_stage: string;
 }
 
 export interface WriteVerificationArtifactInput {
@@ -581,6 +602,12 @@ export class RunStore {
     return this.withMutation(async () => {
       this.assertVerificationCoordinatorAuthority(authority);
       const persisted = await this.readPersistedRun(runId);
+      if ((await this.readVerificationSpecDelta(runId)) !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "SPEC_DELTA_REQUIRED blocks dependent verification execution",
+        );
+      }
       await this.assertApprovedVerificationPackage(
         persisted.run.project_path,
       );
@@ -776,6 +803,12 @@ export class RunStore {
     return this.withMutation(async () => {
       this.assertVerificationCoordinatorAuthority(authority);
       const persisted = await this.readPersistedRun(runId);
+      if ((await this.readVerificationSpecDelta(runId)) !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "SPEC_DELTA_REQUIRED blocks dependent verification execution",
+        );
+      }
       const snapshot = persisted.run.verification_snapshot;
       if (snapshot === null) {
         throw new ArkTeamError(
@@ -881,6 +914,12 @@ export class RunStore {
     return this.withMutation(async () => {
       this.assertVerificationCoordinatorAuthority(authority);
       const persisted = await this.readPersistedRun(runId);
+      if ((await this.readVerificationSpecDelta(runId)) !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "SPEC_DELTA_REQUIRED blocks dependent verification execution",
+        );
+      }
       const snapshot = persisted.run.verification_snapshot;
       if (snapshot?.schema_version === 1) {
         throw new ArkTeamError(
@@ -973,6 +1012,39 @@ export class RunStore {
           return { run, accepted: false, error_record: errorRecord };
         }
       }
+      if (
+        verificationState.current_state === "passed" &&
+        nextState === "pm_review_pending"
+      ) {
+        try {
+          assertCompleteVerificationPmHandoff(persisted.run);
+        } catch (error) {
+          const timestamp = this.now().toISOString();
+          const errorRecord = createVerificationCoordinatorErrorRecord({
+            run: persisted.run,
+            timestamp,
+            code: "INVALID_RECORD",
+            message:
+              error instanceof Error
+                ? error.message
+                : "verification PM handoff is incomplete",
+            attempt_count: 1,
+            evidence_record_ids: [],
+          });
+          const verificationRecords = appendVerificationLinkedRecord(
+            persisted.run.verification_records,
+            errorRecord,
+          );
+          const run: RunRecord = {
+            ...persisted.run,
+            updated_at: timestamp,
+            revision: persisted.run.revision + 1,
+            verification_records: [...verificationRecords],
+          };
+          await this.writePersistedRun({ ...persisted, run });
+          return { run, accepted: false, error_record: errorRecord };
+        }
+      }
 
       const timestamp = this.now().toISOString();
       const run: RunRecord = {
@@ -996,6 +1068,12 @@ export class RunStore {
   ): Promise<RecordVerificationAttemptResult> {
     return this.withMutation(async () => {
       this.assertVerificationCoordinatorAuthority(authority);
+      if ((await this.readVerificationSpecDelta(runId)) !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "SPEC_DELTA_REQUIRED blocks dependent verification execution",
+        );
+      }
       const persisted = await this.readPersistedRun(runId);
       const snapshot = persisted.run.verification_snapshot;
       if (snapshot === null || snapshot.schema_version !== 2) {
@@ -1214,6 +1292,12 @@ export class RunStore {
   ): Promise<CompleteVerificationAttemptResult> {
     return this.withMutation(async () => {
       this.assertVerificationCoordinatorAuthority(authority);
+      if ((await this.readVerificationSpecDelta(runId)) !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "SPEC_DELTA_REQUIRED blocks dependent verification execution",
+        );
+      }
       const persisted = await this.readPersistedRun(runId);
       const verificationState = persisted.run.verification_state;
       if (
@@ -1442,6 +1526,12 @@ export class RunStore {
   ): Promise<RecordVerificationActionErrorResult> {
     return this.withMutation(async () => {
       this.assertVerificationCoordinatorAuthority(authority);
+      if ((await this.readVerificationSpecDelta(runId)) !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "SPEC_DELTA_REQUIRED blocks dependent verification execution",
+        );
+      }
       const persisted = await this.readPersistedRun(runId);
       const snapshot = persisted.run.verification_snapshot;
       const verificationState = persisted.run.verification_state;
@@ -1520,6 +1610,12 @@ export class RunStore {
   ): Promise<TerminateVerificationForApprovalResult> {
     return this.withMutation(async () => {
       this.assertVerificationCoordinatorAuthority(authority);
+      if ((await this.readVerificationSpecDelta(runId)) !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "SPEC_DELTA_REQUIRED blocks dependent verification execution",
+        );
+      }
       const persisted = await this.readPersistedRun(runId);
       const snapshot = persisted.run.verification_snapshot;
       const verificationState = persisted.run.verification_state;
@@ -1636,6 +1732,12 @@ export class RunStore {
   ): Promise<RunRecord> {
     return this.withMutation(async () => {
       this.assertVerificationCoordinatorAuthority(authority);
+      if ((await this.readVerificationSpecDelta(runId)) !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "SPEC_DELTA_REQUIRED blocks dependent verification execution",
+        );
+      }
       const persisted = await this.readPersistedRun(runId);
       const snapshot = persisted.run.verification_snapshot;
       const verificationState = persisted.run.verification_state;
@@ -1738,6 +1840,7 @@ export class RunStore {
             lane,
             recordById,
             supersededEvidenceIds,
+            verificationState.attempts,
           ),
         );
       } catch (error) {
@@ -1848,6 +1951,9 @@ export class RunStore {
         evidence_record_ids: summaryRecords.map(
           (record) => record.record_id,
         ),
+        traceability: VERIFICATION_PM_HANDOFF_TRACEABILITY.map(
+          (entry) => ({ ...entry }),
+        ),
       };
       const reportRecord: VerificationLinkedRecord = {
         schema_version: 2,
@@ -1896,6 +2002,12 @@ export class RunStore {
   ): Promise<WriteVerificationArtifactResult> {
     return this.withMutation(async () => {
       this.assertVerificationCoordinatorAuthority(authority);
+      if ((await this.readVerificationSpecDelta(runId)) !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "SPEC_DELTA_REQUIRED blocks dependent verification execution",
+        );
+      }
       const persisted = await this.readPersistedRun(runId);
       const snapshot = persisted.run.verification_snapshot;
       if (snapshot === null) {
@@ -2057,6 +2169,12 @@ export class RunStore {
   ): Promise<CleanupVerificationArtifactsResult> {
     return this.withMutation(async () => {
       this.assertVerificationCoordinatorAuthority(authority);
+      if ((await this.readVerificationSpecDelta(runId)) !== null) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "SPEC_DELTA_REQUIRED preserves verification evidence",
+        );
+      }
       const persisted = await this.readPersistedRun(runId);
       let run = persisted.run;
       const snapshot = run.verification_snapshot;
@@ -2339,6 +2457,86 @@ export class RunStore {
     return this.readVerificationRollback();
   }
 
+  async recordVerificationSpecDelta(
+    runId: string,
+    input: RecordVerificationSpecDeltaInput,
+    authority?: symbol,
+  ): Promise<VerificationSpecDeltaRecord> {
+    return this.withMutation(async () => {
+      this.assertVerificationCoordinatorAuthority(authority);
+      const persisted = await this.readPersistedRun(runId);
+      const existing = await this.readVerificationSpecDelta(runId);
+      if (existing !== null) {
+        return existing;
+      }
+      const source =
+        persisted.run.verification_snapshot?.source ??
+        (await this.verificationSourceLoader(persisted.run.project_path));
+      const parsed = verificationSpecDeltaRecordSchema.safeParse({
+        status: "SPEC_DELTA_REQUIRED",
+        runtime_status: "not_started",
+        affected_ids: structuredClone(input.affected_ids),
+        classification: input.classification,
+        source_snapshot: {
+          worktree_root: source.worktree_root,
+          commit: source.source_commit,
+          tree: source.source_tree,
+          package_fingerprint:
+            persisted.run.verification_snapshot?.package
+              .package_fingerprint ??
+            APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+        },
+        evidence: structuredClone(input.evidence),
+        impact: input.impact,
+        proposed_resolution: input.proposed_resolution,
+        blocking_stage: input.blocking_stage,
+        created_at_utc: this.now().toISOString(),
+      });
+      if (!parsed.success) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "verification spec delta does not match the closed schema",
+          { cause: parsed.error },
+        );
+      }
+      const finalPath = this.verificationSpecDeltaPath(runId);
+      const temporaryPath = path.join(
+        this.runDirectory(runId),
+        `.verification-spec-delta-${process.pid}-${randomBytes(6).toString("hex")}.tmp`,
+      );
+      try {
+        await writeFile(
+          temporaryPath,
+          `${JSON.stringify(parsed.data, null, 2)}\n`,
+          { encoding: "utf8", flag: "wx", mode: 0o600 },
+        );
+        await link(temporaryPath, finalPath);
+        await rm(temporaryPath, { force: true });
+      } catch (error) {
+        await rm(temporaryPath, { force: true });
+        if (isNodeError(error, "EEXIST")) {
+          const concurrent = await this.readVerificationSpecDelta(runId);
+          if (concurrent !== null) {
+            return concurrent;
+          }
+        }
+        throw new ArkTeamError(
+          "STATE_ROOT_UNAVAILABLE",
+          "unable to persist verification spec delta",
+          { cause: error },
+        );
+      }
+      return parsed.data;
+    });
+  }
+
+  async getVerificationSpecDelta(
+    runId: string,
+  ): Promise<VerificationSpecDeltaRecord | null> {
+    await this.readPersistedRun(runId);
+    return this.readVerificationSpecDelta(runId);
+  }
+
   async getRun(runId: string): Promise<RunRecord> {
     return (await this.readPersistedRun(runId)).run;
   }
@@ -2350,6 +2548,38 @@ export class RunStore {
     this.assertVerificationCoordinatorAuthority(authority);
     const run = (await this.readPersistedRun(runId)).run;
     await this.assertCurrentVerificationSnapshot(run);
+    return run;
+  }
+
+  async revalidateVerificationArtifacts(
+    runId: string,
+    authority?: symbol,
+  ): Promise<RunRecord> {
+    this.assertVerificationCoordinatorAuthority(authority);
+    const run = (await this.readPersistedRun(runId)).run;
+    await this.assertCurrentVerificationSnapshot(run);
+    const snapshot = run.verification_snapshot;
+    if (snapshot === null || snapshot.schema_version !== 2) {
+      throw new ArkTeamError(
+        "CONTRACT_VERSION_MISMATCH",
+        "earlier verification artifacts are read-only",
+      );
+    }
+    const artifactStore = new VerificationArtifactStore({
+      state_root: this.root_path,
+      project_root: run.project_path,
+      snapshot,
+    });
+    await artifactStore.verifyArtifacts(
+      run.verification_records.flatMap((record) =>
+        record.schema_version === 2 && record.payload.kind === "artifact"
+          ? [record.payload]
+          : [],
+      ),
+    );
+    if (snapshot.ui_contract.enabled) {
+      await artifactStore.verifyApprovedBaseline();
+    }
     return run;
   }
 
@@ -4740,6 +4970,15 @@ export class RunStore {
       const integration = persisted.integration;
       const pmSession = persisted.pm_session;
       const expectedTeamIds = persisted.teams.map((team) => team.team_id);
+      const verificationConfig =
+        persisted.run.project_config.verification.coordinator;
+      const verificationReady =
+        verificationConfig === null ||
+        verificationConfig.schema_version !== 2 ||
+        !verificationConfig.enabled ||
+        (persisted.run.verification_state?.current_state ===
+          "original_pm_review" &&
+          persisted.run.verification_state.terminal_outcome === "passed");
       if (
         persisted.run.state !== "verifying" ||
         (integration?.state !== "local_merged" &&
@@ -4753,7 +4992,8 @@ export class RunStore {
         ) ||
         input.report.teams.some((team) => team.status !== "completed") ||
         JSON.stringify(input.report.teams.map((team) => team.team_id)) !==
-          JSON.stringify(expectedTeamIds)
+          JSON.stringify(expectedTeamIds) ||
+        !verificationReady
       ) {
         throw new ArkTeamError(
           "AGENT_SESSION_PROTOCOL_ERROR",
@@ -5303,6 +5543,12 @@ export class RunStore {
   private async assertCurrentVerificationSnapshot(
     run: RunRecord,
   ): Promise<void> {
+    if ((await this.readVerificationSpecDelta(run.run_id)) !== null) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "SPEC_DELTA_REQUIRED blocks dependent verification execution",
+      );
+    }
     const snapshot = run.verification_snapshot;
     if (snapshot === null || snapshot.schema_version !== 2) {
       throw new ArkTeamError(
@@ -5317,8 +5563,8 @@ export class RunStore {
         APPROVED_VERIFICATION_PACKAGE.package_id
     ) {
       throw new ArkTeamError(
-        "CONTRACT_VERSION_MISMATCH",
-        "earlier verification package snapshots are read-only",
+        "PACKAGE_FINGERPRINT_MISMATCH",
+        "contract-v2 verification package identity no longer matches",
       );
     }
     const coordinator = run.project_config.verification.coordinator;
@@ -5381,6 +5627,50 @@ export class RunStore {
     return path.join(
       this.root_path,
       "verification-contract-v2.rollback.json",
+    );
+  }
+
+  private async readVerificationSpecDelta(
+    runId: string,
+  ): Promise<VerificationSpecDeltaRecord | null> {
+    let raw: string;
+    try {
+      raw = await readFile(this.verificationSpecDeltaPath(runId), "utf8");
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        return null;
+      }
+      throw new ArkTeamError(
+        "STATE_ROOT_UNAVAILABLE",
+        "unable to read verification spec delta",
+        { cause: error },
+      );
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(raw) as unknown;
+    } catch (error) {
+      throw new ArkTeamError(
+        "CORRUPT_STATE",
+        "persisted verification spec delta is not valid JSON",
+        { cause: error },
+      );
+    }
+    const parsed = verificationSpecDeltaRecordSchema.safeParse(value);
+    if (!parsed.success) {
+      throw new ArkTeamError(
+        "CORRUPT_STATE",
+        "persisted verification spec delta is invalid",
+        { cause: parsed.error },
+      );
+    }
+    return parsed.data;
+  }
+
+  private verificationSpecDeltaPath(runId: string): string {
+    return path.join(
+      this.runDirectory(runId),
+      "verification-spec-delta.json",
     );
   }
 
@@ -5754,23 +6044,38 @@ function assertCompleteVerificationCapabilityMatrix(run: RunRecord): void {
         ]
       : []),
   ].sort();
-  const discovered = evidence.flatMap((record) =>
-    record?.schema_version === 2 &&
-    record.payload.kind === "capability" &&
-    record.lane !== null &&
-    record.payload.diagnostic !== undefined
-      ? [`${record.lane}\0${record.payload.capability}`]
-      : [],
-  ).sort();
+  const discovered = new Map<string, VerificationLinkedRecordV2[]>();
+  for (const record of evidence) {
+    if (
+      record?.schema_version !== 2 ||
+      record.payload.kind !== "capability" ||
+      record.lane === null ||
+      record.payload.diagnostic === undefined
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "capability discovery contains invalid readiness evidence",
+      );
+    }
+    const key = `${record.lane}\0${record.payload.capability}`;
+    discovered.set(key, [...(discovered.get(key) ?? []), record]);
+  }
   if (
-    evidence.length !== demands.length ||
-    discovered.length !== demands.length ||
-    new Set(discovered).size !== discovered.length ||
-    demands.some((demand, index) => demand !== discovered[index])
+    discovered.size !== demands.length ||
+    demands.some((demand) => {
+      const records = discovered.get(demand);
+      const maximumRecords = demand.endsWith("\0server") ? 2 : 1;
+      return (
+        records === undefined ||
+        records.length < 1 ||
+        records.length > maximumRecords
+      );
+    }) ||
+    [...discovered.keys()].some((key) => !demands.includes(key))
   ) {
     throw new ArkTeamError(
       "INVALID_RECORD",
-      "capability discovery must persist the exact immutable lane matrix once",
+      "capability discovery must persist one exact lane matrix and settled server readiness",
     );
   }
 }
@@ -5806,6 +6111,7 @@ function deriveVerificationLaneDecision(
   lane: VerificationLaneDecisionInput,
   records: Map<string, VerificationLinkedRecord>,
   supersededEvidenceIds: ReadonlySet<string>,
+  attempts: NonNullable<RunRecord["verification_state"]>["attempts"],
 ): VerificationLaneDecisionInput {
   const expectedChecks =
     lane.lane === "backend"
@@ -5875,7 +6181,7 @@ function deriveVerificationLaneDecision(
         "lane decision must link every persisted record for its check",
       );
     }
-    const dispositions = matchingEvidence.map((record) => {
+    const evidenceDispositions = matchingEvidence.map((record) => {
       const disposition = verificationEvidenceDisposition(record);
       if (disposition === null) {
         throw new ArkTeamError(
@@ -5894,15 +6200,28 @@ function deriveVerificationLaneDecision(
           "verification error disposition does not match its closed code",
         );
       }
-      return disposition;
+      return { record, disposition };
     });
-    const integrityFailure = dispositions.some(
-      (disposition) => disposition.integrity_failure,
+    const authoritativeDispositions = evidenceDispositions.filter(
+      ({ record, disposition }) =>
+        disposition.integrity_failure ||
+        !isOptionalSemanticEvidence(snapshot, record, attempts),
+    );
+    if (authoritativeDispositions.length === 0) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "verification check has no authoritative deterministic evidence",
+      );
+    }
+    const integrityFailure = authoritativeDispositions.some(
+      ({ disposition }) => disposition.integrity_failure,
     );
     const outcome = integrityFailure
       ? "error"
       : aggregateVerificationOutcomes(
-          dispositions.map((disposition) => disposition.outcome),
+          authoritativeDispositions.map(
+            ({ disposition }) => disposition.outcome,
+          ),
         );
     if (
       check.outcome !== outcome ||
@@ -5921,6 +6240,415 @@ function deriveVerificationLaneDecision(
     };
   });
   return { lane: lane.lane, checks };
+}
+
+function isOptionalSemanticEvidence(
+  snapshot: VerificationRunSnapshotV2,
+  record: VerificationLinkedRecordV2,
+  attempts: NonNullable<RunRecord["verification_state"]>["attempts"],
+): boolean {
+  if (
+    record.lane !== "ui" ||
+    !snapshot.ui_contract.enabled ||
+    snapshot.ui_contract.semantic_review_required
+  ) {
+    return false;
+  }
+  if (record.payload.kind === "review") {
+    return true;
+  }
+  const actionId =
+    record.payload.kind === "error"
+      ? record.payload.action_id
+      : undefined;
+  return (
+    actionId !== undefined &&
+    attempts.some(
+      (attempt) =>
+        attempt.action_id === actionId &&
+        attempt.kind === "semantic_review",
+    )
+  );
+}
+
+function assertPassedVerificationCheckEvidence(
+  snapshot: VerificationRunSnapshotV2,
+  lane: "backend" | "ui",
+  checkId: string,
+  records: Map<string, VerificationLinkedRecord>,
+  evidence: readonly VerificationLinkedRecordV2[],
+): void {
+  const payloads = evidence.map((record) => record.payload);
+  if (lane === "backend") {
+    if (payloads.filter((payload) => payload.kind === "request").length !== 1) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "passed Backend checks require one decisive API response",
+      );
+    }
+    assertVerificationEvidenceArtifactLinks(records, evidence);
+    return;
+  }
+  if (!snapshot.ui_contract.enabled) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "passed UI evidence targets a disabled lane",
+    );
+  }
+  const agenticTask = snapshot.ui_contract.agentic_tasks.find(
+    (task) => task.id === checkId,
+  );
+  if (agenticTask !== undefined) {
+    const agenticRecords = evidence.filter(
+      (record) => record.payload.kind === "agentic_browser",
+    );
+    if (
+      agenticRecords.length !== 1 ||
+      agenticRecords[0]!.artifact_references.length < 4
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "completed agentic checks require one advisory ledger and deterministic recheck evidence",
+      );
+    }
+    assertVerificationEvidenceArtifactLinks(records, agenticRecords);
+    return;
+  }
+  if (
+    !snapshot.ui_contract.browser_cases.some(
+      (browserCase) => browserCase.id === checkId,
+    )
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "passed UI evidence does not match a snapshotted check",
+    );
+  }
+  const browserRecords = evidence.filter(
+    (record) => record.payload.kind === "browser",
+  );
+  const screenshotRecords = evidence.filter(
+    (record) => record.payload.kind === "screenshot",
+  );
+  const comparisonRecords = evidence.filter(
+    (record) => record.payload.kind === "comparison",
+  );
+  const reviewRecords = evidence.filter(
+    (record) => record.payload.kind === "review",
+  );
+  if (
+    browserRecords.length !== 1 ||
+    screenshotRecords.length !== 3 ||
+    comparisonRecords.length !== 3 ||
+    (snapshot.ui_contract.semantic_review_required &&
+      reviewRecords.length !== 3)
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "passed UI checks require deterministic browser, three screenshots, required review, and three comparisons",
+    );
+  }
+  const viewports = screenshotRecords
+    .flatMap((record) =>
+      record.payload.kind === "screenshot"
+        ? [record.payload.viewport]
+        : [],
+    )
+    .sort();
+  if (
+    viewports.join("\0") !==
+    ["1440x900", "375x812", "768x1024"].join("\0") ||
+    new Set(
+      comparisonRecords.flatMap((record) =>
+        record.payload.kind === "comparison"
+          ? [
+              `${record.payload.baseline_sha256}\0${record.payload.actual_sha256}\0${record.payload.diff_sha256}`,
+            ]
+          : [],
+      ),
+    ).size !== 3
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "passed UI visual evidence does not cover the exact viewport matrix",
+    );
+  }
+  assertVerificationEvidenceArtifactLinks(records, [
+    ...browserRecords,
+    ...screenshotRecords,
+    ...comparisonRecords,
+    ...reviewRecords,
+  ]);
+}
+
+function assertVerificationEvidenceArtifactLinks(
+  records: Map<string, VerificationLinkedRecord>,
+  evidence: readonly VerificationLinkedRecordV2[],
+): void {
+  const artifacts = [...records.values()].flatMap((record) =>
+    record.schema_version === 2 && record.payload.kind === "artifact"
+      ? [record.payload]
+      : [],
+  );
+  for (const record of evidence) {
+    if (record.artifact_references.length === 0) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "passed verification evidence requires linked artifacts",
+      );
+    }
+    for (const reference of record.artifact_references) {
+      if (
+        !artifacts.some(
+          (artifact) =>
+            artifact.artifact_id === reference.artifact_id &&
+            artifact.relative_path === reference.relative_path &&
+            artifact.sha256 === reference.sha256,
+        )
+      ) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "verification evidence references a missing or mismatched artifact",
+        );
+      }
+    }
+  }
+}
+
+function assertCompleteVerificationPmHandoff(run: RunRecord): void {
+  const snapshot = run.verification_snapshot;
+  if (
+    snapshot === null ||
+    snapshot.schema_version !== 2 ||
+    run.verification_snapshot_sha256 === null
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "PM handoff requires one immutable contract-v2 snapshot",
+    );
+  }
+  const records = run.verification_records;
+  const verificationState = run.verification_state;
+  if (
+    verificationState === null ||
+    verificationState.terminal_outcome !== "passed"
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "PM handoff requires one passed durable verification state",
+    );
+  }
+  const recordById = new Map(
+    records.map((record) => [record.record_id, record]),
+  );
+  for (const attempt of verificationState.attempts) {
+    const expectedMaximum = snapshot.attempt_policy[attempt.kind];
+    if (
+      attempt.max_attempts !== expectedMaximum ||
+      attempt.attempt_count < 1 ||
+      attempt.attempt_count > expectedMaximum ||
+      !["succeeded", "exhausted", "aborted"].includes(attempt.status)
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "PM handoff contains an invalid durable attempt count or status",
+      );
+    }
+    const decisiveRecords = attempt.decisive_evidence_record_ids.flatMap(
+      (recordId) => {
+        const record = recordById.get(recordId);
+        return record?.schema_version === 2 ? [record] : [];
+      },
+    );
+    if (
+      decisiveRecords.length !==
+        attempt.decisive_evidence_record_ids.length ||
+      decisiveRecords.some(
+        (record) =>
+          !verificationRecordMatchesAttempt(
+            attempt.kind,
+            attempt.lane,
+            attempt.check_id,
+            record,
+          ),
+      ) ||
+      (attempt.status === "succeeded" &&
+        attempt.decisive_evidence_record_ids.length === 0)
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "PM handoff attempt evidence does not match its durable scope",
+      );
+    }
+    if (
+      attempt.last_error_code !== null &&
+      (attempt.status === "exhausted" || attempt.status === "aborted") &&
+      !records.some(
+        (record) =>
+          record.schema_version === 2 &&
+          record.payload.kind === "error" &&
+          record.payload.action_id === attempt.action_id &&
+          record.payload.code === attempt.last_error_code,
+      )
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "PM handoff attempt is missing its redacted terminal error",
+      );
+    }
+  }
+  const sourceRecords = records.filter(
+    (record) =>
+      record.schema_version === 2 && record.payload.kind === "source",
+  );
+  const configRecords = records.filter(
+    (record) =>
+      record.schema_version === 2 && record.payload.kind === "config",
+  );
+  const snapshotRecords = records.filter(
+    (record) =>
+      record.schema_version === 2 && record.payload.kind === "snapshot",
+  );
+  if (
+    sourceRecords.length !== 1 ||
+    configRecords.length !== 1 ||
+    snapshotRecords.length !== 1 ||
+    sourceRecords[0]!.payload.kind !== "source" ||
+    sourceRecords[0]!.payload.source_sha256 !==
+      snapshot.source_fingerprint ||
+    configRecords[0]!.payload.kind !== "config" ||
+    configRecords[0]!.payload.config_sha256 !==
+      snapshot.resolved_config_sha256 ||
+    snapshotRecords[0]!.payload.kind !== "snapshot" ||
+    snapshotRecords[0]!.payload.snapshot_sha256 !==
+      run.verification_snapshot_sha256
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "PM handoff is missing source, config, or snapshot closure evidence",
+    );
+  }
+  const reports = records.filter(
+    (record) =>
+      record.schema_version === 2 &&
+      record.payload.kind === "report" &&
+      record.payload.outcome === "passed",
+  );
+  const report = reports[0];
+  if (
+    reports.length !== 1 ||
+    report?.schema_version !== 2 ||
+    report.payload.kind !== "report" ||
+    canonicalJson(report.payload.traceability ?? null) !==
+      canonicalJson(VERIFICATION_PM_HANDOFF_TRACEABILITY)
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "PM handoff requires one passed report with complete REQ-AC-TEST-IS traceability",
+    );
+  }
+  const reportPayload = report.payload;
+  const summaryRecords: VerificationLinkedRecordV2[] =
+    reportPayload.evidence_record_ids.flatMap(
+    (recordId: string) => {
+      const record = records.find(
+        (candidate) => candidate.record_id === recordId,
+      );
+      return record?.schema_version === 2 &&
+        record.payload.kind === "lane_summary"
+        ? [record]
+        : [];
+    },
+    );
+  const enabledLanes = [
+    ...(snapshot.backend_contract.enabled ? ["backend" as const] : []),
+    ...(snapshot.ui_contract.enabled ? ["ui" as const] : []),
+  ];
+  if (
+    summaryRecords.length !== enabledLanes.length ||
+    enabledLanes.some(
+      (lane) =>
+        !summaryRecords.some(
+          (record) =>
+            record.payload.kind === "lane_summary" &&
+            record.payload.lane === lane,
+        ),
+    )
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "PM handoff does not contain exactly one enabled-lane summary",
+    );
+  }
+  for (const summary of summaryRecords) {
+    if (
+      summary.payload.kind !== "lane_summary" ||
+      summary.payload.checks === undefined
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "PM handoff lane summary omits its check matrix",
+      );
+    }
+    const summaryLane = summary.payload.lane;
+    const laneRequired =
+      summaryLane === "backend"
+        ? snapshot.backend_contract.enabled &&
+          snapshot.backend_contract.required
+        : snapshot.ui_contract.enabled && snapshot.ui_contract.required;
+    if (laneRequired && summary.payload.outcome !== "passed") {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "PM handoff contains a non-pass required lane",
+      );
+    }
+    for (const check of summary.payload.checks) {
+      if (check.required && check.outcome !== "passed") {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "PM handoff contains a non-pass required check",
+        );
+      }
+      if (check.outcome !== "passed") {
+        continue;
+      }
+      const checkEvidence = check.evidence_record_ids.flatMap((recordId) => {
+        const record = recordById.get(recordId);
+        return record?.schema_version === 2 ? [record] : [];
+      });
+      if (checkEvidence.length !== check.evidence_record_ids.length) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "PM handoff check references missing evidence",
+        );
+      }
+      assertPassedVerificationCheckEvidence(
+        snapshot,
+        summaryLane,
+        check.check_id,
+        recordById,
+        checkEvidence,
+      );
+      const checkAttempts = verificationState.attempts.filter(
+        (attempt) =>
+          attempt.lane === summaryLane &&
+          attempt.check_id === check.check_id,
+      );
+      if (
+        checkAttempts.length === 0 ||
+        checkAttempts.some((attempt) =>
+          attempt.decisive_evidence_record_ids.some(
+            (recordId) => !check.evidence_record_ids.includes(recordId),
+          ),
+        )
+      ) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "PM handoff check does not link its durable attempt evidence",
+        );
+      }
+    }
+  }
 }
 
 function supersededVerificationEvidenceRecordIds(

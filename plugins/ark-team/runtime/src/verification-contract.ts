@@ -17,6 +17,8 @@ const SECRET_PATTERN =
   /(?:api[_-]?key|authorization|cookie|password|secret|token)\s*(?:=|:)/i;
 const SECRET_ARGUMENT_PATTERN =
   /^(?:--?)?(?:api[_-]?key|authorization|cookie|password|secret|token)(?:$|[=:])/i;
+export const VERIFICATION_SECRET_TEXT_PATTERN =
+  /\b(?:authorization|bearer|cookie|password|secret|token|api[_-]?key)\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9]{20,}\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b|\b[A-Za-z0-9_-]{48,}\b|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
 const FORBIDDEN_LOCAL_SERVER_TOKENS = new Set([
   "ansible",
   "docker",
@@ -1605,6 +1607,172 @@ const verificationRecordTypeSchema = z.enum([
   "spec_delta",
 ]);
 
+export const VERIFICATION_PM_HANDOFF_TRACEABILITY = Object.freeze(
+  [
+    ["OBJ-1701", "REQ-1701", "IS-1701"],
+    ["OBJ-1701", "REQ-1702", "IS-1701"],
+    ["OBJ-1702", "REQ-1703", "IS-1703"],
+    ["OBJ-1702", "REQ-1704", "IS-1701"],
+    ["OBJ-1703", "REQ-1705", "IS-1701"],
+    ["OBJ-1703", "REQ-1706", "IS-1702"],
+    ["OBJ-1704", "REQ-1707", "IS-1703"],
+    ["OBJ-1704", "REQ-1708", "IS-1703"],
+    ["OBJ-1705", "REQ-1709", "IS-1705"],
+    ["OBJ-1705", "REQ-1710", "IS-1705"],
+    ["OBJ-1706", "REQ-1711", "IS-1706"],
+    ["OBJ-1706", "REQ-1712", "IS-1706"],
+    ["OBJ-1706", "REQ-1713", "IS-1706"],
+    ["OBJ-1707", "REQ-1714", "IS-1704"],
+    ["OBJ-1707", "REQ-1715", "IS-1704"],
+    ["OBJ-1707", "REQ-1716", "IS-1704"],
+    ["OBJ-1708", "REQ-1717", "IS-1707"],
+    ["OBJ-1708", "REQ-1718", "IS-1707"],
+    ["OBJ-1709", "REQ-1719", "IS-1707"],
+    ["OBJ-1709", "REQ-1720", "IS-1707"],
+    ["OBJ-1709", "REQ-1721", "IS-1707"],
+    ["OBJ-1710", "REQ-1722", "IS-1703"],
+    ["OBJ-1710", "REQ-1723", "IS-1706"],
+  ].map(([objectiveId, requirementId, implementationSliceId]) => {
+    const sequence = requirementId!.slice(4);
+    return Object.freeze({
+      objective_id: objectiveId!,
+      requirement_id: requirementId!,
+      acceptance_id: `AC-${sequence}`,
+      test_id: `TEST-${sequence}`,
+      implementation_slice_id: implementationSliceId!,
+    });
+  }),
+);
+
+const verificationPmHandoffTraceabilitySchema = z
+  .array(
+    z
+      .object({
+        objective_id: z.string().regex(/^OBJ-[0-9]{4}$/),
+        requirement_id: z.string().regex(/^REQ-[0-9]{4}$/),
+        acceptance_id: z.string().regex(/^AC-[0-9]{4}$/),
+        test_id: z.string().regex(/^TEST-[0-9]{4}$/),
+        implementation_slice_id: z.string().regex(/^IS-[0-9]{4}$/),
+      })
+      .strict(),
+  )
+  .length(VERIFICATION_PM_HANDOFF_TRACEABILITY.length);
+
+const verificationSpecDeltaAffectedIdsSchema = z
+  .array(identifierSchema)
+  .min(5)
+  .max(50)
+  .superRefine((affectedIds, context) => {
+    addDuplicateIssues(affectedIds, context, []);
+    const prefixes = ["OBJ", "REQ", "AC", "TEST", "IS"] as const;
+    if (
+      affectedIds.some(
+        (affectedId) =>
+          !/^(?:OBJ|REQ|AC|TEST|IS)-[0-9]{4}$/.test(affectedId),
+      ) ||
+      prefixes.some(
+        (prefix) =>
+          !affectedIds.some((affectedId) =>
+            affectedId.startsWith(`${prefix}-`),
+          ),
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "affected_ids must contain exact OBJ, REQ, AC, TEST, and IS identifiers",
+      });
+    }
+  });
+
+const verificationSpecDeltaTextSchema = boundedStringSchema.refine(
+  (value) =>
+    !VERIFICATION_SECRET_TEXT_PATTERN.test(value) &&
+    !/(?:chain[_ -]?of[_ -]?thought|private reasoning|model thoughts?|transcript)/i.test(
+      value,
+    ),
+  "secret or private reasoning content is forbidden",
+);
+
+export const verificationSpecDeltaRecordSchema = z
+  .object({
+    status: z.literal("SPEC_DELTA_REQUIRED"),
+    runtime_status: z.literal("not_started"),
+    affected_ids: verificationSpecDeltaAffectedIdsSchema,
+    classification: z.enum([
+      "omission",
+      "contradiction",
+      "unsafe_input",
+      "environment_mismatch",
+      "unverifiable",
+    ]),
+    source_snapshot: z
+      .object({
+        worktree_root: z
+          .string()
+          .min(1)
+          .refine(
+            (value) =>
+              path.isAbsolute(value) &&
+              path.normalize(value) === value &&
+              path.resolve(value) === value,
+            "worktree_root must be absolute and canonical",
+          ),
+        commit: shaSchema,
+        tree: shaSchema,
+        package_fingerprint: sha256Schema,
+      })
+      .strict(),
+    evidence: z
+      .array(
+        z
+          .object({
+            kind: identifierSchema.refine(
+              (value) =>
+                !VERIFICATION_SECRET_TEXT_PATTERN.test(value) &&
+                !/(?:chain[_-]?of[_-]?thought|reasoning|thought|transcript)/i.test(
+                  value,
+                ),
+              "secret or private reasoning evidence is forbidden",
+            ),
+            value: verificationSpecDeltaTextSchema,
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(50),
+    impact: verificationSpecDeltaTextSchema,
+    proposed_resolution: verificationSpecDeltaTextSchema,
+    blocking_stage: z.string().regex(/^IS-[0-9]{4}$/),
+    created_at_utc: z
+      .string()
+      .datetime({ offset: true })
+      .refine((value) => value.endsWith("Z"), "created_at_utc must be UTC"),
+  })
+  .strict()
+  .superRefine((record, context) => {
+    if (!record.affected_ids.includes(record.blocking_stage)) {
+      context.addIssue({
+        code: "custom",
+        path: ["blocking_stage"],
+        message: "blocking_stage must be present in affected_ids",
+      });
+    }
+  });
+
+export const verificationSpecDeltaPayloadSchema =
+  verificationSpecDeltaRecordSchema.extend({
+    kind: z.literal("spec_delta"),
+  });
+
+export type VerificationSpecDeltaRecord = z.infer<
+  typeof verificationSpecDeltaRecordSchema
+>;
+
+export type VerificationSpecDeltaPayload = z.infer<
+  typeof verificationSpecDeltaPayloadSchema
+>;
+
 export const verificationErrorCodeSchema = z.enum([
   "SOURCE_DRIFT",
   "PACKAGE_FINGERPRINT_MISMATCH",
@@ -1993,6 +2161,7 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
       kind: z.literal("report"),
       outcome: verificationOutcomeSchema,
       evidence_record_ids: z.array(identifierSchema).max(500),
+      traceability: verificationPmHandoffTraceabilitySchema.optional(),
     })
     .strict(),
   z
@@ -2004,43 +2173,7 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
       reason: boundedStringSchema,
     })
     .strict(),
-  z
-    .object({
-      kind: z.literal("spec_delta"),
-      status: z.literal("SPEC_DELTA_REQUIRED"),
-      runtime_status: z.literal("not_started"),
-      affected_ids: z.array(identifierSchema).min(1).max(50),
-      classification: z.enum([
-        "omission",
-        "contradiction",
-        "unsafe_input",
-        "environment_mismatch",
-        "unverifiable",
-      ]),
-      source_snapshot: z
-        .object({
-          worktree_root: z.string().min(1).refine(path.isAbsolute),
-          commit: shaSchema,
-          tree: shaSchema,
-          package_fingerprint: sha256Schema,
-        })
-        .strict(),
-      evidence: z
-        .array(
-          z
-            .object({
-              kind: identifierSchema,
-              value: boundedStringSchema,
-            })
-            .strict(),
-        )
-        .max(50),
-      impact: boundedStringSchema,
-      proposed_resolution: boundedStringSchema,
-      blocking_stage: identifierSchema,
-      created_at_utc: z.string().datetime({ offset: true }),
-    })
-    .strict(),
+  verificationSpecDeltaPayloadSchema,
 ]);
 
 const verificationArtifactReferenceSchema = z
