@@ -102,29 +102,34 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
   if (snapshot === null) {
     throw new Error("verification snapshot was not persisted");
   }
+  assert.equal(snapshot.schema_version, 2);
   const errorPayload = {
     kind: "error" as const,
     code: "SOURCE_DRIFT" as const,
     message: "bounded test diagnostic",
   };
   const errorRecord = {
-    schema_version: 1 as const,
+    schema_version: 2 as const,
+    contract_id: "verification_contract_v2" as const,
     record_id: `${created.run_id}-error`,
     record_type: "error" as const,
     run_id: created.run_id,
     case_id: snapshot.case_id,
     snapshot_id: snapshot.snapshot_id,
+    lane: null,
     stage: "snapshotted" as const,
     timestamp_utc: "2026-07-26T18:00:01.000Z",
     source_fingerprint: snapshot.source_fingerprint,
     package_fingerprint: snapshot.package.package_fingerprint,
-    required: true,
+    lane_required: null,
+    check_required: true,
     previous_record_sha256: sha256CanonicalJson(
       recorded.verification_records.at(-1),
     ),
     payload_sha256: sha256CanonicalJson(errorPayload),
     payload: errorPayload,
     adapter: null,
+    model: null,
     artifact_references: [],
   };
   const withEvidence = await store.appendVerificationRecord(
@@ -138,6 +143,20 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
         ...errorRecord,
         record_id: `${created.run_id}-broken`,
         snapshot_id: "snapshot-other",
+        previous_record_sha256: sha256CanonicalJson(
+          withEvidence.verification_records.at(-1),
+        ),
+      }),
+    (error: unknown) =>
+      error instanceof ArkTeamError && error.code === "INVALID_RECORD",
+  );
+  await assert.rejects(
+    () =>
+      store.appendVerificationRecord(created.run_id, {
+        ...errorRecord,
+        record_id: `${created.run_id}-lane-downgrade`,
+        lane: "backend",
+        lane_required: false,
         previous_record_sha256: sha256CanonicalJson(
           withEvidence.verification_records.at(-1),
         ),
@@ -181,7 +200,10 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
       error instanceof ArkTeamError && error.code === "SOURCE_DRIFT",
   );
 
-  config.verification.coordinator.baseline_identity.id = "mutated-input";
+  assert.equal(config.verification.coordinator.ui.enabled, true);
+  if (config.verification.coordinator.ui.enabled) {
+    config.verification.coordinator.ui.baseline_identity.id = "mutated-input";
+  }
   let replaySourceReads = 0;
   const reopened = new RunStore({
     root_path: stateRoot,
@@ -193,8 +215,8 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
   });
   const beforeReplay = await reopened.getRun(created.run_id);
   assert.equal(
-    beforeReplay.verification_snapshot?.baseline_identity.id,
-    "baseline-home-v1",
+    beforeReplay.verification_snapshot?.baseline_identity?.id,
+    "baseline-home-v2",
   );
   const replayed = await reopened.recordVerificationSnapshot(created.run_id, {
     package_fingerprint:
@@ -216,8 +238,7 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
         server_port: 10_002,
       }),
     (error: unknown) =>
-      error instanceof ArkTeamError &&
-      error.code === "SCENARIO_SNAPSHOT_MISMATCH",
+      error instanceof ArkTeamError && error.code === "SOURCE_DRIFT",
   );
 
   const recordPath = path.join(stateRoot, created.run_id, "run.json");
@@ -310,6 +331,8 @@ test("TEST-1705 rollback disables new snapshots and preserves existing evidence"
   const rollback = await store.recordVerificationRollback({
     reason: "operator disabled new verification starts",
   });
+  assert.equal(rollback.schema_version, 2);
+  assert.equal(rollback.contract_id, "verification_contract_v2");
   assert.equal(rollback.new_starts_enabled, false);
   assert.equal(rollback.preserves_existing_records, true);
 

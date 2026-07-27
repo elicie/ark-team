@@ -423,11 +423,17 @@ export class RunStore {
       );
       assertVerificationPackageFingerprint(input.package_fingerprint);
       if (persisted.run.verification_snapshot !== null) {
+        if (persisted.run.verification_snapshot.schema_version !== 2) {
+          throw new ArkTeamError(
+            "CONTRACT_VERSION_MISMATCH",
+            "contract-v1 verification evidence is read-only",
+          );
+        }
         if (
           persisted.run.verification_snapshot.server.port !== input.server_port
         ) {
           throw new ArkTeamError(
-            "SCENARIO_SNAPSHOT_MISMATCH",
+            "SOURCE_DRIFT",
             "verification snapshot already records a different server port",
           );
         }
@@ -453,6 +459,12 @@ export class RunStore {
         throw new ArkTeamError(
           "CONFIG_INVALID",
           "verification coordinator configuration is required for a new snapshot",
+        );
+      }
+      if (coordinator.schema_version !== 2) {
+        throw new ArkTeamError(
+          "CONTRACT_VERSION_MISMATCH",
+          "contract-v1 verification configuration is read-only",
         );
       }
       if (!coordinator.enabled) {
@@ -481,15 +493,19 @@ export class RunStore {
       });
       const snapshotSha256 = verificationRunSnapshotSha256(snapshot);
       const commonRecord = {
-        schema_version: 1 as const,
+        schema_version: 2 as const,
+        contract_id: "verification_contract_v2" as const,
         run_id: snapshot.run_id,
         case_id: snapshot.case_id,
         snapshot_id: snapshot.snapshot_id,
+        lane: null,
         timestamp_utc: timestamp,
         source_fingerprint: snapshot.source_fingerprint,
         package_fingerprint: snapshot.package.package_fingerprint,
-        required: true,
+        lane_required: null,
+        check_required: true,
         adapter: null,
+        model: null,
         artifact_references: [],
       };
       const sourcePayload = {
@@ -577,6 +593,12 @@ export class RunStore {
           "verification evidence requires an immutable run snapshot",
         );
       }
+      if (snapshot.schema_version !== 2 || input.schema_version !== 2) {
+        throw new ArkTeamError(
+          "CONTRACT_VERSION_MISMATCH",
+          "contract-v1 verification evidence is read-only",
+        );
+      }
       await this.assertApprovedVerificationPackage(
         persisted.run.project_path,
       );
@@ -595,6 +617,21 @@ export class RunStore {
           "INVALID_RECORD",
           "verification evidence does not link to the immutable run snapshot",
         );
+      }
+      if (input.lane !== null) {
+        const laneContract =
+          input.lane === "backend"
+            ? snapshot.backend_contract
+            : snapshot.ui_contract;
+        if (
+          !laneContract.enabled ||
+          input.lane_required !== laneContract.required
+        ) {
+          throw new ArkTeamError(
+            "INVALID_RECORD",
+            "verification evidence changes immutable lane requiredness",
+          );
+        }
       }
       const verificationRecords = appendVerificationLinkedRecord(
         persisted.run.verification_records,
@@ -630,8 +667,8 @@ export class RunStore {
         return existing;
       }
       const parsed = verificationRollbackRecordSchema.safeParse({
-        schema_version: 1,
-        contract_id: "verification_contract_v1",
+        schema_version: 2,
+        contract_id: "verification_contract_v2",
         package_fingerprint:
           APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
         new_starts_enabled: false,
@@ -3537,11 +3574,11 @@ export class RunStore {
       );
     }
     const parsed = verificationRollbackRecordSchema.safeParse(value);
-    if (!parsed.success) {
+    if (!parsed.success || parsed.data.schema_version !== 2) {
       throw new ArkTeamError(
         "CORRUPT_STATE",
-        "persisted verification rollback is invalid",
-        { cause: parsed.error },
+        "persisted contract-v2 verification rollback is invalid",
+        { cause: parsed.success ? undefined : parsed.error },
       );
     }
     return parsed.data;
@@ -3550,7 +3587,7 @@ export class RunStore {
   private verificationRollbackPath(): string {
     return path.join(
       this.root_path,
-      "verification-contract-v1.rollback.json",
+      "verification-contract-v2.rollback.json",
     );
   }
 

@@ -93,7 +93,7 @@ function addDuplicateIssues(
   }
 }
 
-const capabilitySchema = z.enum([
+const legacyCapabilitySchema = z.enum([
   "server",
   "api",
   "browser",
@@ -102,13 +102,36 @@ const capabilitySchema = z.enum([
   "comparison",
 ]);
 
-const requiredCapabilitiesSchema = z
-  .array(capabilitySchema)
+const legacyRequiredCapabilitiesSchema = z
+  .array(legacyCapabilitySchema)
   .min(1)
   .max(6)
   .superRefine((values, context) =>
     addDuplicateIssues(values, context, ["required_capabilities"]),
   );
+
+const capabilitySchema = z.enum([
+  "agentic_browser",
+  "api",
+  "browser",
+  "comparison",
+  "screenshot",
+  "semantic_review",
+  "server",
+]);
+
+const capabilityListSchema = z
+  .array(capabilitySchema)
+  .max(7)
+  .superRefine((values, context) => {
+    addDuplicateIssues(values, context, []);
+    if ([...values].sort().join("\0") !== values.join("\0")) {
+      context.addIssue({
+        code: "custom",
+        message: "capabilities must be lexically sorted",
+      });
+    }
+  });
 
 const requiredViewportsSchema = z.tuple([
   z.literal("375x812"),
@@ -239,12 +262,73 @@ export const verificationBrowserActionSchema = z.discriminatedUnion("type", [
   waitActionSchema,
 ]);
 
+const legacyVerificationBrowserCaseSchema = z
+  .object({
+    id: identifierSchema,
+    path: z.string().min(1).max(2_048).refine(isLocalPath, "invalid local browser path"),
+    readiness: boundedStringSchema,
+    actions: z.array(verificationBrowserActionSchema).max(50),
+    required: z.boolean(),
+  })
+  .strict();
+
+const visibleAssertionSchema = z
+  .object({
+    kind: z.literal("visible"),
+    role: boundedStringSchema.max(128),
+    name: boundedStringSchema.max(1_000),
+  })
+  .strict();
+const textAssertionSchema = z
+  .object({
+    kind: z.literal("text"),
+    selector: boundedStringSchema,
+    value: boundedStringSchema.max(10_000),
+  })
+  .strict();
+const urlAssertionSchema = z
+  .object({
+    kind: z.literal("url"),
+    value: z.string().min(1).max(2_048).refine(isLocalPath, "invalid local URL assertion"),
+  })
+  .strict();
+const valueAssertionSchema = z
+  .object({
+    kind: z.literal("value"),
+    selector: boundedStringSchema,
+    value: boundedStringSchema.max(10_000),
+  })
+  .strict();
+const accessibilityAssertionSchema = z
+  .object({
+    kind: z.literal("accessibility_snapshot"),
+    sha256: sha256Schema,
+  })
+  .strict();
+const responseAssertionSchema = z
+  .object({
+    kind: z.literal("response"),
+    path: z.string().min(1).max(2_048).refine(isLocalPath, "invalid local response path"),
+    expected_status: z.number().int().min(100).max(599),
+  })
+  .strict();
+
+export const verificationBrowserAssertionSchema = z.discriminatedUnion("kind", [
+  visibleAssertionSchema,
+  textAssertionSchema,
+  urlAssertionSchema,
+  valueAssertionSchema,
+  accessibilityAssertionSchema,
+  responseAssertionSchema,
+]);
+
 export const verificationBrowserCaseSchema = z
   .object({
     id: identifierSchema,
     path: z.string().min(1).max(2_048).refine(isLocalPath, "invalid local browser path"),
     readiness: boundedStringSchema,
     actions: z.array(verificationBrowserActionSchema).max(50),
+    assertions: z.array(verificationBrowserAssertionSchema).min(1).max(50),
     required: z.boolean(),
   })
   .strict();
@@ -317,11 +401,25 @@ const verificationTimeoutsSchema = z
   })
   .strict();
 
+const legacyVerificationAttemptsSchema = z
+  .object({
+    readiness: z.literal(2),
+    api: z.literal(2),
+    browser: z.literal(2),
+    screenshot: z.literal(1),
+    comparison: z.literal(1),
+    semantic_review: z.literal(1),
+    artifact_write: z.literal(1),
+    cleanup: z.literal(1),
+  })
+  .strict();
+
 const verificationAttemptsSchema = z
   .object({
     readiness: z.literal(2),
     api: z.literal(2),
     browser: z.literal(2),
+    agentic_browser: z.literal(1),
     screenshot: z.literal(1),
     comparison: z.literal(1),
     semantic_review: z.literal(1),
@@ -342,11 +440,11 @@ const verificationEvidenceLimitsSchema = z
   })
   .strict();
 
-export const verificationCoordinatorConfigSchema = z
+export const legacyVerificationCoordinatorConfigSchema = z
   .object({
     schema_version: z.literal(1),
     enabled: z.boolean(),
-    required_capabilities: requiredCapabilitiesSchema,
+    required_capabilities: legacyRequiredCapabilitiesSchema,
     server_argv: z.array(boundedStringSchema).min(1).max(32),
     server_bind: z.literal("0.0.0.0"),
     server_host: z.literal("dev"),
@@ -361,7 +459,7 @@ export const verificationCoordinatorConfigSchema = z
     api_probes: z.array(verificationApiProbeSchema).min(1).max(50),
     api_adapter: z.literal("curl"),
     browser_adapter: z.literal("playwright-cli"),
-    browser_cases: z.array(verificationBrowserCaseSchema).min(1).max(50),
+    browser_cases: z.array(legacyVerificationBrowserCaseSchema).min(1).max(50),
     viewports: requiredViewportsSchema,
     baseline_root: z
       .string()
@@ -381,7 +479,7 @@ export const verificationCoordinatorConfigSchema = z
     api_timeout_ms: z.literal(30_000),
     browser_timeout_ms: z.literal(60_000),
     case_timeout_ms: z.literal(120_000),
-    attempts: verificationAttemptsSchema,
+    attempts: legacyVerificationAttemptsSchema,
     approval_policy: z.literal("explicit-one-time-user-decision"),
   })
   .strict()
@@ -494,8 +592,317 @@ export const verificationCoordinatorConfigSchema = z
     });
   });
 
+const exactVersionSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine(
+    (value) =>
+      value.trim() === value &&
+      !SECRET_PATTERN.test(value) &&
+      !/(?:^|[._-])latest(?:$|[._-])/i.test(value) &&
+      !/[<>=*^~|]/.test(value),
+    "version must be exact",
+  );
+
+const modelIdentitySchema = exactVersionSchema.refine(
+  (value) => !/^(?:auto|default|fallback)$/i.test(value),
+  "model identity must be explicit",
+);
+
+const promptTemplateSchema = z
+  .string()
+  .min(1)
+  .max(16 * 1_024)
+  .refine((value) => value.trim().length > 0, "prompt template is blank")
+  .refine(
+    (value) => Buffer.byteLength(value, "utf8") <= 16 * 1_024,
+    "prompt template exceeds 16 KiB",
+  )
+  .refine(
+    (value) => !SECRET_PATTERN.test(value),
+    "secret-bearing prompt template is forbidden",
+  );
+
+const checklistSchema = z
+  .array(boundedStringSchema)
+  .min(1)
+  .max(50)
+  .superRefine((items, context) => {
+    if (Buffer.byteLength(canonicalJson(items), "utf8") > 16 * 1_024) {
+      context.addIssue({
+        code: "custom",
+        message: "checklist exceeds 16 KiB",
+      });
+    }
+  });
+
+const verificationAgenticTaskSchema = z
+  .object({
+    id: identifierSchema,
+    required: z.literal(false),
+    adapter: z.enum(["browser-use", "playwright-agent", "stagehand"]),
+    adapter_version: exactVersionSchema,
+    api_major: exactVersionSchema,
+    model_identity: modelIdentitySchema,
+    browser_build: exactVersionSchema,
+    start_path: z.string().min(1).max(2_048).refine(isLocalPath),
+    goal: z
+      .string()
+      .min(1)
+      .max(4 * 1_024)
+      .refine((value) => value.trim().length > 0, "goal is blank")
+      .refine(
+        (value) => Buffer.byteLength(value, "utf8") <= 4 * 1_024,
+        "goal exceeds 4 KiB",
+      )
+      .refine(
+        (value) => !SECRET_PATTERN.test(value),
+        "secret-bearing goal is forbidden",
+      ),
+    success_criteria: z.array(verificationBrowserAssertionSchema).min(1).max(50),
+    allowed_actions: z
+      .array(z.enum(["click", "navigate", "screenshot", "snapshot", "type"]))
+      .min(1)
+      .max(5),
+    max_steps: z.literal(20),
+    timeout_ms: z.literal(120_000),
+    system_prompt_template: promptTemplateSchema,
+    checklist: checklistSchema,
+    prompt_sha256: sha256Schema,
+    checklist_sha256: sha256Schema,
+  })
+  .strict()
+  .superRefine((task, context) => {
+    addDuplicateIssues(task.allowed_actions, context, ["allowed_actions"]);
+    if (
+      task.prompt_sha256 !==
+      createHash("sha256").update(task.system_prompt_template, "utf8").digest("hex")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["prompt_sha256"],
+        message: "prompt hash does not match the template bytes",
+      });
+    }
+    if (task.checklist_sha256 !== sha256CanonicalJson(task.checklist)) {
+      context.addIssue({
+        code: "custom",
+        path: ["checklist_sha256"],
+        message: "checklist hash does not match canonical checklist bytes",
+      });
+    }
+  });
+
+const disabledLaneSchema = z.object({ enabled: z.literal(false) }).strict();
+
+const enabledBackendLaneSchema = z
+  .object({
+    enabled: z.literal(true),
+    required: z.boolean(),
+    required_capabilities: z.tuple([z.literal("api"), z.literal("server")]),
+    api_adapter: z.literal("curl"),
+    api_adapter_version: exactVersionSchema,
+    api_probes: z.array(verificationApiProbeSchema).min(1).max(50),
+  })
+  .strict()
+  .superRefine((lane, context) => {
+    addDuplicateIssues(
+      lane.api_probes.map((probe) => probe.id),
+      context,
+      ["api_probes"],
+    );
+    if (lane.required && !lane.api_probes.some((probe) => probe.required)) {
+      context.addIssue({
+        code: "custom",
+        path: ["api_probes"],
+        message: "a required backend lane needs a required probe",
+      });
+    }
+  });
+
+const verificationBackendLaneSchema = z.discriminatedUnion("enabled", [
+  disabledLaneSchema,
+  enabledBackendLaneSchema,
+]);
+
+const enabledUiLaneSchema = z
+  .object({
+    enabled: z.literal(true),
+    required: z.boolean(),
+    required_capabilities: capabilityListSchema,
+    optional_capabilities: capabilityListSchema,
+    deterministic_adapter: z.literal("playwright-cli"),
+    deterministic_adapter_version: exactVersionSchema,
+    browser_build: exactVersionSchema,
+    browser_cases: z.array(verificationBrowserCaseSchema).min(1).max(50),
+    viewports: requiredViewportsSchema,
+    baseline_root: z
+      .string()
+      .min(1)
+      .max(1_000)
+      .refine(
+        isCanonicalRelativePath,
+        "baseline_root must be canonical and project-relative",
+      ),
+    baseline_identity: verificationBaselineIdentitySchema,
+    pixel_diff_fraction_max: z.literal(0.005),
+    max_channel_delta: z.literal(8),
+    critical_regions: z.array(criticalRegionSchema).max(100),
+    semantic_review_required: z.boolean(),
+    agentic_tasks: z.array(verificationAgenticTaskSchema).max(50),
+  })
+  .strict()
+  .superRefine((lane, context) => {
+    addDuplicateIssues(
+      lane.browser_cases.map((browserCase) => browserCase.id),
+      context,
+      ["browser_cases"],
+    );
+    addDuplicateIssues(
+      lane.agentic_tasks.map((task) => task.id),
+      context,
+      ["agentic_tasks"],
+    );
+    addDuplicateIssues(
+      lane.critical_regions.map((region) => region.id),
+      context,
+      ["critical_regions"],
+    );
+    if (lane.required && !lane.browser_cases.some((browserCase) => browserCase.required)) {
+      context.addIssue({
+        code: "custom",
+        path: ["browser_cases"],
+        message: "a required UI lane needs a required browser case",
+      });
+    }
+    const expectedRequired = [
+      "browser",
+      "comparison",
+      "screenshot",
+      ...(lane.semantic_review_required ? ["semantic_review"] : []),
+      "server",
+    ];
+    const expectedOptional = [
+      ...(lane.agentic_tasks.length > 0 ? ["agentic_browser"] : []),
+      ...(!lane.semantic_review_required ? ["semantic_review"] : []),
+    ];
+    if (canonicalJson(lane.required_capabilities) !== canonicalJson(expectedRequired)) {
+      context.addIssue({
+        code: "custom",
+        path: ["required_capabilities"],
+        message: "required UI capabilities do not match enabled checks",
+      });
+    }
+    if (canonicalJson(lane.optional_capabilities) !== canonicalJson(expectedOptional)) {
+      context.addIssue({
+        code: "custom",
+        path: ["optional_capabilities"],
+        message: "optional UI capabilities do not match enabled checks",
+      });
+    }
+    if (
+      lane.required_capabilities.some((capability) =>
+        lane.optional_capabilities.includes(capability),
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["optional_capabilities"],
+        message: "required and optional capabilities must be disjoint",
+      });
+    }
+  });
+
+const verificationUiLaneSchema = z.discriminatedUnion("enabled", [
+  disabledLaneSchema,
+  enabledUiLaneSchema,
+]);
+
+const disabledVerificationCoordinatorConfigSchema = z
+  .object({
+    schema_version: z.literal(2),
+    contract_id: z.literal("verification_contract_v2"),
+    enabled: z.literal(false),
+  })
+  .strict();
+
+export const verificationCoordinatorConfigV2Schema = z
+  .object({
+    schema_version: z.literal(2),
+    contract_id: z.literal("verification_contract_v2"),
+    enabled: z.literal(true),
+    server_argv: z.array(boundedStringSchema).min(1).max(32),
+    server_bind: z.literal("0.0.0.0"),
+    server_host: z.literal("dev"),
+    server_port_floor: z.literal(10_001),
+    server_readiness_path: z
+      .string()
+      .min(1)
+      .max(2_048)
+      .refine(isLocalPath, "invalid readiness path"),
+    server_readiness_status: z.number().int().min(100).max(599),
+    server_readiness_timeout_ms: z.literal(30_000),
+    evidence_limits: verificationEvidenceLimitsSchema,
+    console_bytes: z.literal(32 * 1_024),
+    network_bytes: z.literal(32 * 1_024),
+    retention_days: z.literal(30),
+    retention_anchor: z.literal("terminal-report-created-at"),
+    server_timeout_ms: z.literal(30_000),
+    api_timeout_ms: z.literal(30_000),
+    browser_timeout_ms: z.literal(60_000),
+    case_timeout_ms: z.literal(120_000),
+    attempts: verificationAttemptsSchema,
+    approval_policy: z.literal("explicit-one-time-user-decision"),
+    backend: verificationBackendLaneSchema,
+    ui: verificationUiLaneSchema,
+  })
+  .strict()
+  .superRefine((config, context) => {
+    const executable = path.basename(config.server_argv[0] ?? "").toLowerCase();
+    if (
+      ["sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "pwsh"].includes(
+        executable,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["server_argv", 0],
+        message: "server_argv must not invoke a shell",
+      });
+    }
+    config.server_argv.forEach((argument, index) => {
+      if (SECRET_ARGUMENT_PATTERN.test(argument)) {
+        context.addIssue({
+          code: "custom",
+          path: ["server_argv", index],
+          message: "server_argv must not contain credential arguments",
+        });
+      }
+    });
+    const requiredLaneCount =
+      Number(config.backend.enabled && config.backend.required) +
+      Number(config.ui.enabled && config.ui.required);
+    if (requiredLaneCount === 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["backend"],
+        message: "at least one enabled lane must be required",
+      });
+    }
+  });
+
+export const verificationCoordinatorConfigSchema = z.union([
+  legacyVerificationCoordinatorConfigSchema,
+  disabledVerificationCoordinatorConfigSchema,
+  verificationCoordinatorConfigV2Schema,
+]);
+
 export type VerificationCoordinatorConfig = z.infer<
   typeof verificationCoordinatorConfigSchema
+>;
+export type VerificationCoordinatorConfigV2 = z.infer<
+  typeof verificationCoordinatorConfigV2Schema
 >;
 
 export const verificationStageSchema = z.enum([
@@ -519,7 +926,7 @@ export const verificationOutcomeSchema = z.enum([
   "error",
 ]);
 
-const verificationRecordTypeSchema = z.enum([
+const legacyVerificationRecordTypeSchema = z.enum([
   "source",
   "config",
   "snapshot",
@@ -536,7 +943,7 @@ const verificationRecordTypeSchema = z.enum([
   "spec_delta",
 ]);
 
-const verificationErrorCodeSchema = z.enum([
+const legacyVerificationErrorCodeSchema = z.enum([
   "SOURCE_DRIFT",
   "PACKAGE_FINGERPRINT_MISMATCH",
   "CONFIG_INVALID",
@@ -556,7 +963,7 @@ const verificationErrorCodeSchema = z.enum([
   "INVALID_RECORD",
 ]);
 
-const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
+const legacyVerificationRecordPayloadSchema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("source"),
@@ -578,7 +985,7 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("capability"),
-      capability: capabilitySchema,
+      capability: legacyCapabilitySchema,
       available: z.boolean(),
       version: boundedStringSchema.max(128).nullable(),
     })
@@ -648,7 +1055,7 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("error"),
-      code: verificationErrorCodeSchema,
+      code: legacyVerificationErrorCodeSchema,
       message: boundedStringSchema,
     })
     .strict(),
@@ -707,11 +1114,11 @@ const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
     .strict(),
 ]);
 
-export const verificationLinkedRecordSchema = z
+export const legacyVerificationLinkedRecordSchema = z
   .object({
     schema_version: z.literal(1),
     record_id: identifierSchema,
-    record_type: verificationRecordTypeSchema,
+    record_type: legacyVerificationRecordTypeSchema,
     run_id: z.string().regex(RUN_ID_PATTERN),
     case_id: identifierSchema,
     snapshot_id: identifierSchema,
@@ -722,7 +1129,7 @@ export const verificationLinkedRecordSchema = z
     required: z.boolean(),
     previous_record_sha256: sha256Schema.nullable(),
     payload_sha256: sha256Schema,
-    payload: verificationRecordPayloadSchema,
+    payload: legacyVerificationRecordPayloadSchema,
     adapter: z
       .object({
         name: identifierSchema,
@@ -798,6 +1205,446 @@ export const verificationLinkedRecordSchema = z
     }
   });
 
+const verificationRecordTypeSchema = z.enum([
+  "source",
+  "config",
+  "snapshot",
+  "capability",
+  "request",
+  "browser",
+  "agentic_browser",
+  "screenshot",
+  "review",
+  "comparison",
+  "artifact",
+  "cleanup",
+  "lane_summary",
+  "error",
+  "report",
+  "rollback",
+  "spec_delta",
+]);
+
+const verificationErrorCodeSchema = z.enum([
+  "SOURCE_DRIFT",
+  "PACKAGE_FINGERPRINT_MISMATCH",
+  "CONTRACT_VERSION_MISMATCH",
+  "CONFIG_INVALID",
+  "SCENARIO_SNAPSHOT_MISMATCH",
+  "ARTIFACT_ROOT_INVALID",
+  "BASELINE_NOT_APPROVED",
+  "CAPABILITY_UNAVAILABLE",
+  "SERVER_NOT_READY",
+  "API_CONTRACT_MISMATCH",
+  "BROWSER_CONTRACT_MISMATCH",
+  "SCREENSHOT_CAPTURE_FAILED",
+  "IMAGE_REVIEW_REJECTED",
+  "COMPARISON_THRESHOLD_FAILED",
+  "APPROVAL_REQUIRED",
+  "TIMEOUT",
+  "ENVIRONMENT_UNAVAILABLE",
+  "INVALID_RECORD",
+]);
+
+const closedAgenticVerdictSchema = z.enum([
+  "achieved",
+  "not_achieved",
+  "unknown",
+]);
+
+const verificationRecordPayloadSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("source"),
+      source_sha256: sha256Schema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("config"),
+      config_sha256: sha256Schema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("snapshot"),
+      snapshot_sha256: sha256Schema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("capability"),
+      capability: capabilitySchema,
+      available: z.boolean(),
+      version: exactVersionSchema.nullable(),
+    })
+    .strict()
+    .superRefine((capability, context) => {
+      if (capability.available && capability.version === null) {
+        context.addIssue({
+          code: "custom",
+          path: ["version"],
+          message: "available capability requires an exact version",
+        });
+      }
+    }),
+  z
+    .object({
+      kind: z.literal("request"),
+      method: z.enum(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]),
+      path: z.string().min(1).max(2_048).refine(isLocalPath, "invalid request path"),
+      expected_status: z.number().int().min(100).max(599),
+      actual_status: z.number().int().min(100).max(599),
+      request_sha256: sha256Schema,
+      response_sha256: sha256Schema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("browser"),
+      case_sha256: sha256Schema,
+      action_count: z.number().int().nonnegative().max(50),
+      assertion_count: z.number().int().positive().max(50),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("agentic_browser"),
+      execution_status: z.enum(["completed", "blocked", "error"]),
+      finding_status: z.enum(["finding", "no_finding", "unknown"]),
+      self_verdict: closedAgenticVerdictSchema.optional(),
+      judge_verdict: closedAgenticVerdictSchema.optional(),
+      findings: z.array(boundedStringSchema).max(50),
+      input_sha256: sha256Schema,
+      ledger_sha256: sha256Schema,
+      step_count: z.number().int().nonnegative().max(20),
+    })
+    .strict()
+    .superRefine((result, context) => {
+      if (Buffer.byteLength(canonicalJson(result.findings), "utf8") > 16 * 1_024) {
+        context.addIssue({
+          code: "custom",
+          path: ["findings"],
+          message: "agentic findings exceed 16 KiB",
+        });
+      }
+    }),
+  z
+    .object({
+      kind: z.literal("screenshot"),
+      viewport: z.enum(["375x812", "768x1024", "1440x900"]),
+      width: z.number().int().positive(),
+      height: z.number().int().positive(),
+      image_sha256: sha256Schema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("review"),
+      outcome: z.enum(["passed", "failed", "unavailable", "error"]),
+      image_sha256: sha256Schema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("comparison"),
+      outcome: z.enum(["passed", "failed", "error"]),
+      baseline_sha256: sha256Schema,
+      actual_sha256: sha256Schema,
+      diff_sha256: sha256Schema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("artifact"),
+      artifact_id: identifierSchema,
+      relative_path: z
+        .string()
+        .min(1)
+        .max(1_000)
+        .refine(isCanonicalRelativePath, "invalid artifact path"),
+      media_type: z.enum([
+        "image/png",
+        "application/json",
+        "application/x-ndjson",
+        "application/zip",
+        "text/plain",
+      ]),
+      byte_length: z.number().int().positive().max(50 * 1_024 * 1_024),
+      sha256: sha256Schema,
+    })
+    .strict()
+    .superRefine((artifact, context) => {
+      if (
+        artifact.media_type === "application/zip" &&
+        !artifact.relative_path.endsWith(".playwright-trace.zip")
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["relative_path"],
+          message: "only Playwright trace ZIP artifacts are allowed",
+        });
+      }
+    }),
+  z
+    .object({
+      kind: z.literal("cleanup"),
+      disposition: z.enum([
+        "retention_active",
+        "cleaned",
+        "cleanup_error",
+      ]),
+      code: verificationErrorCodeSchema.nullable(),
+      message: boundedStringSchema.nullable(),
+    })
+    .strict()
+    .superRefine((cleanup, context) => {
+      const isError = cleanup.disposition === "cleanup_error";
+      if (isError !== (cleanup.code !== null && cleanup.message !== null)) {
+        context.addIssue({
+          code: "custom",
+          message: "cleanup error provenance does not match its disposition",
+        });
+      }
+    }),
+  z
+    .object({
+      kind: z.literal("lane_summary"),
+      lane: z.enum(["backend", "ui"]),
+      outcome: verificationOutcomeSchema,
+      evidence_record_ids: z.array(identifierSchema).min(1).max(500),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("error"),
+      code: verificationErrorCodeSchema,
+      message: boundedStringSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("report"),
+      outcome: verificationOutcomeSchema,
+      evidence_record_ids: z.array(identifierSchema).max(500),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("rollback"),
+      contract_id: z.literal("verification_contract_v2"),
+      new_starts_enabled: z.literal(false),
+      preserves_existing_records: z.literal(true),
+      reason: boundedStringSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("spec_delta"),
+      status: z.literal("SPEC_DELTA_REQUIRED"),
+      runtime_status: z.literal("not_started"),
+      affected_ids: z.array(identifierSchema).min(1).max(50),
+      classification: z.enum([
+        "omission",
+        "contradiction",
+        "unsafe_input",
+        "environment_mismatch",
+        "unverifiable",
+      ]),
+      source_snapshot: z
+        .object({
+          worktree_root: z.string().min(1).refine(path.isAbsolute),
+          commit: shaSchema,
+          tree: shaSchema,
+          package_fingerprint: sha256Schema,
+        })
+        .strict(),
+      evidence: z
+        .array(
+          z
+            .object({
+              kind: identifierSchema,
+              value: boundedStringSchema,
+            })
+            .strict(),
+        )
+        .max(50),
+      impact: boundedStringSchema,
+      proposed_resolution: boundedStringSchema,
+      blocking_stage: identifierSchema,
+      created_at_utc: z.string().datetime({ offset: true }),
+    })
+    .strict(),
+]);
+
+const verificationArtifactReferenceSchema = z
+  .object({
+    artifact_id: identifierSchema,
+    relative_path: z
+      .string()
+      .min(1)
+      .max(1_000)
+      .refine(
+        isCanonicalRelativePath,
+        "artifact reference must be canonical and relative",
+      ),
+    sha256: sha256Schema,
+  })
+  .strict();
+
+export const verificationLinkedRecordV2Schema = z
+  .object({
+    schema_version: z.literal(2),
+    contract_id: z.literal("verification_contract_v2"),
+    record_id: identifierSchema,
+    record_type: verificationRecordTypeSchema,
+    run_id: z.string().regex(RUN_ID_PATTERN),
+    case_id: identifierSchema,
+    snapshot_id: identifierSchema,
+    lane: z.enum(["backend", "ui"]).nullable(),
+    stage: verificationStageSchema,
+    timestamp_utc: z.string().datetime({ offset: true }),
+    source_fingerprint: sha256Schema,
+    package_fingerprint: sha256Schema,
+    lane_required: z.boolean().nullable(),
+    check_required: z.boolean(),
+    previous_record_sha256: sha256Schema.nullable(),
+    payload_sha256: sha256Schema,
+    payload: verificationRecordPayloadSchema,
+    adapter: z
+      .object({
+        name: identifierSchema,
+        version: exactVersionSchema,
+      })
+      .strict()
+      .nullable(),
+    model: z
+      .object({
+        identity: modelIdentitySchema,
+      })
+      .strict()
+      .nullable(),
+    artifact_references: z.array(verificationArtifactReferenceSchema).max(500),
+  })
+  .strict()
+  .superRefine((record, context) => {
+    if (record.record_type !== record.payload.kind) {
+      context.addIssue({
+        code: "custom",
+        path: ["payload", "kind"],
+        message: "record payload kind does not match record_type",
+      });
+    }
+    if (record.payload_sha256 !== sha256CanonicalJson(record.payload)) {
+      context.addIssue({
+        code: "custom",
+        path: ["payload_sha256"],
+        message: "record payload hash does not match",
+      });
+    }
+    if ((record.lane === null) !== (record.lane_required === null)) {
+      context.addIssue({
+        code: "custom",
+        path: ["lane_required"],
+        message: "lane requiredness must be present exactly when lane is present",
+      });
+    }
+    if (
+      [
+        "capability",
+        "request",
+        "browser",
+        "agentic_browser",
+        "screenshot",
+        "review",
+        "comparison",
+        "lane_summary",
+      ].includes(record.record_type) &&
+      record.lane === null
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["lane"],
+        message: "this record type requires lane provenance",
+      });
+    }
+    if (
+      (record.record_type === "request" && record.lane !== "backend") ||
+      ([
+        "browser",
+        "agentic_browser",
+        "screenshot",
+        "review",
+        "comparison",
+      ].includes(record.record_type) &&
+        record.lane !== "ui")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["lane"],
+        message: "record type does not match its QA lane",
+      });
+    }
+    if (
+      record.payload.kind === "lane_summary" &&
+      record.payload.lane !== record.lane
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["lane"],
+        message: "lane summary payload does not match record lane",
+      });
+    }
+    if (
+      [
+        "capability",
+        "request",
+        "browser",
+        "agentic_browser",
+        "screenshot",
+        "review",
+        "comparison",
+      ].includes(record.record_type) &&
+      record.adapter === null
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["adapter"],
+        message: "adapter identity is required for this record type",
+      });
+    }
+    if (
+      record.record_type === "agentic_browser" &&
+      (record.check_required ||
+        record.model === null ||
+        record.artifact_references.length === 0)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["check_required"],
+        message:
+          "agentic browser evidence must remain advisory with model and artifact provenance",
+      });
+    }
+    if (
+      ["screenshot", "review", "comparison", "artifact", "cleanup"].includes(
+        record.record_type,
+      ) &&
+      record.artifact_references.length === 0
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifact_references"],
+        message: "artifact-linked record has no artifact reference",
+      });
+    }
+  });
+
+export const verificationLinkedRecordSchema = z.union([
+  legacyVerificationLinkedRecordSchema,
+  verificationLinkedRecordV2Schema,
+]);
+
 export type VerificationLinkedRecord = z.infer<
   typeof verificationLinkedRecordSchema
 >;
@@ -810,6 +1657,17 @@ export function appendVerificationLinkedRecord(
     verificationLinkedRecordSchema.parse(record),
   );
   const record = verificationLinkedRecordSchema.parse(input);
+  if (
+    records.length > 0 &&
+    records.some(
+      (candidate) => candidate.schema_version !== record.schema_version,
+    )
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "verification record hash chains cannot mix schema versions",
+    );
+  }
   if (records.some((candidate) => candidate.record_id === record.record_id)) {
     throw new ArkTeamError(
       "INVALID_RECORD",
@@ -828,7 +1686,7 @@ export function appendVerificationLinkedRecord(
   return Object.freeze([...records, record]);
 }
 
-export const verificationRollbackRecordSchema = z
+const legacyVerificationRollbackRecordSchema = z
   .object({
     schema_version: z.literal(1),
     contract_id: z.literal("verification_contract_v1"),
@@ -839,6 +1697,23 @@ export const verificationRollbackRecordSchema = z
     recorded_at_utc: z.string().datetime({ offset: true }),
   })
   .strict();
+
+const verificationRollbackRecordV2Schema = z
+  .object({
+    schema_version: z.literal(2),
+    contract_id: z.literal("verification_contract_v2"),
+    package_fingerprint: sha256Schema,
+    new_starts_enabled: z.literal(false),
+    preserves_existing_records: z.literal(true),
+    reason: boundedStringSchema,
+    recorded_at_utc: z.string().datetime({ offset: true }),
+  })
+  .strict();
+
+export const verificationRollbackRecordSchema = z.union([
+  legacyVerificationRollbackRecordSchema,
+  verificationRollbackRecordV2Schema,
+]);
 
 export type VerificationRollbackRecord = z.infer<
   typeof verificationRollbackRecordSchema
@@ -880,7 +1755,7 @@ export type VerificationSourceIdentity = z.infer<
   typeof verificationSourceIdentitySchema
 >;
 
-export const verificationPackageIdentitySchema = z
+const legacyVerificationPackageIdentitySchema = z
   .object({
     package_id: z.literal("verification-spec-v2"),
     package_status: z.literal("SPEC_APPROVED"),
@@ -891,15 +1766,37 @@ export const verificationPackageIdentitySchema = z
   })
   .strict();
 
-export const APPROVED_VERIFICATION_SPEC_SHA256 =
-  "277fb413390f83f49fdf34fab4a42e3eca83d3f499fe5442e884f165a0128399";
-
-export const APPROVED_VERIFICATION_PACKAGE = Object.freeze({
+const LEGACY_APPROVED_VERIFICATION_PACKAGE = Object.freeze({
   package_id: "verification-spec-v2",
   package_status: "SPEC_APPROVED",
   package_fingerprint:
     "095ae3afac8429264c82145d83a912ac39c0a26f3c30e9ab38398348356256af",
   authority_date: "2026-07-26",
+  reference_boundary: "NONE",
+  spec_sha256:
+    "277fb413390f83f49fdf34fab4a42e3eca83d3f499fe5442e884f165a0128399",
+}) satisfies z.infer<typeof legacyVerificationPackageIdentitySchema>;
+
+export const verificationPackageIdentitySchema = z
+  .object({
+    package_id: z.literal("verification-spec-v3"),
+    package_status: z.literal("SPEC_APPROVED"),
+    package_fingerprint: sha256Schema,
+    authority_date: z.literal("2026-07-27"),
+    reference_boundary: z.literal("NONE"),
+    spec_sha256: sha256Schema,
+  })
+  .strict();
+
+export const APPROVED_VERIFICATION_SPEC_SHA256 =
+  "68b9553034481d4a7ee530f1886d4a87d7ceede03a7cfb127c10051b0db8f4d7";
+
+export const APPROVED_VERIFICATION_PACKAGE = Object.freeze({
+  package_id: "verification-spec-v3",
+  package_status: "SPEC_APPROVED",
+  package_fingerprint:
+    "de4df180bfc6754e21b8177e8302ef861eda37acc5cb7b7979715b8773e24bd2",
+  authority_date: "2026-07-27",
   reference_boundary: "NONE",
   spec_sha256: APPROVED_VERIFICATION_SPEC_SHA256,
 }) satisfies z.infer<typeof verificationPackageIdentitySchema>;
@@ -922,11 +1819,11 @@ const verificationServerSnapshotSchema = z
     }
   });
 
-export const verificationRunSnapshotSchema = z
+const legacyVerificationRunSnapshotSchema = z
   .object({
     schema_version: z.literal(1),
     snapshot_id: identifierSchema,
-    package: verificationPackageIdentitySchema,
+    package: legacyVerificationPackageIdentitySchema,
     source: verificationSourceIdentitySchema,
     source_fingerprint: sha256Schema,
     run_id: z.string().regex(RUN_ID_PATTERN),
@@ -941,7 +1838,7 @@ export const verificationRunSnapshotSchema = z
     baseline_identity: verificationBaselineIdentitySchema,
     server: verificationServerSnapshotSchema,
     browser_environment: browserEnvironmentSchema,
-    required_capabilities: requiredCapabilitiesSchema,
+    required_capabilities: legacyRequiredCapabilitiesSchema,
     api_contract: z
       .object({
         adapter: z.literal("curl"),
@@ -951,17 +1848,17 @@ export const verificationRunSnapshotSchema = z
     browser_contract: z
       .object({
         adapter: z.literal("playwright-cli"),
-        cases: z.array(verificationBrowserCaseSchema).min(1).max(50),
+        cases: z.array(legacyVerificationBrowserCaseSchema).min(1).max(50),
       })
       .strict(),
     timeouts_ms: verificationTimeoutsSchema,
-    attempt_policy: verificationAttemptsSchema,
+    attempt_policy: legacyVerificationAttemptsSchema,
     comparison_policy: verificationComparisonPolicySchema,
     evidence_policy: verificationEvidencePolicySchema,
     approval_policy: z.literal(
       "explicit-one-time-user-decision",
     ),
-    resolved_config: verificationCoordinatorConfigSchema,
+    resolved_config: legacyVerificationCoordinatorConfigSchema,
     resolved_config_canonical: z.string().min(2),
     resolved_config_sha256: sha256Schema,
   })
@@ -969,7 +1866,7 @@ export const verificationRunSnapshotSchema = z
   .superRefine((snapshot, context) => {
     if (
       canonicalJson(snapshot.package) !==
-      canonicalJson(APPROVED_VERIFICATION_PACKAGE)
+      canonicalJson(LEGACY_APPROVED_VERIFICATION_PACKAGE)
     ) {
       context.addIssue({
         code: "custom",
@@ -1091,6 +1988,181 @@ export const verificationRunSnapshotSchema = z
     }
   });
 
+const verificationEvidencePolicyV2Schema = verificationEvidencePolicySchema.extend({
+  retention_anchor: z.literal("terminal-report-created-at"),
+});
+
+export const verificationRunSnapshotV2Schema = z
+  .object({
+    schema_version: z.literal(2),
+    contract_id: z.literal("verification_contract_v2"),
+    snapshot_id: identifierSchema,
+    package: verificationPackageIdentitySchema,
+    source: verificationSourceIdentitySchema,
+    source_fingerprint: sha256Schema,
+    run_id: z.string().regex(RUN_ID_PATTERN),
+    case_id: z.literal("BOOTSTRAP-1701"),
+    scenario_version: z.literal(2),
+    stage: z.literal("snapshotted"),
+    required: z.literal(true),
+    created_at_utc: z.string().datetime({ offset: true }),
+    artifact_root: z
+      .string()
+      .min(1)
+      .refine(path.isAbsolute, "artifact_root must be absolute"),
+    artifact_references: z.array(boundedStringSchema).max(500),
+    baseline_root: z
+      .string()
+      .min(1)
+      .refine(path.isAbsolute, "baseline_root must be absolute")
+      .nullable(),
+    baseline_identity: verificationBaselineIdentitySchema.nullable(),
+    server: verificationServerSnapshotSchema,
+    browser_environment: browserEnvironmentSchema.nullable(),
+    backend_contract: verificationBackendLaneSchema,
+    ui_contract: verificationUiLaneSchema,
+    timeouts_ms: verificationTimeoutsSchema,
+    attempt_policy: verificationAttemptsSchema,
+    evidence_policy: verificationEvidencePolicyV2Schema,
+    approval_policy: z.literal("explicit-one-time-user-decision"),
+    resolved_config: verificationCoordinatorConfigV2Schema,
+    resolved_config_canonical: z.string().min(2),
+    resolved_config_sha256: sha256Schema,
+  })
+  .strict()
+  .superRefine((snapshot, context) => {
+    if (
+      canonicalJson(snapshot.package) !==
+      canonicalJson(APPROVED_VERIFICATION_PACKAGE)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["package"],
+        message: "snapshot package does not match the approved package",
+      });
+    }
+    if (
+      snapshot.source.worktree_state !== "GIT_CLEAN" ||
+      snapshot.source.porcelain_status.length !== 0
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["source"],
+        message: "snapshot source must be a clean dynamic capture",
+      });
+    }
+    if (snapshot.source_fingerprint !== sha256CanonicalJson(snapshot.source)) {
+      context.addIssue({
+        code: "custom",
+        path: ["source_fingerprint"],
+        message: "source fingerprint does not match the source record",
+      });
+    }
+    const config = snapshot.resolved_config;
+    if (snapshot.server.port < config.server_port_floor) {
+      context.addIssue({
+        code: "custom",
+        path: ["server", "port"],
+        message: "recorded server port is below the configured floor",
+      });
+    }
+    if (snapshot.resolved_config_canonical !== canonicalJson(config)) {
+      context.addIssue({
+        code: "custom",
+        path: ["resolved_config_canonical"],
+        message: "resolved configuration canonical bytes do not match",
+      });
+    }
+    if (snapshot.resolved_config_sha256 !== sha256CanonicalJson(config)) {
+      context.addIssue({
+        code: "custom",
+        path: ["resolved_config_sha256"],
+        message: "resolved configuration hash does not match",
+      });
+    }
+
+    const expectedBaselineIdentity = config.ui.enabled
+      ? config.ui.baseline_identity
+      : null;
+    const expectedBrowserEnvironment = config.ui.enabled
+      ? config.ui.baseline_identity.environment
+      : null;
+    if (
+      expectedBaselineIdentity !== null &&
+      (expectedBaselineIdentity.source_commit !== snapshot.source.source_commit ||
+        expectedBaselineIdentity.source_tree !== snapshot.source.source_tree)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["baseline_identity"],
+        message: "baseline identity does not match the approved source",
+      });
+    }
+    if (config.ui.enabled !== (snapshot.baseline_root !== null)) {
+      context.addIssue({
+        code: "custom",
+        path: ["baseline_root"],
+        message: "baseline root must exist exactly when the UI lane is enabled",
+      });
+    }
+
+    const linkedValues: Array<[unknown, unknown, PropertyKey[]]> = [
+      [snapshot.baseline_identity, expectedBaselineIdentity, ["baseline_identity"]],
+      [
+        snapshot.browser_environment,
+        expectedBrowserEnvironment,
+        ["browser_environment"],
+      ],
+      [snapshot.backend_contract, config.backend, ["backend_contract"]],
+      [snapshot.ui_contract, config.ui, ["ui_contract"]],
+      [
+        snapshot.timeouts_ms,
+        {
+          server_ms: config.server_timeout_ms,
+          api_ms: config.api_timeout_ms,
+          browser_ms: config.browser_timeout_ms,
+          case_ms: config.case_timeout_ms,
+        },
+        ["timeouts_ms"],
+      ],
+      [snapshot.attempt_policy, config.attempts, ["attempt_policy"]],
+      [
+        snapshot.evidence_policy,
+        {
+          console_event_limit: config.evidence_limits.console_events,
+          console_byte_limit: config.console_bytes,
+          network_event_limit: config.evidence_limits.network_events,
+          network_byte_limit: config.network_bytes,
+          api_preview_byte_limit: config.evidence_limits.api_preview_bytes,
+          retention_days: config.retention_days,
+          retention_anchor: config.retention_anchor,
+          semantic_review_required:
+            config.ui.enabled && config.ui.semantic_review_required,
+          max_files: config.evidence_limits.file_count,
+          max_file_bytes: config.evidence_limits.file_bytes,
+          max_total_bytes: config.evidence_limits.total_bytes,
+          max_metadata_bytes_per_check: config.evidence_limits.metadata_bytes,
+        },
+        ["evidence_policy"],
+      ],
+      [snapshot.approval_policy, config.approval_policy, ["approval_policy"]],
+    ];
+    for (const [actual, expected, issuePath] of linkedValues) {
+      if (canonicalJson(actual) !== canonicalJson(expected)) {
+        context.addIssue({
+          code: "custom",
+          path: issuePath,
+          message: "snapshot value does not match resolved configuration",
+        });
+      }
+    }
+  });
+
+export const verificationRunSnapshotSchema = z.union([
+  legacyVerificationRunSnapshotSchema,
+  verificationRunSnapshotV2Schema,
+]);
+
 export type VerificationRunSnapshot = z.infer<
   typeof verificationRunSnapshotSchema
 >;
@@ -1108,7 +2180,7 @@ export interface BuildVerificationRunSnapshotInput {
 
 export function buildVerificationRunSnapshot(
   input: BuildVerificationRunSnapshotInput,
-): VerificationRunSnapshot {
+): z.infer<typeof verificationRunSnapshotV2Schema> {
   assertVerificationPackageFingerprint(input.package_fingerprint);
   assertVerificationSourceIdentity(input.source);
   const parsedConfig = verificationCoordinatorConfigSchema.safeParse(input.config);
@@ -1120,6 +2192,12 @@ export function buildVerificationRunSnapshot(
     );
   }
   const config = parsedConfig.data;
+  if (config.schema_version !== 2) {
+    throw new ArkTeamError(
+      "CONTRACT_VERSION_MISMATCH",
+      "contract-v1 verification configuration is read-only",
+    );
+  }
   if (!config.enabled) {
     throw new ArkTeamError(
       "INVALID_TRANSITION",
@@ -1127,46 +2205,45 @@ export function buildVerificationRunSnapshot(
     );
   }
   if (
-    config.baseline_identity.source_commit !== input.source.source_commit ||
-    config.baseline_identity.source_tree !== input.source.source_tree
+    config.ui.enabled &&
+    (config.ui.baseline_identity.source_commit !== input.source.source_commit ||
+      config.ui.baseline_identity.source_tree !== input.source.source_tree)
   ) {
     throw new ArkTeamError(
       "SOURCE_DRIFT",
       "approved baseline identity does not match the captured source",
     );
   }
-  const parsedSnapshot = verificationRunSnapshotSchema.safeParse({
-    schema_version: 1,
-    snapshot_id: `${input.run_id}-verification-v1`,
+  const parsedSnapshot = verificationRunSnapshotV2Schema.safeParse({
+    schema_version: 2,
+    contract_id: "verification_contract_v2",
+    snapshot_id: `${input.run_id}-verification-v2`,
     package: APPROVED_VERIFICATION_PACKAGE,
     source: input.source,
     source_fingerprint: sha256CanonicalJson(input.source),
     run_id: input.run_id,
     case_id: "BOOTSTRAP-1701",
-    scenario_version: 1,
+    scenario_version: 2,
     stage: "snapshotted",
     required: true,
     created_at_utc: input.created_at_utc,
     artifact_root: input.artifact_root,
     artifact_references: [],
-    baseline_root: path.resolve(input.project_path, config.baseline_root),
-    baseline_identity: config.baseline_identity,
+    baseline_root: config.ui.enabled
+      ? path.resolve(input.project_path, config.ui.baseline_root)
+      : null,
+    baseline_identity: config.ui.enabled ? config.ui.baseline_identity : null,
     server: {
       host: config.server_host,
       bind: config.server_bind,
       port: input.server_port,
       api_origin: `http://dev:${input.server_port}`,
     },
-    browser_environment: config.baseline_identity.environment,
-    required_capabilities: config.required_capabilities,
-    api_contract: {
-      adapter: config.api_adapter,
-      probes: config.api_probes,
-    },
-    browser_contract: {
-      adapter: config.browser_adapter,
-      cases: config.browser_cases,
-    },
+    browser_environment: config.ui.enabled
+      ? config.ui.baseline_identity.environment
+      : null,
+    backend_contract: config.backend,
+    ui_contract: config.ui,
     timeouts_ms: {
       server_ms: config.server_timeout_ms,
       api_ms: config.api_timeout_ms,
@@ -1174,11 +2251,6 @@ export function buildVerificationRunSnapshot(
       case_ms: config.case_timeout_ms,
     },
     attempt_policy: config.attempts,
-    comparison_policy: {
-      pixel_diff_fraction_max: config.pixel_diff_fraction_max,
-      max_channel_delta: config.max_channel_delta,
-      critical_regions: config.critical_regions,
-    },
     evidence_policy: {
       console_event_limit: config.evidence_limits.console_events,
       console_byte_limit: config.console_bytes,
@@ -1186,7 +2258,9 @@ export function buildVerificationRunSnapshot(
       network_byte_limit: config.network_bytes,
       api_preview_byte_limit: config.evidence_limits.api_preview_bytes,
       retention_days: config.retention_days,
-      semantic_review_required: config.semantic_review_required,
+      retention_anchor: config.retention_anchor,
+      semantic_review_required:
+        config.ui.enabled && config.ui.semantic_review_required,
       max_files: config.evidence_limits.file_count,
       max_file_bytes: config.evidence_limits.file_bytes,
       max_total_bytes: config.evidence_limits.total_bytes,
