@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 
 import { ArkTeamError } from "../src/errors.js";
 import { DEFAULT_PROJECT_CONFIG } from "../src/project-config.js";
-import { RunStore } from "../src/state-store.js";
+import { resolveStateRoot, RunStore } from "../src/state-store.js";
 import {
   APPROVED_VERIFICATION_PACKAGE,
   sha256CanonicalJson,
@@ -34,6 +34,13 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(testRoot, { recursive: true, force: true });
+});
+
+test("state root defaults to the Ark-owned home directory", () => {
+  assert.equal(
+    resolveStateRoot({}),
+    path.join(homedir(), ".ark-team", "runs"),
+  );
 });
 
 test("TEST-001 creates a run and reopens persisted state", async () => {

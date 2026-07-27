@@ -5,6 +5,7 @@ import { z } from "zod/v4";
 import {
   type AppServerMessage,
   type AppServerProtocolClient,
+  type ExternalAppServerRuntime,
   type JsonRpcId,
   StdioAppServerClient,
 } from "./app-server-client.js";
@@ -18,6 +19,7 @@ import {
   type ManagedRole,
   type Usage,
 } from "./managed-role.js";
+import type { ResolvedModelBindingV1 } from "./provider-types.js";
 import {
   assertManagedOutputContractRole,
   managedOutputJsonSchemas,
@@ -38,6 +40,7 @@ export interface ApprovalSessionRequest {
   working_directory: string;
   resume_session_id?: string;
   output_contract?: ManagedOutputContract;
+  model_binding?: ResolvedModelBindingV1;
   signal?: AbortSignal;
 }
 
@@ -65,8 +68,8 @@ export interface ApprovalCompletedUpdate {
   turn_id: string;
   role: ManagedRole;
   agent_name: "ark_pm" | "ark_pl" | "ark_worker";
-  model: "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna";
-  model_reasoning_effort: "xhigh";
+  model: string;
+  model_reasoning_effort: string;
   sandbox_mode: "read-only" | "workspace-write";
   approval_policy: "never" | "on-request";
   final_report: string;
@@ -80,6 +83,8 @@ export interface ApprovalSessionOptions {
   client?: AppServerProtocolClient;
   codex_path?: string;
   timeout_ms?: number;
+  external_runtime?: ExternalAppServerRuntime;
+  provider_sensitive_env_names?: readonly string[];
 }
 
 interface WireApproval {
@@ -120,6 +125,7 @@ const threadStartResponseSchema = z.object({
     id: z.string().min(1),
   }),
   model: z.string().min(1),
+  modelProvider: z.string().min(1),
   cwd: z.string().min(1),
   runtimeWorkspaceRoots: z.array(z.string()).optional(),
   approvalPolicy: z.union([z.literal("never"), z.literal("on-request")]),
@@ -135,7 +141,7 @@ const threadStartResponseSchema = z.object({
       networkAccess: z.literal(false),
     }),
   ]),
-  reasoningEffort: z.literal("xhigh"),
+  reasoningEffort: z.string().min(1),
 });
 
 const turnStartResponseSchema = z.object({
@@ -247,8 +253,12 @@ export class AppServerApprovalSession {
   private readonly suppliedClient: AppServerProtocolClient | undefined;
   private readonly codexPath: string;
   private readonly timeoutMs: number;
+  private readonly externalRuntime: ExternalAppServerRuntime | undefined;
+  private readonly providerSensitiveEnvironmentNames: readonly string[];
   private client: AppServerProtocolClient | null = null;
   private role: ManagedRole | null = null;
+  private selectedModel: string | null = null;
+  private selectedReasoningEffort: string | null = null;
   private outputContract: ManagedOutputContract | null = null;
   private sessionId: string | null = null;
   private turnId: string | null = null;
@@ -258,6 +268,7 @@ export class AppServerApprovalSession {
   private preTurnMessages: AppServerMessage[] = [];
   private updateQueue: ApprovalSessionUpdate[] = [];
   private updateWaiters: UpdateWaiter[] = [];
+  private terminalFailureListeners = new Set<(error: ArkTeamError) => void>();
   private failure: ArkTeamError | null = null;
   private started = false;
   private terminal = false;
@@ -271,6 +282,9 @@ export class AppServerApprovalSession {
     this.suppliedClient = options.client;
     this.codexPath = options.codex_path ?? "codex";
     this.timeoutMs = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
+    this.externalRuntime = options.external_runtime;
+    this.providerSensitiveEnvironmentNames =
+      options.provider_sensitive_env_names ?? [];
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1) {
       throw new ArkTeamError("INVALID_INPUT", "timeout_ms must be a positive integer");
     }
@@ -306,8 +320,25 @@ export class AppServerApprovalSession {
     if (request.resume_session_id !== undefined && !resumeSessionId) {
       throw new ArkTeamError("INVALID_INPUT", "resume_session_id must not be empty");
     }
+    const profile = managedRoleProfiles[request.role];
+    const binding = resolveSessionBinding(
+      request.role,
+      request.model_binding,
+      this.externalRuntime,
+    );
     this.role = request.role;
-    this.client = this.suppliedClient ?? new StdioAppServerClient({ codex_path: this.codexPath });
+    this.selectedModel = binding.model;
+    this.selectedReasoningEffort = binding.reasoningEffort;
+    this.client =
+      this.suppliedClient ??
+      new StdioAppServerClient({
+        codex_path: this.codexPath,
+        provider_sensitive_env_names:
+          this.providerSensitiveEnvironmentNames,
+        ...(this.externalRuntime === undefined
+          ? {}
+          : { external_runtime: this.externalRuntime }),
+      });
     this.removeMessageListener = this.client.onMessage((message) => {
       this.handleMessage(message);
     });
@@ -317,7 +348,6 @@ export class AppServerApprovalSession {
     });
     this.startDeadline(request.signal);
 
-    const profile = managedRoleProfiles[request.role];
     try {
       await this.client.request("initialize", {
         clientInfo: {
@@ -330,14 +360,17 @@ export class AppServerApprovalSession {
       this.client.notify("initialized");
 
       const threadParams = {
-        model: profile.model,
+        model: binding.model,
+        ...(binding.modelProvider === null
+          ? {}
+          : { modelProvider: binding.modelProvider }),
         cwd: workingDirectory,
         approvalPolicy: profile.approval_policy,
         approvalsReviewer: "user",
         sandbox: profile.sandbox_mode,
         config: {
           ...managedCodexConfig,
-          model_reasoning_effort: profile.model_reasoning_effort,
+          model_reasoning_effort: binding.reasoningEffort,
           web_search: "disabled",
           ...(profile.sandbox_mode === "workspace-write"
             ? {
@@ -360,10 +393,25 @@ export class AppServerApprovalSession {
               ...threadParams,
             }),
       );
-      if (threadResponse.model !== profile.model) {
+      if (threadResponse.model !== binding.model) {
         throw new ArkTeamError(
           "AGENT_SESSION_PROTOCOL_ERROR",
-          `app-server selected ${threadResponse.model} instead of ${profile.model}`,
+          `app-server selected ${threadResponse.model} instead of ${binding.model}`,
+        );
+      }
+      if (
+        binding.modelProvider !== null &&
+        threadResponse.modelProvider !== binding.modelProvider
+      ) {
+        throw new ArkTeamError(
+          "AGENT_SESSION_PROTOCOL_ERROR",
+          `app-server selected provider ${threadResponse.modelProvider} instead of ${binding.modelProvider}`,
+        );
+      }
+      if (threadResponse.reasoningEffort !== binding.reasoningEffort) {
+        throw new ArkTeamError(
+          "AGENT_SESSION_PROTOCOL_ERROR",
+          `app-server selected ${threadResponse.reasoningEffort} reasoning effort instead of ${binding.reasoningEffort}`,
         );
       }
       if (threadResponse.cwd !== workingDirectory) {
@@ -424,6 +472,10 @@ export class AppServerApprovalSession {
                 request.role,
                 assignment,
                 request.output_contract,
+                {
+                  model: binding.model,
+                  reasoning_effort: binding.reasoningEffort,
+                },
               ),
               text_elements: [],
             },
@@ -431,8 +483,8 @@ export class AppServerApprovalSession {
           cwd: workingDirectory,
           approvalPolicy: profile.approval_policy,
           approvalsReviewer: "user",
-          model: profile.model,
-          effort: profile.model_reasoning_effort,
+          model: binding.model,
+          effort: binding.reasoningEffort,
           ...(request.output_contract === undefined
             ? {}
             : {
@@ -484,7 +536,7 @@ export class AppServerApprovalSession {
 
   async close(): Promise<void> {
     if (this.terminal) {
-      await this.cleanupPromise;
+      await this.cleanup();
       return;
     }
     const client = this.client;
@@ -495,6 +547,24 @@ export class AppServerApprovalSession {
     }
     this.fail("Managed Codex app-server session was cancelled");
     await this.cleanup();
+  }
+
+  onTerminalFailure(listener: (error: ArkTeamError) => void): () => void {
+    if (this.failure) {
+      const failure = this.failure;
+      queueMicrotask(() => {
+        try {
+          listener(failure);
+        } catch {
+          // A lifecycle observer must not prevent session cleanup.
+        }
+      });
+      return () => {};
+    }
+    this.terminalFailureListeners.add(listener);
+    return () => {
+      this.terminalFailureListeners.delete(listener);
+    };
   }
 
   private handleMessage(message: AppServerMessage): void {
@@ -721,8 +791,8 @@ export class AppServerApprovalSession {
       turn_id: this.requireTurnId(),
       role,
       agent_name: profile.agent_name,
-      model: profile.model,
-      model_reasoning_effort: profile.model_reasoning_effort,
+      model: this.requireSelectedModel(),
+      model_reasoning_effort: this.requireSelectedReasoningEffort(),
       sandbox_mode: profile.sandbox_mode,
       approval_policy: profile.approval_policy,
       final_report: this.finalReport,
@@ -809,6 +879,14 @@ export class AppServerApprovalSession {
     for (const waiter of this.updateWaiters.splice(0)) {
       waiter.reject(this.failure);
     }
+    for (const listener of this.terminalFailureListeners) {
+      try {
+        listener(this.failure);
+      } catch {
+        // A lifecycle observer must not prevent session cleanup.
+      }
+    }
+    this.terminalFailureListeners.clear();
   }
 
   private async closeAfterFailure(message: string, cause: unknown): Promise<never> {
@@ -861,6 +939,26 @@ export class AppServerApprovalSession {
     return this.role;
   }
 
+  private requireSelectedModel(): string {
+    if (!this.selectedModel) {
+      throw new ArkTeamError(
+        "AGENT_SESSION_PROTOCOL_ERROR",
+        "selected model is unavailable",
+      );
+    }
+    return this.selectedModel;
+  }
+
+  private requireSelectedReasoningEffort(): string {
+    if (!this.selectedReasoningEffort) {
+      throw new ArkTeamError(
+        "AGENT_SESSION_PROTOCOL_ERROR",
+        "selected reasoning effort is unavailable",
+      );
+    }
+    return this.selectedReasoningEffort;
+  }
+
   private requireWriterRole(): Exclude<ManagedRole, "pm"> {
     const role = this.requireRole();
     if (role === "pm") {
@@ -871,6 +969,83 @@ export class AppServerApprovalSession {
     }
     return role;
   }
+}
+
+interface SessionBinding {
+  model: string;
+  reasoningEffort: string;
+  modelProvider: string | null;
+}
+
+function resolveSessionBinding(
+  role: ManagedRole,
+  binding: ResolvedModelBindingV1 | undefined,
+  externalRuntime: ExternalAppServerRuntime | undefined,
+): SessionBinding {
+  const profile = managedRoleProfiles[role];
+  if (binding === undefined) {
+    if (externalRuntime !== undefined) {
+      throw new ArkTeamError(
+        "INVALID_INPUT",
+        "external app-server runtime requires an external model binding",
+      );
+    }
+    return {
+      model: profile.model,
+      reasoningEffort: profile.model_reasoning_effort,
+      modelProvider: null,
+    };
+  }
+
+  if (binding.kind === "native") {
+    if (externalRuntime !== undefined) {
+      throw new ArkTeamError(
+        "INVALID_INPUT",
+        "native model binding cannot use an external app-server runtime",
+      );
+    }
+    if (
+      binding.model !== profile.model ||
+      binding.requested_reasoning_effort !== profile.model_reasoning_effort ||
+      binding.effective_reasoning_effort !== profile.model_reasoning_effort
+    ) {
+      throw new ArkTeamError(
+        "INVALID_INPUT",
+        "native model binding does not match the managed role profile",
+      );
+    }
+    return {
+      model: binding.model,
+      reasoningEffort: binding.effective_reasoning_effort,
+      modelProvider: null,
+    };
+  }
+
+  if (role !== "worker") {
+    throw new ArkTeamError(
+      "INVALID_INPUT",
+      "external model bindings are supported only for worker sessions",
+    );
+  }
+  if (externalRuntime === undefined) {
+    throw new ArkTeamError(
+      "INVALID_INPUT",
+      "external model binding requires a prepared app-server runtime",
+    );
+  }
+  if (
+    externalRuntime.app_server_provider_id !== binding.app_server_provider_id
+  ) {
+    throw new ArkTeamError(
+      "INVALID_INPUT",
+      "external app-server runtime does not match the model binding",
+    );
+  }
+  return {
+    model: binding.model,
+    reasoningEffort: binding.effective_reasoning_effort,
+    modelProvider: binding.app_server_provider_id,
+  };
 }
 
 function messageTurnId(message: AppServerMessage): string | null {

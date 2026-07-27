@@ -411,6 +411,142 @@ test("TEST-506 cancels assignments and stops active sessions on run pause", asyn
   });
 });
 
+test("session cleanup survives launch and decision persistence failures", async () => {
+  await withSchedulerFixture(async ({ stateRoot, worktree }) => {
+    const store = deterministicStore(stateRoot);
+    const run = await store.createRun({
+      objective: "Close a session when its first update cannot be persisted",
+      project_path: worktree,
+    });
+    const session = new ScriptedSession([
+      completedUpdate("pl", "MUST_NOT_PERSIST"),
+    ]);
+    store.recordAssignmentUpdate = async () => {
+      throw new Error("simulated launch persistence failure");
+    };
+    const scheduler = new ManagedAssignmentScheduler(store, {
+      session_factory: () => session,
+    });
+
+    await assert.rejects(
+      scheduler.start({
+        run_id: run.run_id,
+        team_id: "team-a",
+        role: "pl",
+        assignment: "Close after launch persistence fails",
+        working_directory: worktree,
+      }),
+      (error: unknown) =>
+        error instanceof ArkTeamError &&
+        error.code === "AGENT_SESSION_FAILED",
+    );
+    assert.equal(session.close_count, 1);
+  });
+
+  await withSchedulerFixture(async ({ stateRoot, worktree }) => {
+    const store = deterministicStore(stateRoot);
+    const run = await store.createRun({
+      objective: "Close a session when its decision cannot be persisted",
+      project_path: worktree,
+    });
+    const session = new ScriptedSession([
+      waitingUpdate("pl", APPROVAL_ID),
+      completedUpdate("pl", "MUST_NOT_PERSIST"),
+    ]);
+    const scheduler = new ManagedAssignmentScheduler(store, {
+      session_factory: () => session,
+    });
+    const waiting = await scheduler.start({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Close after decision persistence fails",
+      working_directory: worktree,
+    });
+    store.recordAssignmentUpdate = async () => {
+      throw new Error("simulated decision persistence failure");
+    };
+
+    await assert.rejects(
+      scheduler.decide(
+        run.run_id,
+        waiting.assignment_id,
+        APPROVAL_ID,
+        "decline",
+      ),
+      (error: unknown) =>
+        error instanceof ArkTeamError &&
+        error.code === "AGENT_SESSION_FAILED",
+    );
+    assert.equal(session.close_count, 1);
+    assert.equal(scheduler.hasLiveSession(waiting.assignment_id), false);
+  });
+});
+
+test("cancel and stopRun close live sessions when stop persistence fails", async () => {
+  await withSchedulerFixture(async ({ stateRoot, worktree }) => {
+    const store = deterministicStore(stateRoot);
+    const run = await store.createRun({
+      objective: "Close a cancelled session despite persistence failure",
+      project_path: worktree,
+    });
+    const session = new ScriptedSession([
+      waitingUpdate("pl", APPROVAL_ID),
+    ]);
+    const scheduler = new ManagedAssignmentScheduler(store, {
+      session_factory: () => session,
+    });
+    const waiting = await scheduler.start({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Fail cancellation persistence",
+      working_directory: worktree,
+    });
+    store.stopAssignment = async () => {
+      throw new Error("simulated cancellation persistence failure");
+    };
+
+    await assert.rejects(
+      scheduler.cancel(run.run_id, waiting.assignment_id),
+      /simulated cancellation persistence failure/,
+    );
+    assert.equal(session.close_count, 1);
+    assert.equal(scheduler.hasLiveSession(waiting.assignment_id), false);
+  });
+
+  await withSchedulerFixture(async ({ stateRoot, worktree }) => {
+    const store = deterministicStore(stateRoot);
+    const run = await store.createRun({
+      objective: "Close run sessions despite persistence failure",
+      project_path: worktree,
+    });
+    const session = new ScriptedSession([
+      waitingUpdate("pl", APPROVAL_ID),
+    ]);
+    const scheduler = new ManagedAssignmentScheduler(store, {
+      session_factory: () => session,
+    });
+    const waiting = await scheduler.start({
+      run_id: run.run_id,
+      team_id: "team-a",
+      role: "pl",
+      assignment: "Fail run-stop persistence",
+      working_directory: worktree,
+    });
+    store.stopActiveAssignments = async () => {
+      throw new Error("simulated run-stop persistence failure");
+    };
+
+    await assert.rejects(
+      scheduler.stopRun(run.run_id, "paused"),
+      /simulated run-stop persistence failure/,
+    );
+    assert.equal(session.close_count, 1);
+    assert.equal(scheduler.hasLiveSession(waiting.assignment_id), false);
+  });
+});
+
 test("TEST-1301 resumes an orphaned approval in the persisted thread without applying it", async () => {
   await withSchedulerFixture(async ({ stateRoot, worktree }) => {
     const store = deterministicStore(stateRoot);

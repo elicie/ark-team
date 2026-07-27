@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import type {
   AssignmentListResult,
   AssignmentRecord,
@@ -11,6 +13,11 @@ import {
 } from "./approval-session.js";
 import { ArkTeamError } from "./errors.js";
 import { assertManagedWorkspace } from "./managed-session.js";
+import { assertExternalBindingCurrent } from "./provider-config.js";
+import {
+  ProviderBridge,
+  type ProviderBridgeOptions,
+} from "./provider-bridge.js";
 import {
   type CreateAssignmentInput,
   type CorrectAssignmentInput,
@@ -28,12 +35,15 @@ export interface ApprovalSessionHandle {
     approvalId: string,
     decision: ApprovalDecision,
   ): Promise<ApprovalSessionUpdate>;
+  armWaitingMonitor?(): void;
   close(): Promise<void>;
 }
 
 export interface ManagedAssignmentSchedulerOptions {
   session_factory?: (assignment: AssignmentRecord) => ApprovalSessionHandle;
   codex_path?: string;
+  provider_environment?: NodeJS.ProcessEnv;
+  provider_fetch?: typeof fetch;
 }
 
 export type RetryDecision = "retry_once" | "cancel_run";
@@ -50,6 +60,8 @@ export class ManagedAssignmentScheduler {
     | ((assignment: AssignmentRecord) => ApprovalSessionHandle)
     | null;
   private readonly codexPath: string;
+  private readonly providerEnvironment: NodeJS.ProcessEnv;
+  private readonly providerFetch: typeof fetch | undefined;
 
   constructor(
     private readonly store: RunStore,
@@ -60,6 +72,9 @@ export class ManagedAssignmentScheduler {
       options.codex_path ??
       (process.env.ARK_TEAM_CODEX_PATH?.trim() || undefined) ??
       "codex";
+    this.providerEnvironment =
+      options.provider_environment ?? process.env;
+    this.providerFetch = options.provider_fetch;
   }
 
   async start(input: CreateAssignmentInput): Promise<AssignmentRecord> {
@@ -67,6 +82,13 @@ export class ManagedAssignmentScheduler {
       sessionRole(input.role),
       input.working_directory,
     );
+    if (input.role === "worker") {
+      const run = await this.store.getRun(input.run_id);
+      await this.assertBindingCurrentOrPause(
+        input.run_id,
+        run.model_bindings.worker,
+      );
+    }
     const assignment = await this.store.createAssignment({
       ...input,
       working_directory: workingDirectory,
@@ -79,6 +101,10 @@ export class ManagedAssignmentScheduler {
     const current = await this.store.getAssignment(
       input.run_id,
       input.assignment_id,
+    );
+    await this.assertBindingCurrentOrPause(
+      input.run_id,
+      current.model_binding,
     );
     const workingDirectory = await assertManagedWorkspace(
       sessionRole(current.role),
@@ -99,6 +125,10 @@ export class ManagedAssignmentScheduler {
       input.run_id,
       input.assignment_id,
     );
+    await this.assertBindingCurrentOrPause(
+      input.run_id,
+      current.model_binding,
+    );
     const workingDirectory = await assertManagedWorkspace(
       sessionRole(current.role),
       current.working_directory,
@@ -114,6 +144,10 @@ export class ManagedAssignmentScheduler {
     const current = await this.store.getAssignment(
       input.run_id,
       input.assignment_id,
+    );
+    await this.assertBindingCurrentOrPause(
+      input.run_id,
+      current.model_binding,
     );
     const workingDirectory = await assertManagedWorkspace(
       sessionRole(current.role),
@@ -207,6 +241,10 @@ export class ManagedAssignmentScheduler {
         "approval_id is unknown or already resolved",
       );
     }
+    await this.assertBindingCurrentOrPause(
+      runId,
+      assignment.model_binding,
+    );
     const live = this.liveAssignments.get(assignmentId);
     if (!live || live.run_id !== runId) {
       throw new ArkTeamError(
@@ -215,16 +253,16 @@ export class ManagedAssignmentScheduler {
       );
     }
 
-    await this.store.recordAssignmentApprovalResolution(
-      runId,
-      assignmentId,
-      {
-        approval_id: approvalId,
-        decision,
-        source: "user",
-      },
-    );
     try {
+      await this.store.recordAssignmentApprovalResolution(
+        runId,
+        assignmentId,
+        {
+          approval_id: approvalId,
+          decision,
+          source: "user",
+        },
+      );
       const update = await live.session.decide(approvalId, decision);
       const persisted = await this.persistAndResolveRoutineApprovals(
         assignment,
@@ -232,11 +270,15 @@ export class ManagedAssignmentScheduler {
         update,
       );
       if (persisted.state !== "waiting_user") {
-        this.liveAssignments.delete(assignmentId);
+        this.deleteLiveAssignment(assignmentId, live.session);
+      } else {
+        live.session.armWaitingMonitor?.();
       }
       return persisted;
     } catch (error) {
-      this.liveAssignments.delete(assignmentId);
+      if (this.deleteLiveAssignment(assignmentId, live.session)) {
+        await closeSession(live.session);
+      }
       const normalized =
         error instanceof ArkTeamError && error.code === "INVALID_INPUT"
           ? sessionFailure(
@@ -291,6 +333,10 @@ export class ManagedAssignmentScheduler {
       );
       return this.store.getAssignment(runId, assignmentId);
     }
+    await this.assertBindingCurrentOrPause(
+      runId,
+      current.model_binding,
+    );
 
     if (current.session_id === null) {
       throw new ArkTeamError(
@@ -340,16 +386,21 @@ export class ManagedAssignmentScheduler {
         "Use the current retry_request_id to choose retry_once or cancel_run",
       );
     }
-    const live = this.liveAssignments.get(assignmentId);
-    this.liveAssignments.delete(assignmentId);
-    const assignment = await this.store.stopAssignment(
-      runId,
-      assignmentId,
-      "cancelled",
-      reason,
-    );
-    await closeSession(live?.session);
-    return assignment;
+    const candidate = this.liveAssignments.get(assignmentId);
+    const live = candidate?.run_id === runId ? candidate : undefined;
+    if (live) {
+      this.deleteLiveAssignment(assignmentId, live.session);
+    }
+    try {
+      return await this.store.stopAssignment(
+        runId,
+        assignmentId,
+        "cancelled",
+        reason,
+      );
+    } finally {
+      await closeSession(live?.session);
+    }
   }
 
   async stopRun(
@@ -357,22 +408,19 @@ export class ManagedAssignmentScheduler {
     state: "paused" | "cancelled",
     reason?: string,
   ): Promise<AssignmentRecord[]> {
-    const active = (
-      await this.store.listAssignments(runId, {
-        states: ["running", "waiting_user"],
-      })
-    ).assignments;
-    const sessions: ApprovalSessionHandle[] = [];
-    for (const assignment of active) {
-      const live = this.liveAssignments.get(assignment.assignment_id);
-      if (live?.run_id === runId) {
-        sessions.push(live.session);
-      }
-      this.liveAssignments.delete(assignment.assignment_id);
+    const live = [...this.liveAssignments.entries()].filter(
+      ([, assignment]) => assignment.run_id === runId,
+    );
+    for (const [assignmentId, assignment] of live) {
+      this.deleteLiveAssignment(assignmentId, assignment.session);
     }
-    const stopped = await this.store.stopActiveAssignments(runId, state, reason);
-    await Promise.all(sessions.map(async (session) => closeSession(session)));
-    return stopped;
+    try {
+      return await this.store.stopActiveAssignments(runId, state, reason);
+    } finally {
+      await Promise.all(
+        live.map(async ([, assignment]) => closeSession(assignment.session)),
+      );
+    }
   }
 
   hasLiveSession(assignmentId: string): boolean {
@@ -383,20 +431,82 @@ export class ManagedAssignmentScheduler {
     assignment: AssignmentRecord,
     resumeSessionId?: string,
   ): Promise<AssignmentRecord> {
+    await this.assertBindingCurrentOrPause(
+      assignment.run_id,
+      assignment.model_binding,
+    );
     let session: ApprovalSessionHandle;
+    let bridge: ProviderBridge | undefined;
     try {
       if (this.sessionFactory !== null) {
         session = this.sessionFactory(assignment);
       } else {
         const run = await this.store.getRun(assignment.run_id);
-        session = new AppServerApprovalSession({
+        const providerSensitiveEnvironmentNames =
+          await this.store.providerSensitiveEnvironmentNames(
+            run.model_bindings.worker,
+          );
+        if (assignment.model_binding.kind === "external") {
+          const bridgeOptions: ProviderBridgeOptions = {
+            binding: assignment.model_binding,
+            environment: this.providerEnvironment,
+            request_timeout_ms:
+              run.project_config.execution.agent_timeout_minutes *
+              60_000,
+            codex_home: path.join(
+              this.store.root_path,
+              assignment.run_id,
+              "external-codex-home",
+            ),
+            ...(this.providerFetch === undefined
+              ? {}
+              : { fetch_impl: this.providerFetch }),
+          };
+          bridge = await ProviderBridge.start(bridgeOptions);
+          await this.store.recordProviderBridgeStarted(
+            assignment.run_id,
+            assignment.assignment_id,
+            bridge.diagnostics.port,
+          );
+        }
+        const appServerSession = new AppServerApprovalSession({
           codex_path: this.codexPath,
           timeout_ms:
             run.project_config.execution.agent_timeout_minutes * 60_000,
+          ...(providerSensitiveEnvironmentNames.length === 0
+            ? {}
+            : {
+                provider_sensitive_env_names:
+                  providerSensitiveEnvironmentNames,
+              }),
+          ...(bridge === undefined
+            ? {}
+            : { external_runtime: bridge.external_runtime }),
         });
+        session =
+          bridge === undefined
+            ? appServerSession
+            : new ProviderBridgeSession(
+                appServerSession,
+                bridge,
+                async (failedSession, error) =>
+                  this.handleWaitingSessionFailure(
+                    assignment,
+                    failedSession,
+                    error,
+                  ),
+              );
       }
     } catch (error) {
+      await bridge?.close();
+      if (isProviderDrift(error)) {
+        await this.pauseForProviderDrift(assignment.run_id);
+        throw error;
+      }
       await this.recordSessionFailure(assignment, error);
+      if (isExternalProviderError(error)) {
+        throw error;
+      }
       throw sessionFailure("Unable to create a managed assignment session", error);
     }
     this.liveAssignments.set(assignment.assignment_id, {
@@ -415,6 +525,7 @@ export class ManagedAssignmentScheduler {
         ...(assignment.output_contract === null
           ? {}
           : { output_contract: assignment.output_contract }),
+        model_binding: assignment.model_binding,
       });
       const persisted = await this.persistAndResolveRoutineApprovals(
         assignment,
@@ -422,11 +533,19 @@ export class ManagedAssignmentScheduler {
         update,
       );
       if (persisted.state !== "waiting_user") {
-        this.liveAssignments.delete(assignment.assignment_id);
+        this.deleteLiveAssignment(assignment.assignment_id, session);
+      } else {
+        session.armWaitingMonitor?.();
       }
       return persisted;
     } catch (error) {
-      this.liveAssignments.delete(assignment.assignment_id);
+      if (this.deleteLiveAssignment(assignment.assignment_id, session)) {
+        await closeSession(session);
+      }
+      if (isProviderDrift(error)) {
+        await this.pauseForProviderDrift(assignment.run_id);
+        throw error;
+      }
       await this.recordSessionFailure(assignment, error);
       throw normalizeSessionFailure(error);
     }
@@ -478,6 +597,37 @@ export class ManagedAssignmentScheduler {
     return persisted;
   }
 
+  private deleteLiveAssignment(
+    assignmentId: string,
+    session: ApprovalSessionHandle,
+  ): boolean {
+    if (this.liveAssignments.get(assignmentId)?.session === session) {
+      this.liveAssignments.delete(assignmentId);
+      return true;
+    }
+    return false;
+  }
+
+  private async handleWaitingSessionFailure(
+    assignment: AssignmentRecord,
+    session: ApprovalSessionHandle,
+    error: ArkTeamError,
+  ): Promise<void> {
+    const live = this.liveAssignments.get(assignment.assignment_id);
+    if (
+      live?.run_id !== assignment.run_id ||
+      live.session !== session
+    ) {
+      return;
+    }
+    this.liveAssignments.delete(assignment.assignment_id);
+    await closeSession(session);
+    await this.recordSessionFailure(
+      assignment,
+      normalizeSessionFailure(error),
+    );
+  }
+
   private async recordSessionFailure(
     assignment: AssignmentRecord,
     error: unknown,
@@ -500,7 +650,136 @@ export class ManagedAssignmentScheduler {
       assignment.run_id,
       assignment.assignment_id,
       message,
+      error instanceof ArkTeamError ? error.code : undefined,
     );
+  }
+
+  private async assertBindingCurrentOrPause(
+    runId: string,
+    binding: AssignmentRecord["model_binding"],
+  ): Promise<void> {
+    if (binding.kind === "native") {
+      return;
+    }
+    try {
+      await assertExternalBindingCurrent(binding, {
+        environment: this.providerEnvironment,
+      });
+    } catch (error) {
+      if (
+        isProviderDrift(error)
+      ) {
+        await this.pauseForProviderDrift(runId);
+      }
+      throw error;
+    }
+  }
+
+  private async pauseForProviderDrift(runId: string): Promise<void> {
+    const reason =
+      "External provider configuration changed; the run was paused before continuing";
+    await this.stopRun(runId, "paused", reason);
+    const run = await this.store.getRun(runId);
+    if (run.state !== "paused") {
+      await this.store.pauseRun(runId, reason);
+    }
+  }
+}
+
+class ProviderBridgeSession implements ApprovalSessionHandle {
+  private closed = false;
+  private waitingMonitorArmed = false;
+  private pendingTerminalFailure: ArkTeamError | null = null;
+  private removeTerminalFailureListener: (() => void) | null;
+
+  constructor(
+    private readonly session: AppServerApprovalSession,
+    private readonly bridge: ProviderBridge,
+    private readonly onWaitingFailure: (
+      session: ProviderBridgeSession,
+      error: ArkTeamError,
+    ) => Promise<void>,
+  ) {
+    this.removeTerminalFailureListener = this.session.onTerminalFailure(
+      (error) => {
+        this.pendingTerminalFailure =
+          this.bridge.currentTerminalError() ?? error;
+        this.dispatchWaitingFailure();
+      },
+    );
+  }
+
+  async start(
+    request: ApprovalSessionRequest,
+  ): Promise<ApprovalSessionUpdate> {
+    return this.run(() => this.session.start(request));
+  }
+
+  async decide(
+    approvalId: string,
+    decision: ApprovalDecision,
+  ): Promise<ApprovalSessionUpdate> {
+    return this.run(() => this.session.decide(approvalId, decision));
+  }
+
+  armWaitingMonitor(): void {
+    if (this.closed) {
+      return;
+    }
+    this.waitingMonitorArmed = true;
+    this.dispatchWaitingFailure();
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.waitingMonitorArmed = false;
+    this.pendingTerminalFailure = null;
+    this.removeTerminalFailureListener?.();
+    this.removeTerminalFailureListener = null;
+    try {
+      await this.session.close();
+    } finally {
+      await this.bridge.close();
+    }
+  }
+
+  private async run(
+    operation: () => Promise<ApprovalSessionUpdate>,
+  ): Promise<ApprovalSessionUpdate> {
+    this.waitingMonitorArmed = false;
+    this.pendingTerminalFailure = null;
+    try {
+      const update = await operation();
+      if (update.status === "completed") {
+        await this.close();
+      }
+      return update;
+    } catch (error) {
+      const terminal = this.bridge.currentTerminalError();
+      await this.close();
+      throw terminal ?? error;
+    }
+  }
+
+  private dispatchWaitingFailure(): void {
+    if (
+      this.closed ||
+      !this.waitingMonitorArmed ||
+      this.pendingTerminalFailure === null
+    ) {
+      return;
+    }
+    const error = this.pendingTerminalFailure;
+    this.pendingTerminalFailure = null;
+    this.waitingMonitorArmed = false;
+    try {
+      void this.onWaitingFailure(this, error).catch(() => {});
+    } catch {
+      // Detached lifecycle handling must never surface an unhandled error.
+    }
   }
 }
 
@@ -539,6 +818,23 @@ function normalizeSessionFailure(error: unknown): ArkTeamError {
     return error;
   }
   return sessionFailure("Managed assignment session failed", error);
+}
+
+function isProviderDrift(error: unknown): error is ArkTeamError {
+  return (
+    error instanceof ArkTeamError &&
+    error.code === "PROVIDER_CONFIG_DRIFT"
+  );
+}
+
+function isExternalProviderError(
+  error: unknown,
+): error is ArkTeamError {
+  return (
+    error instanceof ArkTeamError &&
+    (error.code.startsWith("PROVIDER_") ||
+      error.code.startsWith("ADAPTER_"))
+  );
 }
 
 function sessionFailure(message: string, cause: unknown): ArkTeamError {

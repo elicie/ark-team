@@ -98,6 +98,7 @@ export interface ManagedSessionRequest {
   resume_session_id?: string;
   output_contract?: ManagedOutputContract;
   timeout_ms?: number;
+  provider_sensitive_env_names?: readonly string[];
   signal?: AbortSignal;
 }
 
@@ -230,12 +231,19 @@ export function buildManagedPrompt(
   role: ManagedRole,
   assignment: string,
   outputContract?: ManagedOutputContract,
+  modelContract: {
+    model: string;
+    reasoning_effort: string;
+  } = {
+    model: managedRoleProfiles[role].model,
+    reasoning_effort: managedRoleProfiles[role].model_reasoning_effort,
+  },
 ): string {
   const profile = managedRoleProfiles[role];
   return [
     "<ark_team_managed_role>",
     `Role: ${profile.agent_name}`,
-    `Model contract: ${profile.model} / ${profile.model_reasoning_effort}`,
+    `Model contract: ${modelContract.model} / ${modelContract.reasoning_effort}`,
     `Permission contract: ${profile.sandbox_mode} / ${profile.approval_policy}`,
     profile.instructions,
     outputContract === undefined

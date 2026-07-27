@@ -14,6 +14,11 @@ import {
   projectConfigSchema,
 } from "./project-config.js";
 import {
+  createNativeModelBinding,
+  NATIVE_WORKER_MODEL_BINDING,
+  resolvedModelBindingV1Schema,
+} from "./provider-types.js";
+import {
   sha256CanonicalJson,
   verificationLinkedRecordSchema,
   verificationRecordMatchesSnapshot,
@@ -65,6 +70,13 @@ export type TeamState = z.infer<typeof teamStateSchema>;
 
 export const assignmentRoleSchema = z.enum(["pl", "worker", "integration_pl"]);
 export type AssignmentRole = z.infer<typeof assignmentRoleSchema>;
+
+function legacyNativeAssignmentBinding(role: AssignmentRole) {
+  return role === "worker"
+    ? NATIVE_WORKER_MODEL_BINDING
+    : createNativeModelBinding("gpt-5.6-terra", "xhigh");
+}
+
 export const eventAgentRoleSchema = z.enum([
   "pm",
   "pl",
@@ -180,7 +192,15 @@ export const assignmentRecordSchema = z
     turn_count: z.number().int().positive().default(1),
     session_attempt_count: z.number().int().positive().default(1),
     correction_count: z.number().int().nonnegative().default(0),
+    model_binding: resolvedModelBindingV1Schema.optional(),
   })
+  .strict()
+  .transform((assignment) => ({
+    ...assignment,
+    model_binding:
+      assignment.model_binding ??
+      legacyNativeAssignmentBinding(assignment.role),
+  }))
   .superRefine((assignment, context) => {
     if (
       assignment.role === "pl" &&
@@ -516,7 +536,16 @@ export const runRecordSchema = z
       .array(verificationLinkedRecordSchema)
       .max(10_000)
       .default([]),
+    model_bindings: z
+      .object({
+        worker: resolvedModelBindingV1Schema,
+      })
+      .strict()
+      .default({
+        worker: NATIVE_WORKER_MODEL_BINDING,
+      }),
   })
+  .strict()
   .superRefine((run, context) => {
     if (
       run.project_config_sha256 !== null &&
@@ -740,11 +769,12 @@ export const runRecordSchema = z
 
 export type RunRecord = z.infer<typeof runRecordSchema>;
 
-export const runEventSchema = z.object({
-  schema_version: z.literal(1),
-  sequence: z.number().int().positive(),
-  event_id: z.string().min(1),
-  event_type: z.enum([
+export const runEventSchema = z
+  .object({
+    schema_version: z.literal(1),
+    sequence: z.number().int().positive(),
+    event_id: z.string().min(1),
+    event_type: z.enum([
     "run.created",
     "run.paused",
     "run.resumed",
@@ -783,29 +813,53 @@ export const runEventSchema = z.object({
     "assignment.failed",
     "assignment.paused",
     "assignment.cancelled",
-  ]),
-  timestamp: z.string().min(1),
-  state: runStateSchema,
-  message: z.string().min(1).optional(),
-  assignment_id: z.string().regex(ASSIGNMENT_ID_PATTERN).optional(),
-  team_id: z.string().regex(TEAM_ID_PATTERN).optional(),
-  agent_role: eventAgentRoleSchema.optional(),
-  approval_id: z.string().uuid().optional(),
-  retry_request_id: z.string().uuid().optional(),
-  retry_kind: retryRequestKindSchema.optional(),
-  retry_decision: z.enum(["retry_once", "cancel_run"]).optional(),
-  remote_request_id: z.string().uuid().optional(),
-  remote_decision: z.enum(["approve_once", "cancel_run"]).optional(),
-  recovery_decision: z.enum(["resume_safely", "cancel_run"]).optional(),
-  session_attempt_count: z.number().int().positive().optional(),
-  correction_count: z.number().int().nonnegative().optional(),
-  report_target: reportTargetSchema.optional(),
-  approval_decision: z
-    .enum(["approve_once", "approve_session", "decline", "cancel"])
-    .optional(),
-  approval_source: z.enum(["user", "routine_policy"]).optional(),
-  usage: usageSchema.optional(),
-});
+    "assignment.provider_selected",
+    "assignment.provider_bridge_started",
+    ]),
+    timestamp: z.string().min(1),
+    state: runStateSchema,
+    message: z.string().min(1).optional(),
+    assignment_id: z.string().regex(ASSIGNMENT_ID_PATTERN).optional(),
+    team_id: z.string().regex(TEAM_ID_PATTERN).optional(),
+    agent_role: eventAgentRoleSchema.optional(),
+    approval_id: z.string().uuid().optional(),
+    retry_request_id: z.string().uuid().optional(),
+    retry_kind: retryRequestKindSchema.optional(),
+    retry_decision: z.enum(["retry_once", "cancel_run"]).optional(),
+    remote_request_id: z.string().uuid().optional(),
+    remote_decision: z.enum(["approve_once", "cancel_run"]).optional(),
+    recovery_decision: z.enum(["resume_safely", "cancel_run"]).optional(),
+    session_attempt_count: z.number().int().positive().optional(),
+    correction_count: z.number().int().nonnegative().optional(),
+    report_target: reportTargetSchema.optional(),
+    approval_decision: z
+      .enum(["approve_once", "approve_session", "decline", "cancel"])
+      .optional(),
+    approval_source: z.enum(["user", "routine_policy"]).optional(),
+    usage: usageSchema.optional(),
+    provider_id: z.string().min(1).max(80).optional(),
+    app_server_provider_id: z.string().min(1).max(80).optional(),
+    adapter_id: z.string().min(1).max(80).optional(),
+    adapter_api_version: z.literal(1).optional(),
+    adapter_sha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .nullable()
+      .optional(),
+    provider_config_sha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    model: z.string().min(1).max(256).optional(),
+    requested_reasoning_effort: z.string().min(1).max(64).optional(),
+    effective_reasoning_effort: z.string().min(1).max(64).optional(),
+    structured_output_mode: z
+      .enum(["native_json_schema", "validated_json"])
+      .optional(),
+    bridge_port: z.number().int().min(10001).max(65535).optional(),
+    provider_error_code: z.string().min(1).max(80).optional(),
+  })
+  .strict();
 
 export type RunEvent = z.infer<typeof runEventSchema>;
 
@@ -854,6 +908,16 @@ export const persistedRunSchema = z
         });
       }
       assignmentIds.add(assignment.assignment_id);
+      if (
+        assignment.role === "worker" &&
+        sha256CanonicalJson(assignment.model_binding) !==
+          sha256CanonicalJson(value.run.model_bindings.worker)
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: `worker assignment ${assignment.assignment_id} model binding does not match the run snapshot`,
+        });
+      }
     }
 
     const teamIds = new Set<string>();

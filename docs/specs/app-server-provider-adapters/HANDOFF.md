@@ -1,11 +1,12 @@
 # Implementation Handoff — App-Server Provider Adapters
 
-- Package: `ark-team-provider-adapters-v1.0.0`
+- Package: `ark-team-provider-adapters-v1.1.0`
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
 - Reference boundary: `NONE`
 - Approved slices: `SLICE-001`, `SLICE-002`, `SLICE-003`, `SLICE-004`
 - Exact next slice: `SLICE-001`
 - Normative contract: [SPEC.md](./SPEC.md)
+- Supersedes: `ark-team-provider-adapters-v1.0.0`
 
 ## 1. 구현 순서
 
@@ -26,7 +27,13 @@ delta가 필요하다.
 - Commit: `50531832a57e3fd0dae093b7ad0b51197e668045`
 - Tree: `de77e16a2c257456721bd44fc260f6b90afd2af6`
 - Capture: clean before this spec package was added
-- Expected baseline delta: this directory의 `SPEC.md`, `HANDOFF.md`, `STATUS.md`
+- Delta application observation:
+  - Git HEAD:
+    `150d81a4ebe97ce0aeb2046f8f1461a73fa91742`
+  - worktree에는 사용자가 승인한 기본 state root 변경과 이 spec delta가
+    존재한다.
+  - 구현자는 실제 worktree baseline을 다시 기록하고 해당 변경을 되돌리지
+    않는다.
 
 ### OpenCodex reference
 
@@ -78,6 +85,8 @@ output validation이 그대로 유지돼야 한다.
 - `plugins/ark-team/runtime/src/provider-config.ts`
   - `ARK_TEAM_PROVIDER_CONFIG`
   - strict TOML/Zod schema
+  - mutually exclusive `inline_key`, `env_key`, `none`
+  - owner-only inline-key catalog permission 검사
   - redacted canonical hash
 - `plugins/ark-team/runtime/src/provider-types.ts`
   - model binding, capabilities, normalized request/event, errors
@@ -86,13 +95,14 @@ output validation이 그대로 유지돼야 한다.
 - `plugins/ark-team/runtime/src/provider-bridge.ts`
   - authenticated `127.0.0.1`, port >=10001
   - Responses route와 upstream dispatch
+  - request-time inline/environment credential resolution
 - `plugins/ark-team/runtime/src/adapters/openai-chat.ts`
   - pinned OpenCodex-derived minimal adapter
   - `text.format` 보완
 - `plugins/ark-team/runtime/src/app-server-client.ts`
   - safe argv model provider injection
   - child-only bridge token environment
-  - external isolated `CODEX_HOME`
+  - `~/.ark-team/runs/<run-id>` 아래 external isolated `CODEX_HOME`
 - `plugins/ark-team/runtime/src/approval-session.ts`
   - binding input
   - `modelProvider` start/resume와 response validation
@@ -113,10 +123,10 @@ boundary와 behavior는 바꾸지 않는다.
 SLICE-001:
 
 - Requirements: `REQ-001`, `REQ-003`–`REQ-007`, `REQ-009`–`REQ-012`,
-  `REQ-015`, `REQ-008`의 `builtin:openai-chat` 부분
-- Acceptance: `AC-001`, `AC-003`–`AC-007`, `AC-009`–`AC-012`, `AC-015`
+  `REQ-013`, `REQ-015`, `REQ-008`의 `builtin:openai-chat` 부분
+- Acceptance: `AC-001`, `AC-003`–`AC-007`, `AC-009`–`AC-013`, `AC-015`
 - Tests: `TEST-001`, `TEST-003`–`TEST-007`, `TEST-009`–`TEST-012`,
-  `TEST-015`
+  `TEST-013`, `TEST-015`
 
 하나라도 닫히지 않으면 slice를 완료로 보고하지 않는다.
 
@@ -134,6 +144,7 @@ SLICE-001:
 - current project config rejects unknown/secret-bearing fields.
 - current worker structured reports are validated after the turn.
 - current external provider retry budget is three and Luna fallback is false.
+- managed runtime의 기본 state root는 `~/.ark-team/runs`이다.
 
 ## 6. Verified commands
 
@@ -166,11 +177,18 @@ Default test는 real provider나 paid subscription을 호출하면 안 된다.
 - Bridge port는 10001 이상이며 3000을 사용하지 않는다.
 - app-server provider config는 safe argv로 전달하고 shell command를 만들지
   않는다.
-- upstream key는 provider catalog, argv, child env, state, log에 넣지 않는다.
-  `api_key_env`가 가리키는 parent process value를 bridge가 request 시점에만
-  읽는다.
+- inline upstream key는 owner-only provider catalog에만 저장할 수 있다.
+  environment key 값은 parent process environment에만 둔다.
+- 두 credential 방식 모두 raw key를 safe app-server config, canonical hash,
+  binding, state, event, error, log, argv, app-server child environment에
+  복제하지 않는다. bridge가 request 시점에만 선택된 credential을 읽는다.
+- inline key가 있는 catalog에 대해 파일이 current-user regular file이
+  아니거나, 파일에 group/other permission bit가 있거나, catalog directory가
+  owner-only가 아니면 `PROVIDER_CONFIG_INSECURE_PERMISSIONS`로 실행 전
+  실패한다. request마다 permission을 다시 확인하고 inline key를 다시 읽는다.
 - app-server child에는 high-entropy bridge token만 전달한다.
-- external child의 `CODEX_HOME`은 run-specific Ark state 아래에 둔다.
+- external child의 `CODEX_HOME` 기본값은
+  `~/.ark-team/runs/<run-id>/external-codex-home`이다.
 - custom adapter module은 project root 밖 absolute realpath, exact SHA-256,
   API version을 import 전에 검사한다.
 - custom adapter는 trusted code이며 sandbox로 표현하지 않는다.
@@ -180,12 +198,19 @@ Default test는 real provider나 paid subscription을 호출하면 안 된다.
 - `.codex/team-orchestrator.toml`의 `version = 1`과 native model literal을
   변경하지 않는다.
 - provider definitions와 credentials를 project config에 넣지 않는다.
+  inline key는 user-owned provider catalog에서만 허용한다.
+- 기존 `env_key` catalog는 그대로 유효하며 `inline_key`로 자동 변환하지
+  않는다.
 - old assignment에 binding이 없으면 role의 native binding만 복원한다.
-- external run resume는 provider config와 adapter hash가 같을 때만 허용한다.
+- external run resume는 redacted provider config와 adapter hash가 같을 때만
+  허용한다. inline key 값만 회전하면 drift로 보지 않고 다음 request부터
+  현재 값을 사용하며, `auth_kind`나 non-secret config 변경은 drift이다.
 - native Luna path의 user-level auth/state behavior는 이번 slice에서
   migration하지 않는다.
 - external path는 user `~/.codex/config.toml`을 읽거나 쓰는 provider source로
   사용하지 않는다.
+- 기존 `~/.codex/team-orchestrator/runs` record는 자동 이동하거나 삭제하지
+  않는다.
 
 ## 9. OpenCodex porting warnings
 
@@ -205,9 +230,11 @@ Z.AI Coding Plan의 current public 문서는 지원 도구 밖의 subscription �
 SLICE-001 검증에 Coding Plan credential을 사용하지 않는다.
 
 Z.AI provider를 기술적으로 설정하는 offline fixture는 `policy = "blocked"`로
-허용하지만 live activation은 `PROVIDER_POLICY_BLOCKED`여야 한다. 일반 API
-계약 또는 provider의 별도 서면 허용이 확인되면 `SLICE-005` spec delta를
-요청한다.
+허용하지만 Coding Plan credential의 live activation은
+`PROVIDER_POLICY_BLOCKED`여야 한다. 일반 Open Platform API key billing
+endpoint는 Coding Plan endpoint와 별도이며 generic `openai-chat` 계약으로
+표현할 수 있지만, 실제 유료 smoke test는 사용자의 명시적 승인 없이는
+실행하지 않는다.
 
 ## 11. Rollback
 
@@ -230,6 +257,8 @@ Z.AI provider를 기술적으로 설정하는 offline fixture는 `policy = "bloc
 - SHA-256 검증이 custom adapter를 sandbox한다고 가정하지 않는다.
 - Codex SDK thread options가 per-thread provider를 지원한다고 가정하지 않는다.
 - provider failure 시 Luna가 안전한 fallback이라고 가정하지 않는다.
+- catalog가 owner-only라는 사실만으로 plaintext key가 version control,
+  backup, 동기화 도구에서 자동 제외된다고 가정하지 않는다.
 
 ## 13. Spec delta 반환 형식
 

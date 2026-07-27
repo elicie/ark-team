@@ -87,9 +87,152 @@ plugins/ark-team/
 - `ark_team_assignment_retry_decide`
 - `ark_team_assignment_cancel`
 
-실행 정보는 기본적으로 `~/.codex/team-orchestrator/runs` 아래에 원자적
+실행 정보는 기본적으로 `~/.ark-team/runs` 아래에 원자적
 JSON 레코드로 저장됩니다. 다른 위치를 사용하려면 Codex를 시작하기 전에
 절대 경로인 `ARK_TEAM_STATE_ROOT` 환경 변수를 설정합니다.
+
+## 외부 worker provider 사용법
+
+Ark Team은 worker만 외부 OpenAI Chat 호환 provider로 명시적으로 교체할
+수 있습니다. PM과 PL은 기존 Codex 모델을 사용합니다. 외부 provider를
+선택하지 않으면 worker도 기존 Luna/xhigh를 그대로 사용합니다.
+
+### 1. Provider catalog 준비
+
+Provider 설정은 프로젝트 저장소가 아니라 사용자 소유의
+`~/.ark-team/catalogs/providers-v1.toml`에 두는 것을 권장합니다.
+`inline_key`를 사용하면 API key가 평문으로 저장되므로 catalog 디렉터리는
+`0700`, 파일은 `0600` 권한이어야 합니다.
+
+```sh
+mkdir -p ~/.ark-team/catalogs
+chmod 700 ~/.ark-team ~/.ark-team/catalogs
+```
+
+아래 내용을 `~/.ark-team/catalogs/providers-v1.toml`에 저장한 뒤 파일
+권한을 설정합니다.
+
+```sh
+chmod 600 ~/.ark-team/catalogs/providers-v1.toml
+```
+
+이 파일은 Git, 동기화 디렉터리, 공개 백업에 포함하지 마십시오.
+
+Z.AI GLM Coding Plan에서 `glm-5.2`를 사용하는 `inline_key` 예시는 다음과
+같습니다.
+
+```toml
+version = 1
+
+[providers.zai_open_platform]
+adapter = "builtin:openai-chat"
+base_url = "https://api.z.ai/api/coding/paas/v4/"
+auth_kind = "inline_key"
+api_key = "여기에-Z.AI-API-key-입력"
+structured_output_mode = "validated_json"
+policy = "standard"
+allowed_models = ["glm-5.2"]
+
+[providers.zai_open_platform.reasoning_effort_map]
+xhigh = "max"
+```
+
+`policy = "standard"`는 실제 호출을 허용합니다. `policy = "blocked"`이면
+API key와 endpoint가 올바르더라도 네트워크 요청 전에
+`PROVIDER_POLICY_BLOCKED`로 중단합니다.
+
+API key를 catalog에 직접 넣지 않으려면 같은 provider에서 다음 두 줄을
+사용합니다.
+
+```toml
+auth_kind = "env_key"
+api_key_env = "ZAI_API_KEY"
+```
+
+이 경우 Codex를 시작하기 전에 환경 변수를 설정합니다.
+
+```sh
+export ZAI_API_KEY="여기에-Z.AI-API-key-입력"
+```
+
+하나의 catalog에 여러 `[providers.<provider-id>]` 항목을 함께 둘 수
+있습니다. 실행할 때 지정한 provider만 선택되며, 다른 provider 설정을
+모두 채울 필요는 없습니다. 현재 구현된 adapter는
+`builtin:openai-chat`입니다.
+
+### 2. Codex에 catalog 경로 전달
+
+Codex를 시작하기 전에 catalog의 절대 경로를 설정합니다.
+
+```sh
+export ARK_TEAM_PROVIDER_CONFIG="$HOME/.ark-team/catalogs/providers-v1.toml"
+```
+
+설치된 plugin manifest는 `ARK_TEAM_PROVIDER_CONFIG`와 `ZAI_API_KEY`를 MCP
+서버에 전달합니다. 다른 이름의 `api_key_env`를 사용한다면
+`plugins/ark-team/.mcp.json`의 `env_vars`에도 그 이름을 추가해야 합니다.
+환경 변수를 변경하거나 plugin을 업데이트한 뒤에는 새 Codex 세션을
+시작합니다.
+
+### 3. 외부 worker로 실행
+
+일반적인 전체 실행에는 `ark_team_execute`를 사용합니다. 입력의
+`model_overrides.worker`에 catalog의 provider ID, 실제 model ID, 요청할
+reasoning effort를 지정합니다.
+
+```json
+{
+  "objective": "요청한 기능을 구현하고 검증한다",
+  "project_path": "/absolute/path/to/project",
+  "model_overrides": {
+    "worker": {
+      "provider": "zai_open_platform",
+      "model": "glm-5.2",
+      "reasoning_effort": "xhigh"
+    }
+  }
+}
+```
+
+수동으로 계획을 적용하거나 복구 흐름을 제어할 때는 같은
+`model_overrides`를 `ark_team_start`에 전달합니다. 기존 실행 도중
+provider를 바꾸지는 않으며, 선택 결과는 run과 worker assignment에
+영속화됩니다.
+
+Codex 대화에서는 다음처럼 요청할 수 있습니다.
+
+```text
+$ark-team 이 프로젝트에서 요청한 작업을 실행해줘.
+worker는 provider zai_open_platform, model glm-5.2,
+reasoning_effort xhigh를 사용해.
+```
+
+### 4. 선택 결과 확인
+
+`ark_team_status` 또는 `ark_team_assignment_status`에서 다음 항목을
+확인합니다.
+
+```json
+{
+  "kind": "external",
+  "provider_id": "zai_open_platform",
+  "model": "glm-5.2",
+  "requested_reasoning_effort": "xhigh",
+  "effective_reasoning_effort": "max"
+}
+```
+
+API key 자체는 상태, 로그, binding, argv 또는 app-server child 환경에
+저장되지 않습니다. 외부 worker는 인증된 `127.0.0.1` loopback bridge와
+run별 격리된 `CODEX_HOME`을 사용합니다. 실패하면 같은 provider binding으로
+최대 세 번 재시도하며 Luna로 자동 전환하지 않습니다.
+
+`inline_key`의 key 값만 교체하면 다음 요청부터 새 값을 읽습니다. 반면
+endpoint, 인증 방식, model mapping 같은 비밀이 아닌 설정을 실행 도중
+바꾸면 기존 binding과 달라지므로 해당 실행은 drift로 중단됩니다.
+
+자세한 catalog schema와 오류 조건은
+`plugins/ark-team/skills/ark-team/references/configuration.md`를 참고합니다.
 
 런타임은 실행을 생성할 때 선택한 프로젝트의
 `.codex/team-orchestrator.toml`을 엄격하게 불러오고, 문서화된 기본값을
@@ -406,9 +549,10 @@ fast-forward를 수행한 뒤, 최종 인수를 위해 PM을 재개합니다. �
 브랜치를 보존한 채 검증된 연결 worktree를 정리합니다. 영속화된 승인
 대기는 컨트롤러가 재시작된 뒤 같은 스레드에서 명시적으로 복구할 수
 있으며, 사라진 승인을 새 턴으로 넘기지 않습니다. 명시적인 외부
-provider 및 Git 이외의 adapter를 추가하려면 다음 런타임 구현 단위가
-여전히 필요합니다. 현재 제어 평면은 아직 남아 있는 해당 보장을
-제공한다고 주장하지 않습니다.
+worker provider는 `builtin:openai-chat` adapter와 strict catalog,
+loopback bridge를 통해 지원합니다. Anthropic, Google,
+OpenAI Responses 및 custom adapter를 실제 실행에 추가하려면 후속
+런타임 구현 단위가 필요합니다.
 
 활성화된 Git 연결 worktree/Sol → Terra → Luna 오케스트레이션 목표는
 처음부터 끝까지 구현되었으며 전역 설치할 수 있습니다. 결정론적

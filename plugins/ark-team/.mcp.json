@@ -9,7 +9,9 @@
       "env_vars": [
         "ARK_TEAM_STATE_ROOT",
         "ARK_TEAM_WORKTREE_ROOT",
-        "ARK_TEAM_CODEX_PATH"
+        "ARK_TEAM_CODEX_PATH",
+        "ARK_TEAM_PROVIDER_CONFIG",
+        "ZAI_API_KEY"
       ]
     }
   }

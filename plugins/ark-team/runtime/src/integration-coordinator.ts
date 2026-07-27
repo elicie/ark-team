@@ -368,6 +368,10 @@ export class IntegrationCoordinator {
           assignment.structured_report?.kind === "pl_report",
       )
       .map((assignment) => assignment.structured_report);
+    const providerSensitiveEnvironmentNames =
+      await this.store.providerSensitiveEnvironmentNames(
+        run.model_bindings.worker,
+      );
     const result = await this.pmLauncher.run({
       role: "pm",
       assignment: [
@@ -384,6 +388,12 @@ export class IntegrationCoordinator {
       resume_session_id: pmSessionId,
       output_contract: "pm_report",
       timeout_ms: run.project_config.execution.agent_timeout_minutes * 60_000,
+      ...(providerSensitiveEnvironmentNames.length === 0
+        ? {}
+        : {
+            provider_sensitive_env_names:
+              providerSensitiveEnvironmentNames,
+          }),
     });
     if (
       result.session_id !== pmSessionId ||

@@ -56,7 +56,7 @@ cleanup_verified_worktrees = true
 require_approval_for_remote_actions = true
 
 [logging]
-root = "~/.codex/team-orchestrator/runs"
+root = "~/.ark-team/runs"
 retention_days = 30
 record_usage = true
 record_private_reasoning = false
@@ -96,6 +96,43 @@ root; project configuration never relocates an already running MCP server or
 stores credentials.
 
 ## Execution backends
+
+### External worker provider
+
+`ark_team_start` and `ark_team_execute` accept one optional, explicit worker
+override:
+
+```json
+{
+  "model_overrides": {
+    "worker": {
+      "provider": "company_ai",
+      "model": "company-model",
+      "reasoning_effort": "xhigh"
+    }
+  }
+}
+```
+
+Set `ARK_TEAM_PROVIDER_CONFIG` to the absolute path of an Ark-owned version-1
+provider catalog before starting Codex. The first implemented adapter is
+`builtin:openai-chat`; it supports `inline_key`, `env_key`, and `none`
+authentication. A catalog containing an inline key and its containing
+directory must both be owned by the current user with no group/other
+permission bits (normally directory `0700`, file `0600`).
+
+The bundled plugin MCP manifest forwards `ARK_TEAM_PROVIDER_CONFIG` and the
+sample Z.AI `ZAI_API_KEY` name. If an `env_key` provider uses another
+`api_key_env` name, add that name to the MCP server's environment forwarding
+allowlist before starting Codex. `inline_key` does not require a separate key
+environment variable.
+
+The override is never implicit. Omitting it keeps the native Luna/xhigh worker.
+External assignments use an authenticated loopback bridge and an isolated
+Ark-owned `CODEX_HOME`; they do not write provider settings to the user's
+Codex configuration. Non-secret catalog drift pauses continuation, while an
+inline key-only rotation is picked up on the next request. External failures
+retry the same persisted binding three times and never fall back to Luna.
 
 ### Native custom-agent roles
 
@@ -339,7 +376,7 @@ After three provider or tool-call failures:
 
 ## Logs and retention
 
-Use `~/.codex/team-orchestrator/runs/<run-id>/` as the managed-runtime default.
+Use `~/.ark-team/runs/<run-id>/` as the managed-runtime default.
 
 Expand a leading `~` through the current user's platform home-directory API before creating paths. Do not pass it as a literal path segment or rely on shell expansion. Accept absolute configured paths on every platform; resolve relative configured paths from the project root.
 

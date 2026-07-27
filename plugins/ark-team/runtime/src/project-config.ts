@@ -85,7 +85,7 @@ export const projectConfigSchema = z
       .strict(),
     logging: z
       .object({
-        root: z.literal("~/.codex/team-orchestrator/runs"),
+        root: z.literal("~/.ark-team/runs"),
         retention_days: z.literal(30),
         record_usage: z.literal(true),
         record_private_reasoning: z.literal(false),
@@ -152,7 +152,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = Object.freeze({
     require_approval_for_remote_actions: true,
   }),
   logging: Object.freeze({
-    root: "~/.codex/team-orchestrator/runs",
+    root: "~/.ark-team/runs",
     retention_days: 30,
     record_usage: true,
     record_private_reasoning: false,

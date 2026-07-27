@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -17,6 +18,7 @@ const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(testDirectory, "../../../..");
 const pluginRoot = path.join(repositoryRoot, "plugins/ark-team");
 const execFileAsync = promisify(execFile);
+const PROVIDER_CANARY = "built-mcp-provider-canary";
 
 let temporaryRoot: string;
 let projectRoot: string;
@@ -50,6 +52,35 @@ before(async () => {
     "-m",
     "baseline",
   ]);
+  const providerCatalogDirectory = path.join(
+    temporaryRoot,
+    "provider-catalog",
+  );
+  const providerCatalogPath = path.join(
+    providerCatalogDirectory,
+    "providers-v1.toml",
+  );
+  await mkdir(providerCatalogDirectory, { mode: 0o700 });
+  await writeFile(
+    providerCatalogPath,
+    [
+      "version = 1",
+      "",
+      "[providers.bundle_test]",
+      'adapter = "builtin:openai-chat"',
+      'base_url = "https://provider.example.invalid/v1"',
+      'auth_kind = "inline_key"',
+      `api_key = "${PROVIDER_CANARY}"`,
+      'structured_output_mode = "validated_json"',
+      'policy = "standard"',
+      'allowed_models = ["model-bundle-test"]',
+      "",
+      "[providers.bundle_test.reasoning_effort_map]",
+      'high = "high"',
+      "",
+    ].join("\n"),
+    { encoding: "utf8", mode: 0o600 },
+  );
 
   const pluginConfig = JSON.parse(
     await readFile(path.join(pluginRoot, ".mcp.json"), "utf8"),
@@ -71,6 +102,7 @@ before(async () => {
     env: {
       ...getDefaultEnvironment(),
       ARK_TEAM_STATE_ROOT: path.join(temporaryRoot, "state"),
+      ARK_TEAM_PROVIDER_CONFIG: providerCatalogPath,
     },
     stderr: "pipe",
   });
@@ -244,4 +276,47 @@ test("TEST-006 and TEST-1406 expose configured lifecycle through MCP", async () 
     | undefined;
   assert.equal(teamsPayload?.ok, true);
   assert.equal(teamsPayload?.total, 1);
+
+  const externalStarted = await client.callTool({
+    name: "ark_team_start",
+    arguments: {
+      objective: "Built MCP provider binding smoke test",
+      project_path: projectRoot,
+      model_overrides: {
+        worker: {
+          provider: "bundle_test",
+          model: "model-bundle-test",
+          reasoning_effort: "high",
+        },
+      },
+    },
+  });
+  assert.equal(externalStarted.isError, undefined);
+  const externalPayload = externalStarted.structuredContent as
+    | {
+        ok?: boolean;
+        run?: {
+          model_bindings?: {
+            worker?: {
+              adapter_sha256?: string | null;
+            };
+          };
+        };
+      }
+    | undefined;
+  assert.equal(externalPayload?.ok, true);
+  const builtAdapter = await readFile(
+    path.join(pluginRoot, "runtime/dist/adapters/openai-chat.js"),
+  );
+  const expectedAdapterSha256 = createHash("sha256")
+    .update(builtAdapter)
+    .digest("hex");
+  assert.equal(
+    externalPayload?.run?.model_bindings?.worker?.adapter_sha256,
+    expectedAdapterSha256,
+  );
+  assert.equal(
+    JSON.stringify(externalStarted).includes(PROVIDER_CANARY),
+    false,
+  );
 });
