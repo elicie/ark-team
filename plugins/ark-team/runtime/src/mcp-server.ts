@@ -26,6 +26,7 @@ import {
   ArkTeamRunCoordinator,
   IntegrationCoordinator,
 } from "./integration-coordinator.js";
+import { createDefaultVerificationPmGate } from "./verification-local-runtime.js";
 
 const SERVER_INSTRUCTIONS =
   "Use Ark Team tools only after explicit user invocation. Prefer ark_team_execute to create a run, invoke the managed read-only PM, execute dependency-ready teams, and continue through guarded integration, PM review, and worktree cleanup. Use ark_team_start plus ark_team_plan_apply only for manual or recovery flows. Inspect team worktrees with ark_team_team_list and the integration record with ark_team_status. Keep every returned assignment_id. For waiting_user, distinguish pending_approval, pending_retry, and remote_action. Deliver live agent approvals only through ark_team_assignment_decide, exhausted-retry choices only through ark_team_assignment_retry_decide, and the exact persisted push/PR request only through ark_team_remote_decide. If a persisted agent approval lost its live session after controller restart, use ark_team_assignment_recover with resume_safely or cancel_run; recovery never carries the old approval into the new turn. Never approve a remote action without the user's explicit choice. Then call ark_team_advance to continue the hierarchy. Use assignment status/list for stored reports, counters, and usage. Run pause/cancel stops active managed assignments.";
@@ -46,16 +47,24 @@ export function createArkTeamMcpServer(
   store: RunStore,
   scheduler = new ManagedAssignmentScheduler(store),
   materializer = new PlanMaterializer(store),
-  coordinator: TeamExecutionCoordinator = new ArkTeamRunCoordinator(
-    store,
-    new TeamCoordinator(store, scheduler),
-    new IntegrationCoordinator(store, scheduler),
-  ),
-  orchestrator: ArkTeamExecutionController = new ArkTeamOrchestrator(store, {
-    materializer,
-    coordinator,
-  }),
+  coordinator?: TeamExecutionCoordinator,
+  orchestrator?: ArkTeamExecutionController,
 ): McpServer {
+  const activeCoordinator =
+    coordinator ??
+    new ArkTeamRunCoordinator(
+      store,
+      new TeamCoordinator(store, scheduler),
+      new IntegrationCoordinator(store, scheduler, {
+        verification_gate: createDefaultVerificationPmGate(store),
+      }),
+    );
+  const activeOrchestrator =
+    orchestrator ??
+    new ArkTeamOrchestrator(store, {
+      materializer,
+      coordinator: activeCoordinator,
+    });
   const server = new McpServer(
     {
       name: "ark-team",
@@ -120,7 +129,7 @@ export function createArkTeamMcpServer(
     },
     async ({ objective, project_path, model_overrides }) =>
       handleTool(async () => ({
-        ...(await orchestrator.execute({
+        ...(await activeOrchestrator.execute({
           objective,
           project_path,
           ...(model_overrides === undefined
@@ -148,7 +157,7 @@ export function createArkTeamMcpServer(
     },
     async ({ run_id }) =>
       handleTool(async () => ({
-        ...(await coordinator.advance(run_id)),
+        ...(await activeCoordinator.advance(run_id)),
       })),
   );
 
@@ -172,14 +181,14 @@ export function createArkTeamMcpServer(
     },
     async ({ run_id, request_id, decision }) =>
       handleTool(async () => {
-        if (!supportsRemoteDecision(coordinator)) {
+        if (!supportsRemoteDecision(activeCoordinator)) {
           throw new ArkTeamError(
             "REMOTE_ACTION_UNAVAILABLE",
             "configured coordinator does not support remote actions",
           );
         }
         return {
-          ...(await coordinator.decideRemote(
+          ...(await activeCoordinator.decideRemote(
             run_id,
             request_id,
             decision,

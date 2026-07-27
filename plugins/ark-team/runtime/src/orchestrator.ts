@@ -35,6 +35,7 @@ import {
   ArkTeamRunCoordinator,
   IntegrationCoordinator,
 } from "./integration-coordinator.js";
+import { createDefaultVerificationPmGate } from "./verification-local-runtime.js";
 
 export interface ManagedPmLauncher {
   run(request: ManagedSessionRequest): Promise<ManagedSessionResult>;
@@ -106,6 +107,7 @@ export class ArkTeamOrchestrator {
         new TeamCoordinator(store, scheduler),
         new IntegrationCoordinator(store, scheduler, {
           pm_launcher: this.pmLauncher,
+          verification_gate: createDefaultVerificationPmGate(store),
           ...(options.codex_path === undefined
             ? {}
             : { codex_path: options.codex_path }),
