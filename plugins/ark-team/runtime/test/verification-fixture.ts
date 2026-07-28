@@ -34,7 +34,7 @@ export function validVerificationCoordinatorConfig(): VerificationCoordinatorCon
     enabled: true,
     server_argv: ["npm", "run", "dev"],
     server_bind: "0.0.0.0",
-    server_host: "dev",
+    server_host: "devbox",
     server_port_floor: 10_001,
     server_readiness_path: "/",
     server_readiness_status: 200,

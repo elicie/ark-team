@@ -101,7 +101,10 @@ import {
   verificationRunSnapshotSha256,
   verificationSpecDeltaRecordSchema,
 } from "./verification-contract.js";
-import { VerificationArtifactStore } from "./verification-artifact-store.js";
+import {
+  VerificationArtifactStore,
+  type VerificationApprovedBaselinePngBytesByCase,
+} from "./verification-artifact-store.js";
 import type { PreparedTeamWorkspace } from "./worktree-manager.js";
 
 export interface RunStoreOptions {
@@ -175,6 +178,26 @@ export interface VerificationApprovedBaselineResult {
   manifest: VerificationApprovedBaselineManifest;
   manifest_sha256: string;
   baseline_set_sha256: string;
+  png_bytes_by_case: VerificationApprovedBaselinePngBytesByCase;
+}
+
+export interface VerificationArtifactReference {
+  readonly artifact_id: string;
+  readonly relative_path: string;
+  readonly sha256: string;
+}
+
+export interface ReadVerificationArtifactInput {
+  readonly reference: VerificationArtifactReference;
+  readonly media_type: WriteVerificationArtifactInput["media_type"];
+  readonly byte_length: number;
+}
+
+export interface ReadVerificationArtifactResult {
+  readonly reference: VerificationArtifactReference;
+  readonly media_type: WriteVerificationArtifactInput["media_type"];
+  readonly byte_length: number;
+  readonly bytes: Uint8Array;
 }
 
 export interface CleanupVerificationArtifactsResult {
@@ -2161,6 +2184,68 @@ export class RunStore {
       project_root: persisted.run.project_path,
       snapshot,
     }).verifyApprovedBaseline();
+  }
+
+  async readVerificationArtifact(
+    runId: string,
+    input: ReadVerificationArtifactInput,
+  ): Promise<ReadVerificationArtifactResult> {
+    const expected = Object.freeze({
+      reference: Object.freeze({ ...input.reference }),
+      media_type: input.media_type,
+      byte_length: input.byte_length,
+    });
+    const persisted = await this.readPersistedRun(runId);
+    const snapshot = persisted.run.verification_snapshot;
+    if (snapshot === null || snapshot.schema_version !== 2) {
+      throw new ArkTeamError(
+        "CONTRACT_VERSION_MISMATCH",
+        "a contract-v2 snapshot is required to read verification artifacts",
+      );
+    }
+    await this.assertApprovedVerificationPackage(persisted.run.project_path);
+    const currentSource = await this.verificationSourceLoader(
+      persisted.run.project_path,
+    );
+    assertVerificationSourceIdentity(currentSource, snapshot.source);
+    const matches = persisted.run.verification_records.filter(
+      (record) =>
+        record.schema_version === 2 &&
+        record.payload.kind === "artifact" &&
+        record.payload.artifact_id === expected.reference.artifact_id &&
+        record.payload.relative_path === expected.reference.relative_path &&
+        record.payload.sha256 === expected.reference.sha256 &&
+        record.payload.media_type === expected.media_type &&
+        record.payload.byte_length === expected.byte_length,
+    );
+    const record = matches[0];
+    if (
+      matches.length !== 1 ||
+      record?.schema_version !== 2 ||
+      record.payload.kind !== "artifact" ||
+      record.artifact_references.length !== 1 ||
+      record.artifact_references[0]?.artifact_id !==
+        expected.reference.artifact_id ||
+      record.artifact_references[0].relative_path !==
+        expected.reference.relative_path ||
+      record.artifact_references[0].sha256 !== expected.reference.sha256
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "verification artifact read requires one exact registered reference",
+      );
+    }
+    const bytes = await new VerificationArtifactStore({
+      state_root: this.root_path,
+      project_root: persisted.run.project_path,
+      snapshot,
+    }).readRegisteredArtifact(record.payload);
+    return Object.freeze({
+      reference: expected.reference,
+      media_type: record.payload.media_type,
+      byte_length: record.payload.byte_length,
+      bytes: Uint8Array.from(bytes),
+    });
   }
 
   async cleanupVerificationArtifacts(

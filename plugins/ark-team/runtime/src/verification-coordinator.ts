@@ -19,10 +19,13 @@ import {
   type VerificationApiRuntimeRequest,
 } from "./verification-api-adapter.js";
 import {
+  createVerificationBrowserDriverV2Request,
   createVerificationBrowserDriverRequest,
+  normalizeVerificationBrowserDriverV2Result,
   normalizeVerificationBrowserDriverResult,
   VerificationBrowserContractError,
   type VerificationBrowserEvidence,
+  type VerificationBrowserDriverV2Request,
   type VerificationBrowserDriverRequest,
 } from "./verification-browser-adapter.js";
 import {
@@ -37,12 +40,15 @@ import {
 } from "./verification-semantic-review-adapter.js";
 import {
   compareVerificationPngs,
+  createVerificationScreenshotRuntimeV2Expectation,
   createVerificationScreenshotRequest,
+  normalizeVerificationScreenshotRuntimeV2Result,
   normalizeVerificationScreenshotResult,
   VerificationVisualContractError,
   type VerificationScreenshotEvidence,
   type VerificationScreenshotImageEvidence,
   type VerificationScreenshotRuntimeRequest,
+  type VerificationScreenshotRuntimeV2Result,
   type VerificationSemanticReviewOutcome,
   type VerificationVisualComparisonEvidence,
 } from "./verification-visual-adapter.js";
@@ -163,6 +169,7 @@ export type VerificationCoordinatorStore = Pick<
   | "terminateVerificationForApproval"
   | "finalizeVerification"
   | "writeVerificationArtifact"
+  | "readVerificationArtifact"
   | "cleanupVerificationArtifacts"
   | "verifyApprovedBaseline"
   | "recordVerificationRollback"
@@ -249,6 +256,7 @@ export interface RunVerificationActionInput<TInput, TValue> {
   lane: "backend" | "ui" | null;
   check_id: string | null;
   input: TInput;
+  timeout_ms?: number;
   adapter: (
     context: VerificationAdapterContext<TInput>,
   ) => Promise<VerificationAdapterAttemptResult<TValue>>;
@@ -277,7 +285,7 @@ export interface VerificationServerStartRequest {
   argv: readonly string[];
   cwd: string;
   bind: "0.0.0.0";
-  host: "dev";
+  host: "devbox";
   port: number;
   origin: string;
   readiness: {
@@ -347,6 +355,7 @@ type VerificationBootstrapViewport = "375x812" | "768x1024" | "1440x900";
 export interface RunVerificationBootstrapInput {
   package_fingerprint: string;
   server: Omit<VerificationServerRegistration, "registration_id">;
+  ui_evidence_source?: "approved_store";
   api_body_base64_by_probe?: Readonly<Record<string, string>>;
   semantic_checklist_by_case?: Readonly<
     Record<string, VerificationSemanticReviewChecklistIdentity>
@@ -451,6 +460,7 @@ export interface VerificationArtifactReferenceValue {
 }
 
 export interface VerificationCoordinatorRuntime {
+  browser_contract?: "v2-combined";
   port_available?: VerificationPortAvailabilityProbe;
   capability_adapters: Readonly<
     Record<
@@ -481,7 +491,9 @@ export interface VerificationCoordinatorRuntime {
     signal: AbortSignal,
   ) => Promise<unknown>;
   execute_browser?: (
-    request: DeepReadonly<VerificationBrowserDriverRequest>,
+    request: DeepReadonly<
+      VerificationBrowserDriverRequest | VerificationBrowserDriverV2Request
+    >,
     signal: AbortSignal,
   ) => Promise<unknown>;
   execute_screenshots?: (
@@ -679,6 +691,13 @@ export class VerificationCoordinator {
   }
 
   async recoverLocal(runId: string): Promise<RunRecord> {
+    return this.recoverLocalEnvironment(runId, true);
+  }
+
+  private async recoverLocalEnvironment(
+    runId: string,
+    requireServerReadiness: boolean,
+  ): Promise<RunRecord> {
     const initial = await this.store.getRun(runId);
     const snapshot = initial.verification_snapshot;
     if (snapshot === null || snapshot.schema_version !== 2) {
@@ -773,6 +792,7 @@ export class VerificationCoordinator {
       }
     }
     if (
+      requireServerReadiness &&
       verificationStageIndex(state) >= verificationStageIndex("ready")
     ) {
       const registration = {
@@ -881,9 +901,23 @@ export class VerificationCoordinator {
     }
     await this.announceRollout(runId);
 
+    let approvedBaselineBytes:
+      | Readonly<
+          Record<
+            string,
+            Readonly<
+              Record<VerificationBootstrapViewport, Uint8Array>
+            >
+          >
+        >
+      | undefined;
     if (snapshot.ui_contract.enabled) {
       try {
-        await this.store.verifyApprovedBaseline(runId);
+        const approvedBaseline =
+          await this.store.verifyApprovedBaseline(runId);
+        if (input.ui_evidence_source === "approved_store") {
+          approvedBaselineBytes = approvedBaseline.png_bytes_by_case;
+        }
       } catch (error) {
         if (
           error instanceof ArkTeamError &&
@@ -1041,6 +1075,7 @@ export class VerificationCoordinator {
         });
         visualEvidence.push(...semantic.evidence_record_ids);
         const baselines =
+          approvedBaselineBytes?.[browserCase.id] ??
           input.baseline_png_bytes_by_case?.[browserCase.id];
         if (baselines === undefined) {
           throw new ArkTeamError(
@@ -1192,6 +1227,200 @@ export class VerificationCoordinator {
       steps,
       run: handoff,
     };
+  }
+
+  async resumeCombinedBootstrap(
+    runId: string,
+    input: RunVerificationBootstrapInput,
+  ): Promise<RunRecord> {
+    const current = await this.recoverLocalEnvironment(runId, false);
+    const snapshot = requireV2Snapshot(current);
+    const runtime = this.requireLocalRuntime();
+    if (
+      runtime.browser_contract !== "v2-combined" ||
+      !snapshot.ui_contract.enabled ||
+      input.package_fingerprint !==
+        snapshot.package.package_fingerprint
+    ) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "only the exact combined UI bootstrap can resume",
+      );
+    }
+    const state = current.verification_state?.current_state;
+    if (state !== "executing" && state !== "collecting") {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "combined UI bootstrap can resume only at the browser/screenshot boundary",
+      );
+    }
+    if (
+      current.verification_state?.attempts.some((attempt) =>
+        [
+          "screenshot",
+          "semantic_review",
+          "comparison",
+          "agentic_browser",
+        ].includes(attempt.kind),
+      )
+    ) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "combined UI bootstrap recovery found work after the durable browser boundary",
+      );
+    }
+    for (const browserCase of snapshot.ui_contract.browser_cases) {
+      requireCombinedBrowserRecord(current, browserCase.id);
+    }
+
+    const caseIds = snapshot.ui_contract.browser_cases
+      .map((browserCase) => browserCase.id)
+      .sort();
+    const checklistIds = Object.keys(
+      input.semantic_checklist_by_case ?? {},
+    ).sort();
+    if (
+      caseIds.length !== checklistIds.length ||
+      caseIds.some((caseId, index) => caseId !== checklistIds[index])
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "combined UI bootstrap recovery requires one exact checklist per browser case",
+      );
+    }
+    const injectedBaselineIds = Object.keys(
+      input.baseline_png_bytes_by_case ?? {},
+    ).sort();
+    if (
+      input.ui_evidence_source === "approved_store" &&
+      injectedBaselineIds.length !== 0
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "approved-store recovery rejects injected baseline bytes",
+      );
+    }
+    if (
+      input.ui_evidence_source !== "approved_store" &&
+      (caseIds.length !== injectedBaselineIds.length ||
+        caseIds.some(
+          (caseId, index) => caseId !== injectedBaselineIds[index],
+        ))
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "combined UI bootstrap recovery requires the exact baseline cases",
+      );
+    }
+    const approvedBaseline =
+      await this.store.verifyApprovedBaseline(runId);
+    const baselineBytesByCase =
+      input.ui_evidence_source === "approved_store"
+        ? approvedBaseline.png_bytes_by_case
+        : input.baseline_png_bytes_by_case;
+    if (baselineBytesByCase === undefined) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "combined UI bootstrap recovery has no approved baseline bytes",
+      );
+    }
+
+    if (state === "executing") {
+      const collecting = await this.advance(runId, "collecting");
+      if (!collecting.accepted) {
+        throw new ArkTeamError(
+          "INVALID_TRANSITION",
+          "combined UI bootstrap recovery could not enter collecting",
+        );
+      }
+    }
+
+    for (const browserCase of snapshot.ui_contract.browser_cases) {
+      const screenshots = await this.runScreenshots(runId, {
+        action_id: bootstrapActionId("screenshot", browserCase.id),
+        case_id: browserCase.id,
+      });
+      if (!screenshots.ok) {
+        continue;
+      }
+      const checklist =
+        input.semantic_checklist_by_case?.[browserCase.id];
+      const baselines = baselineBytesByCase[browserCase.id];
+      if (checklist === undefined || baselines === undefined) {
+        throw new ArkTeamError(
+          "INVALID_RECORD",
+          "combined UI bootstrap recovery input changed after validation",
+        );
+      }
+      const semantic = await this.runSemanticReview(runId, {
+        action_id: bootstrapActionId(
+          "semantic-review",
+          browserCase.id,
+        ),
+        case_id: browserCase.id,
+        screenshot_paths: screenshots.value.images.map((image) =>
+          path.join(snapshot.artifact_root, image.artifact.relative_path),
+        ),
+        checklist,
+      });
+      await this.runComparison(runId, {
+        action_id: bootstrapActionId("comparison", browserCase.id),
+        case_id: browserCase.id,
+        actuals: screenshots.value.images.map((image) => ({
+          evidence: image.evidence,
+          png_bytes: image.png_bytes,
+        })),
+        baseline_png_bytes: baselines,
+        semantic_review_outcome: semantic.ok
+          ? semantic.value.outcome
+          : null,
+      });
+    }
+
+    for (const task of snapshot.ui_contract.agentic_tasks) {
+      await this.runAction(runId, {
+        action_id: bootstrapActionId("agentic", task.id),
+        kind: "agentic_browser",
+        lane: "ui",
+        check_id: task.id,
+        input: {
+          task_id: task.id,
+          deterministic_recheck_available: false,
+        },
+        adapter: async () => ({
+          ok: false,
+          code: "CAPABILITY_UNAVAILABLE",
+          capability: "agentic_browser",
+          message:
+            "agentic exploration is not restarted after the durable browser boundary",
+        }),
+      });
+    }
+
+    const deciding = await this.advance(runId, "deciding");
+    if (!deciding.accepted) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "combined UI bootstrap recovery could not enter deciding",
+      );
+    }
+    const terminal = await this.finalize(
+      runId,
+      deriveBootstrapLaneDecisions(
+        await this.store.getRun(runId),
+      ),
+    );
+    if (terminal.verification_state?.terminal_outcome !== "passed") {
+      return terminal;
+    }
+    const pending = await this.advance(runId, "pm_review_pending");
+    if (!pending.accepted) {
+      throw new ArkTeamError(
+        "INVALID_TRANSITION",
+        "combined UI bootstrap recovery could not enter PM review pending",
+      );
+    }
+    return pending.run;
   }
 
   async beginOriginalPmReview(runId: string): Promise<RunRecord> {
@@ -1629,6 +1858,9 @@ export class VerificationCoordinator {
       lane: "ui",
       check_id: browserCase.id,
       input: { case_id: browserCase.id },
+      ...(runtime.browser_contract === "v2-combined"
+        ? { timeout_ms: snapshot.timeouts_ms.case_ms }
+        : {}),
       adapter: async (context) => {
         const registered = runtime.capability_adapters.browser;
         if (
@@ -1650,20 +1882,37 @@ export class VerificationCoordinator {
           case_id: browserCase.id,
         }).slice(0, 24);
         try {
-          const request = createVerificationBrowserDriverRequest({
-            snapshot,
-            case_id: browserCase.id,
-            attempt_id: `browser-${artifactToken}`,
-          });
+          const request =
+            runtime.browser_contract === "v2-combined"
+              ? createVerificationBrowserDriverV2Request({
+                  snapshot,
+                  case_id: browserCase.id,
+                  attempt_id: `browser-${artifactToken}`,
+                })
+              : createVerificationBrowserDriverRequest({
+                  snapshot,
+                  case_id: browserCase.id,
+                  attempt_id: `browser-${artifactToken}`,
+                });
           const rawResult = await runtime.execute_browser(
             request,
             context.signal,
           );
           this.completeTimedEffect(context);
-          const normalized = normalizeVerificationBrowserDriverResult(
-            request,
-            rawResult,
-          );
+          let combined = null;
+          let normalized;
+          if (request.schema_version === 2) {
+            combined = normalizeVerificationBrowserDriverV2Result(
+              request,
+              rawResult,
+            );
+            normalized = combined.browser;
+          } else {
+            normalized = normalizeVerificationBrowserDriverResult(
+              request,
+              rawResult,
+            );
+          }
           const traceArtifact = await this.writeArtifact(runId, {
             artifact_id: `browser-trace-${artifactToken}`,
             relative_path: request.trace.relative_path,
@@ -1685,6 +1934,41 @@ export class VerificationCoordinator {
             verificationArtifactReference(traceArtifact);
           const evidenceReference =
             verificationArtifactReference(evidenceArtifact);
+          const combinedReferences: VerificationArtifactReferenceValue[] = [];
+          if (combined !== null) {
+            const screenshotEvidenceBytes = canonicalJsonBytes(
+              combined.screenshot.evidence,
+            );
+            combinedReferences.push(
+              verificationArtifactReference(
+                await this.writeArtifact(runId, {
+                  artifact_id:
+                    `combined-screenshot-evidence-${artifactToken}`,
+                  relative_path:
+                    `screenshots/${browserCase.id}/${artifactToken}.combined.json`,
+                  media_type: "application/json",
+                  bytes: screenshotEvidenceBytes,
+                  sha256: sha256Bytes(screenshotEvidenceBytes),
+                  lane: "ui",
+                }),
+              ),
+            );
+            for (const image of combined.screenshot.images) {
+              combinedReferences.push(
+                verificationArtifactReference(
+                  await this.writeArtifact(runId, {
+                    artifact_id:
+                      `combined-screenshot-${artifactToken}-${image.evidence.viewport}`,
+                    relative_path: image.evidence.relative_path,
+                    media_type: "image/png",
+                    bytes: image.png_bytes,
+                    sha256: image.evidence.sha256,
+                    lane: "ui",
+                  }),
+                ),
+              );
+            }
+          }
           const payload = {
             kind: "browser" as const,
             case_sha256: request.case_sha256,
@@ -1715,7 +1999,11 @@ export class VerificationCoordinator {
               version: ui.deterministic_adapter_version,
             },
             model: null,
-            artifact_references: [evidenceReference, traceReference],
+            artifact_references: [
+              evidenceReference,
+              traceReference,
+              ...combinedReferences,
+            ],
           });
 
           if (!normalized.passed) {
@@ -1771,12 +2059,13 @@ export class VerificationCoordinator {
         const registeredBrowser = runtime.capability_adapters.browser;
         const registeredScreenshot = runtime.capability_adapters.screenshot;
         if (
-          runtime.execute_screenshots === undefined ||
           registeredBrowser.name !== ui.deterministic_adapter ||
           registeredBrowser.version !==
             ui.deterministic_adapter_version ||
           registeredScreenshot.name !== registeredBrowser.name ||
-          registeredScreenshot.version !== registeredBrowser.version
+          registeredScreenshot.version !== registeredBrowser.version ||
+          (runtime.browser_contract !== "v2-combined" &&
+            runtime.execute_screenshots === undefined)
         ) {
           return {
             ok: false,
@@ -1791,12 +2080,170 @@ export class VerificationCoordinator {
             attempt: this.attemptNumber(context),
             case_id: browserCase.id,
           }).slice(0, 24);
+          if (runtime.browser_contract === "v2-combined") {
+            const browserRecord = requireCombinedBrowserRecord(
+              current,
+              browserCase.id,
+            );
+            const browserArtifactToken =
+              browserRecord.record_id.slice("browser-".length);
+            const evidenceReference = requireOwnedArtifactReference(
+              browserRecord,
+              `combined-screenshot-evidence-${browserArtifactToken}`,
+            );
+            const evidenceRegistration = requireArtifactRegistration(
+              current,
+              evidenceReference,
+              "application/json",
+            );
+            const evidenceFile =
+              await this.store.readVerificationArtifact(runId, {
+                reference: evidenceReference,
+                media_type: "application/json",
+                byte_length: evidenceRegistration.byte_length,
+              });
+            const stagedEvidence = parseCombinedScreenshotEvidence(
+              evidenceFile.bytes,
+            );
+            const request = createVerificationBrowserDriverV2Request({
+              snapshot,
+              case_id: browserCase.id,
+              attempt_id: stagedEvidence.attempt_id,
+            });
+            const expectation =
+              createVerificationScreenshotRuntimeV2Expectation({
+                plan: request.screenshot,
+                final_url: stagedEvidence.url,
+              });
+            const rawImages: VerificationScreenshotRuntimeV2Result["screenshots"][number][] =
+              [];
+            for (const [index, capture] of expectation.captures.entries()) {
+              const reference = requireOwnedArtifactReference(
+                browserRecord,
+                `combined-screenshot-${browserArtifactToken}-${capture.viewport}`,
+              );
+              const registration = requireArtifactRegistration(
+                current,
+                reference,
+                "image/png",
+              );
+              const file = await this.store.readVerificationArtifact(
+                runId,
+                {
+                  reference,
+                  media_type: "image/png",
+                  byte_length: registration.byte_length,
+                },
+              );
+              const image = stagedEvidence.screenshots[index];
+              if (image === undefined) {
+                throw new ArkTeamError(
+                  "INVALID_RECORD",
+                  "combined screenshot evidence omits a fixed viewport",
+                );
+              }
+              rawImages.push({
+                sequence: image.sequence,
+                viewport: image.viewport,
+                width: image.width,
+                height: image.height,
+                device_scale_factor: image.device_scale_factor,
+                url: image.url,
+                relative_path: image.relative_path,
+                media_type: image.media_type,
+                captured_at_utc: image.captured_at_utc,
+                byte_length: image.byte_length,
+                sha256: image.sha256,
+                capture: { ...image.capture },
+                bytes: file.bytes,
+              });
+            }
+            const normalized =
+              normalizeVerificationScreenshotRuntimeV2Result(
+                expectation,
+                {
+                  schema_version: 2,
+                  contract_id:
+                    "verification_screenshot_runtime_result_v2",
+                  run_id: stagedEvidence.run_id,
+                  snapshot_id: stagedEvidence.snapshot_id,
+                  case_id: stagedEvidence.case_id,
+                  attempt_id: stagedEvidence.attempt_id,
+                  case_sha256: stagedEvidence.case_sha256,
+                  package_fingerprint:
+                    stagedEvidence.package_fingerprint,
+                  source_fingerprint: stagedEvidence.source_fingerprint,
+                  adapter: { ...stagedEvidence.adapter },
+                  browser_build: stagedEvidence.browser_build,
+                  origin: stagedEvidence.origin,
+                  url: stagedEvidence.url,
+                  screenshots: rawImages,
+                },
+              );
+            this.completeTimedEffect(context);
+            const imageArtifacts: VerificationScreenshotValue["images"] =
+              [];
+            for (const [index, image] of normalized.images.entries()) {
+              const artifact = requireOwnedArtifactReference(
+                browserRecord,
+                `combined-screenshot-${browserArtifactToken}-${image.evidence.viewport}`,
+              );
+              imageArtifacts.push({
+                evidence: image.evidence,
+                artifact,
+                png_bytes: Uint8Array.from(image.png_bytes),
+              });
+              const payload = {
+                kind: "screenshot" as const,
+                viewport: image.evidence.viewport,
+                width: image.evidence.width,
+                height: image.evidence.height,
+                image_sha256: image.evidence.sha256,
+              };
+              await context.submit({
+                schema_version: 2,
+                contract_id: "verification_contract_v2",
+                record_id:
+                  `screenshot-${artifactToken}-${image.evidence.viewport}`,
+                record_type: "screenshot",
+                run_id: snapshot.run_id,
+                case_id: snapshot.case_id,
+                check_id: browserCase.id,
+                snapshot_id: snapshot.snapshot_id,
+                lane: "ui",
+                stage: "collecting",
+                timestamp_utc: image.evidence.captured_at_utc,
+                source_fingerprint: snapshot.source_fingerprint,
+                package_fingerprint:
+                  snapshot.package.package_fingerprint,
+                lane_required: ui.required,
+                check_required: browserCase.required,
+                previous_record_sha256: "0".repeat(64),
+                payload_sha256: sha256CanonicalJson(payload),
+                payload,
+                adapter: { ...expectation.adapter },
+                model: null,
+                artifact_references: [
+                  imageArtifacts[index]!.artifact,
+                  evidenceReference,
+                ],
+              });
+            }
+            return {
+              ok: true,
+              value: {
+                evidence: normalized.evidence,
+                evidence_artifact: evidenceReference,
+                images: imageArtifacts,
+              },
+            };
+          }
           const request = createVerificationScreenshotRequest({
             snapshot,
             case_id: browserCase.id,
             attempt_id: `screenshot-${artifactToken}`,
           });
-          const rawResult = await runtime.execute_screenshots(
+          const rawResult = await runtime.execute_screenshots!(
             request,
             context.signal,
           );
@@ -2122,7 +2569,9 @@ export class VerificationCoordinator {
               case_id: browserCase.id,
               viewport,
               baseline: {
-                ...baseline,
+                manifest: baseline.manifest,
+                manifest_sha256: baseline.manifest_sha256,
+                baseline_set_sha256: baseline.baseline_set_sha256,
                 png_bytes: baselineBytes[viewport],
               },
               actual: {
@@ -3086,18 +3535,40 @@ export class VerificationBootstrapPmGate {
       );
     }
     if (current.verification_state?.current_state !== "pm_review_pending") {
-      const result = await this.coordinator.runBootstrap(
-        runId,
-        await this.inputResolver(runId),
-      );
+      const input = await this.inputResolver(runId);
       if (
-        result.status !== "completed" ||
-        result.run.verification_state?.current_state !== "pm_review_pending"
+        current.verification_snapshot?.schema_version === 2 &&
+        current.verification_state?.terminal_outcome === null &&
+        ["executing", "collecting"].includes(
+          current.verification_state.current_state,
+        )
       ) {
-        throw new ArkTeamError(
-          "INVALID_TRANSITION",
-          "local verification did not produce a passed PM handoff",
+        const resumed = await this.coordinator.resumeCombinedBootstrap(
+          runId,
+          input,
         );
+        if (
+          resumed.verification_state?.current_state !==
+            "pm_review_pending" ||
+          resumed.verification_state.terminal_outcome !== "passed"
+        ) {
+          throw new ArkTeamError(
+            "INVALID_TRANSITION",
+            "resumed local verification did not produce a passed PM handoff",
+          );
+        }
+      } else {
+        const result = await this.coordinator.runBootstrap(runId, input);
+        if (
+          result.status !== "completed" ||
+          result.run.verification_state?.current_state !==
+            "pm_review_pending"
+        ) {
+          throw new ArkTeamError(
+            "INVALID_TRANSITION",
+            "local verification did not produce a passed PM handoff",
+          );
+        }
       }
     }
     return this.coordinator.beginOriginalPmReview(runId);
@@ -3208,15 +3679,36 @@ function verificationBootstrapInputProblem(
     ).sort();
     if (
       caseIds.length !== checklistIds.length ||
-      caseIds.some((caseId, index) => caseId !== checklistIds[index]) ||
+      caseIds.some((caseId, index) => caseId !== checklistIds[index])
+    ) {
+      return problem(
+        "omission",
+        "UI checklist does not cover the exact browser cases",
+        "semantic verification cannot reproduce every enabled case",
+        "supply one checklist for each UI case",
+      );
+    }
+    if (input.ui_evidence_source === "approved_store") {
+      if (baselineIds.length !== 0) {
+        return problem(
+          "unsafe_input",
+          "production UI bootstrap received injected baseline bytes",
+          "caller-controlled bytes could replace the approved baseline",
+          "remove injected baseline bytes and use only the approved store",
+        );
+      }
+      return null;
+    }
+    if (
+      input.ui_evidence_source !== undefined ||
       caseIds.length !== baselineIds.length ||
       caseIds.some((caseId, index) => caseId !== baselineIds[index])
     ) {
       return problem(
         "omission",
-        "UI checklist or baseline bytes do not cover the exact browser cases",
-        "semantic and deterministic visual verification cannot reproduce every enabled case",
-        "supply one checklist and the approved three baseline PNGs for each UI case",
+        "UI baseline bytes do not cover the exact browser cases",
+        "deterministic visual verification cannot reproduce every enabled case",
+        "supply the approved three baseline PNGs for each UI case",
       );
     }
     for (const caseId of caseIds) {
@@ -3240,6 +3732,7 @@ function verificationBootstrapInputProblem(
       }
     }
   } else if (
+    input.ui_evidence_source !== undefined ||
     Object.keys(input.semantic_checklist_by_case ?? {}).length !== 0 ||
     Object.keys(input.baseline_png_bytes_by_case ?? {}).length !== 0
   ) {
@@ -3522,11 +4015,11 @@ function parseReadinessInput(
   }
   if (
     input.server.framework === "nextjs" &&
-    !input.server.allowed_dev_origins.includes("dev")
+    !input.server.allowed_dev_origins.includes("devbox")
   ) {
     throw new ArkTeamError(
       "CONFIG_INVALID",
-      "Next.js local verification requires allowedDevOrigins to include dev",
+      "Next.js local verification requires allowedDevOrigins to include devbox",
     );
   }
   return deepFreeze(structuredClone(input)) as RunVerificationReadinessInput;
@@ -3782,6 +4275,122 @@ function requireSucceededCheckAction(
       `${kind} prerequisite has not succeeded for ${checkId}`,
     );
   }
+}
+
+function requireCombinedBrowserRecord(
+  run: RunRecord,
+  checkId: string,
+): VerificationLinkedRecord {
+  const attempt = run.verification_state?.attempts.find(
+    (candidate) =>
+      candidate.kind === "browser" &&
+      candidate.check_id === checkId &&
+      candidate.status === "succeeded",
+  );
+  if (attempt === undefined) {
+    throw new ArkTeamError(
+      "INVALID_TRANSITION",
+      `browser prerequisite has not succeeded for ${checkId}`,
+    );
+  }
+  const decisive = new Set(attempt.decisive_evidence_record_ids);
+  const matches = run.verification_records.filter(
+    (record) =>
+      record.schema_version === 2 &&
+      record.record_type === "browser" &&
+      record.payload.kind === "browser" &&
+      record.check_id === checkId &&
+      decisive.has(record.record_id) &&
+      record.record_id.startsWith("browser-"),
+  );
+  if (matches.length !== 1) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "combined screenshot materialization requires one decisive browser record",
+    );
+  }
+  return matches[0]!;
+}
+
+function requireOwnedArtifactReference(
+  owner: VerificationLinkedRecord,
+  artifactId: string,
+): VerificationArtifactReferenceValue {
+  const matches = owner.artifact_references.filter(
+    (reference) => reference.artifact_id === artifactId,
+  );
+  if (matches.length !== 1) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      `combined browser evidence does not own ${artifactId}`,
+    );
+  }
+  return { ...matches[0]! };
+}
+
+function requireArtifactRegistration(
+  run: RunRecord,
+  reference: VerificationArtifactReferenceValue,
+  mediaType: "application/json" | "image/png",
+): { byte_length: number } {
+  const matches = run.verification_records.filter(
+    (record) =>
+      record.schema_version === 2 &&
+      record.record_type === "artifact" &&
+      record.payload.kind === "artifact" &&
+      record.payload.artifact_id === reference.artifact_id &&
+      record.payload.relative_path === reference.relative_path &&
+      record.payload.sha256 === reference.sha256 &&
+      record.payload.media_type === mediaType,
+  );
+  if (
+    matches.length !== 1 ||
+    matches[0]?.payload.kind !== "artifact"
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "combined screenshot artifact registration is missing or ambiguous",
+    );
+  }
+  return { byte_length: matches[0].payload.byte_length };
+}
+
+function parseCombinedScreenshotEvidence(
+  bytes: Uint8Array,
+): VerificationScreenshotEvidence {
+  let text: string;
+  let parsed: unknown;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "combined screenshot evidence is not canonical UTF-8 JSON",
+      { cause: error },
+    );
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    (parsed as { schema_version?: unknown }).schema_version !== 1 ||
+    (parsed as { contract_id?: unknown }).contract_id !==
+      "verification_screenshot_evidence_v1" ||
+    typeof (parsed as { attempt_id?: unknown }).attempt_id !== "string" ||
+    typeof (parsed as { url?: unknown }).url !== "string" ||
+    !Array.isArray(
+      (parsed as { screenshots?: unknown }).screenshots,
+    ) ||
+    (parsed as { screenshots: unknown[] }).screenshots.length !== 3 ||
+    canonicalJson(parsed) !== text
+  ) {
+    throw new ArkTeamError(
+      "INVALID_RECORD",
+      "combined screenshot evidence does not match its durable contract",
+    );
+  }
+  return parsed as VerificationScreenshotEvidence;
 }
 
 function requireAgenticRecheckCase(
@@ -4133,11 +4742,11 @@ function assertRegisteredVerificationServer(
   }
   if (
     server.framework === "nextjs" &&
-    !server.allowed_dev_origins.includes("dev")
+    !server.allowed_dev_origins.includes("devbox")
   ) {
     throw new ArkTeamError(
       "CONFIG_INVALID",
-      "Next.js local verification requires allowedDevOrigins to include dev",
+      "Next.js local verification requires allowedDevOrigins to include devbox",
     );
   }
 }
@@ -4762,6 +5371,18 @@ function actionTimeoutMs<TInput, TValue>(
   snapshot: VerificationRunSnapshot & { schema_version: 2 },
   options: RunVerificationActionInput<TInput, TValue>,
 ): number {
+  if (options.timeout_ms !== undefined) {
+    if (
+      options.kind !== "browser" ||
+      options.timeout_ms !== snapshot.timeouts_ms.case_ms
+    ) {
+      throw new ArkTeamError(
+        "INVALID_RECORD",
+        "verification action timeout override is not approved",
+      );
+    }
+    return options.timeout_ms;
+  }
   switch (options.kind) {
     case "readiness":
       return snapshot.resolved_config.server_readiness_timeout_ms;

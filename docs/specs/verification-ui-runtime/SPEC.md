@@ -1,17 +1,20 @@
 # SLICE-017 결정론적 UI 런타임 보완 명세
 
-- Spec identity: `ark-team-verification-ui-runtime-v1.0.1`
+- Spec identity: `ark-team-verification-ui-runtime-v1.0.2`
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
 - Delta status: `SPEC_DELTA_APPLIED`
-- Supersedes: `ark-team-verification-ui-runtime-v1.0.0`
+- Supersedes: `ark-team-verification-ui-runtime-v1.0.1`
 - Authority date: 2026-07-28 UTC
 - Authority: 사용자가 요청한 실제 UI QA 실행 기능, Backend/UI 독립 실행
   요구, `verification-spec-v4`, 그리고 이 보완안으로 진행하라는 사용자 승인
 - Target source:
-  `GIT-COMMIT:fcebe022dd00add51ece1e98e40be81f78f8a28b`
-- Target tree: `62445c044022e23f0389f826b5c6e460edc9ae65`
+  `GIT-COMMIT:8dcea3d5a117f1197b8fee3d33808bfa9406372d`
+- Target tree: `5d18c1cdfcd93de147b0470577532c84d5504c4e`
 - Parent contract: `docs/slices/SLICE-017.md`
   (`verification-spec-v4`)
+- Parent host-token override: 이 보완 명세에서 parent의 로컬 hostname
+  `dev`는 `devbox`로 읽는다. Parent 문서 bytes와 package fingerprint는
+  바꾸지 않으며 이 override는 아래 승인 SPEC SHA-256으로 검증한다.
 - Reference boundary: `NONE`
 - Deliverable: 이 문서 package만 작성하며 제품 코드나 의존성을 변경하지 않는다.
 
@@ -47,10 +50,13 @@
 | `UIR-EVID-005` | 저장소 `package.json`과 lockfile에 Playwright 의존성이 없다. | 실행 중 자동 설치하지 말고 구현 commit에서 exact dependency를 추가한다. |
 | `UIR-EVID-006` | Codex Playwright wrapper SHA-256은 `aa3fdff5d0e4556177f4dfd5f04117e772aa54f94b6a2e34b6c0edf629c6b9b5`이며 `npx --yes --package @playwright/cli`를 사용한다. | 버전이 고정되지 않은 agent CLI wrapper는 gate 실행기가 아니다. |
 | `UIR-EVID-007` | 관측된 `@playwright/cli 0.1.17`은 alpha Playwright와 Chromium `151.0.7922.10`을 사용한다. | 안정판 browser identity와 일치하지 않는다. |
-| `UIR-EVID-008` | 현재 host에서 `dev` lookup은 `EAI_AGAIN`이다. | 시스템 DNS나 `/etc/hosts`를 변경하지 않고 Chromium 안에서 exact `dev → 127.0.0.1` mapping을 사용한다. |
+| `UIR-EVID-008` | 실제 서버 hostname은 사용자가 정정한 `devbox`이며 `100.95.211.34`로 해석된다. | 기존 `dev` token은 잘못 기록됐다. |
 | `UIR-EVID-009` | 현재 bootstrap은 `runBrowserCase` 뒤 `runScreenshots`를 별도 호출하고 두 runtime contract는 context/state 전달 경로가 없다. | v1.0.0대로 구현하면 선언 action이 정상 UI gate에서 두 번 실행될 수 있으므로 combined execution으로 보정해야 한다. |
 | `UIR-EVID-010` | screenshot v1 request/result는 각 capture URL을 action 전 초기 URL과 같게 강제한다. | same-origin navigation action 뒤 실제 화면을 증명하려면 검증된 browser `final_url`을 screenshot 기대 URL로 연결해야 한다. |
 | `UIR-EVID-011` | coordinator ownership은 browser action에서 screenshot record 제출을 거부하고, 두 action 사이 in-memory result는 crash/reopen 때 사라진다. | Combined effect의 PNG/metadata를 먼저 등록 artifact로 내구성 있게 쓰고 screenshot action은 그 bytes를 strict-read해 record만 materialize해야 한다. |
+| `UIR-EVID-012` | Chromium 151은 `http://dev:10091`을 HSTS로 HTTPS 승격해 HTTP 서버 요청 전 `ERR_SSL_PROTOCOL_ERROR`를 냈다. | `dev`는 승인 HTTP QA hostname으로 사용할 수 없다. |
+| `UIR-EVID-013` | `0.0.0.0:10091` fixture와 유일한 `--host-resolver-rules=MAP devbox 127.0.0.1` argument로 Chromium이 `http://devbox:10091/`에서 HTTP 200, exact URL, heading을 확인했다. | `devbox`는 기존 HTTP/port/bind/network 계약을 바꾸지 않고 실행 가능하다. |
+| `UIR-EVID-014` | Playwright `route.fetch/fulfill`로 navigation redirect를 선검사하면 같은 document의 정상 WebSocket이 연결되지 않았고, `route.continue`만 사용하면 cross-origin redirect 대상에 effect가 발생한 뒤 차단됐다. Chromium `Fetch.requestPaused`의 request-stage guard는 정상 local HTTP/WS를 통과시키면서 redirect HTTP와 external WS를 effect 전에 차단했다. | 시작한 exact Chromium target 내부의 request-stage guard가 HTTP(S) 경계를 소유하고 Playwright WebSocket route가 WS 경계를 중복 검증해야 한다. |
 
 ### 2.2 공식 reference
 
@@ -135,8 +141,8 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
   bootstrap 정상 경로의 case당 declared action과 click/submit side effect는
   총 한 번이다.
 - `UIR-DEC-006`: system resolver를 바꾸지 않고 유일한 Chromium launch
-  argument `--host-resolver-rules=MAP dev 127.0.0.1`을 사용한다. URL gate는
-  여전히 exact `http://dev:<recorded-port>` origin을 검사한다.
+  argument `--host-resolver-rules=MAP devbox 127.0.0.1`을 사용한다. URL
+  gate는 exact `http://devbox:<recorded-port>` origin을 검사한다.
 - `UIR-DEC-007`: semantic review가 optional이면 unavailable 결과를
   보존하고 비교를 계속한다. required이면 기존 capability gate가
   `unavailable`로 닫는다.
@@ -155,6 +161,15 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
   reference를 소유한다. 이어지는 screenshot action은 해당 artifact를
   strict-read해 기존 screenshot evidence를 materialize할 뿐 browser를
   호출하지 않는다. In-memory-only handoff는 금지한다.
+- `UIR-DEC-012`: `devbox` override는 신규 contract-v2 coordinator config,
+  server snapshot/readiness, Backend API, deterministic UI, Next.js
+  `allowedDevOrigins` 전체에 적용한다. 기존 schema-v1 `dev` records는
+  read-only 호환을 유지한다.
+- `UIR-DEC-013`: HTTP(S) exact-origin 경계는 새로 시작한 exact Chromium
+  page target에 request-stage guard를 initial navigation 전에 설치한다.
+  이는 외부/system browser에 attach하거나 persistent CDP session을
+  재사용하는 동작이 아니다. WebSocket route는 같은 origin을 별도로
+  검증하고 정상 연결만 server로 전달한다.
 
 ### 알려진 경고
 
@@ -165,7 +180,7 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
 - pixel 결과는 OS/font/rendering 환경에도 영향을 받는다. 기존 v4 baseline
   tuple과 strict byte comparison을 유지하며 mismatch를 자동 승인하거나
   baseline으로 승격하지 않는다.
-- Next.js 프로젝트는 기존 요구대로 `allowedDevOrigins`에 `dev`가 있음을
+- Next.js 프로젝트는 `allowedDevOrigins`에 `devbox`가 있음을
   별도 source inspection으로 증명해야 한다.
 - 기존 deterministic-browser retry ceiling은 두 번이다. Combined effect는
   attempt 내부 중복을 제거하지만 첫 attempt가 effect 뒤 실패하면 immutable
@@ -199,10 +214,12 @@ timezone `UTC`, light color scheme, reduced motion `no-preference`,
 `serviceWorkers: "block"`, 빈 permissions, `acceptDownloads: false`를
 사용한다.
 
-페이지 생성 전 HTTP(S) route와 WebSocket route를 등록한다. exact recorded
-origin만 통과하고 다른 host/scheme/port, cross-origin redirect, `file:`,
-`chrome:`, external WebSocket은 effect 전에 차단한다. 초기 `about:blank`과
-allowed-origin에서 생성된 non-network `data:`/`blob:`만 허용한다.
+새 page는 inert `about:blank` 상태에서 만들고 initial navigation 전에
+Chromium request-stage HTTP(S) guard와 WebSocket route를 모두 활성화한다.
+exact recorded origin만 통과하고 다른 host/scheme/port, cross-origin
+redirect, `file:`, `chrome:`, external WebSocket은 effect 전에 차단한다.
+초기 `about:blank`과 allowed-origin에서 생성된 non-network `data:`/`blob:`
+만 허용한다.
 
 ### UIR-REQ-003 — Deterministic action and assertion mapping
 
@@ -401,12 +418,19 @@ wiring, focused tests와 전체 회귀를 함께 완료해야 한다. 일부만 
 
 ## 9. 문서 작업 상태
 
-v1.0.1은 구현 검토에서 확인된 `AMBIGUITY`를 보정한다. v1.0.0의
+v1.0.2는 실브라우저 구현 검증에서 확인된 잘못된 `dev` hostname을 사용자
+정정대로 `devbox`로 보정한다. 또한 redirect 선검사용
+`route.fetch/fulfill`이 정상 WebSocket을 막는 Playwright 동작을 확인해,
+새로 시작한 exact Chromium target 내부의 request-stage guard로 HTTP(S)
+경계를 구현하도록 구체화한다. 제품의 HTTP, bind, port, exact-origin,
+resolver boundary는 바꾸지 않는다.
+
+v1.0.1은 구현 검토에서 확인된 `AMBIGUITY`를 보정했다. v1.0.0의
 viewport당 action 반복은 제거됐지만 별도 browser/screenshot effect 사이의
 중복은 남아 있었다. Combined UI-case effect가 두 기존 evidence contract를
 한 context에서 생성하도록 결정했으며 다른 제품 동작은 바꾸지 않는다.
 
-이 package 작성 중 제품 의존성 설치, browser 다운로드, server 실행,
-browser QA, model/agentic 실행, baseline 생성, Docker, 인프라 변경은 하지
-않았다. 실제 `UIR-TEST-001`부터 `UIR-TEST-007`까지는 `IS-1708`
-implementation loop에서 실행한다.
+v1.0.2 host 보정 evidence에는 `0.0.0.0:10091` local fixture와 exact
+Chromium 접속을 사용했다. Baseline 생성·변경, model/agentic 실행, Docker,
+인프라 또는 시스템 설정 변경은 하지 않았다. 나머지 `UIR-TEST-001`부터
+`UIR-TEST-007`까지는 `IS-1708` implementation loop에서 실행한다.

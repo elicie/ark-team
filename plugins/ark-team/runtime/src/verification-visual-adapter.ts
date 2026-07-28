@@ -110,6 +110,52 @@ export interface VerificationScreenshotRuntimeResult {
   readonly screenshots: readonly VerificationScreenshotRuntimeImage[];
 }
 
+export type VerificationScreenshotCapturePlanV2 = Omit<
+  VerificationScreenshotCaptureRequest,
+  "url"
+>;
+
+export interface VerificationScreenshotRuntimeV2Plan
+  extends Omit<
+    VerificationScreenshotRuntimeRequest,
+    "schema_version" | "contract_id" | "url" | "captures" | "policy"
+  > {
+  readonly schema_version: 2;
+  readonly contract_id: "verification_screenshot_runtime_v2";
+  readonly initial_url: string;
+  readonly expected_url_source: "validated-browser-final-url";
+  readonly readiness: VerificationBrowserScreenshotReadiness;
+  readonly captures: readonly VerificationScreenshotCapturePlanV2[];
+  readonly policy: VerificationScreenshotRuntimeRequest["policy"] & {
+    readonly navigation: "disabled";
+    readonly actions: "disabled";
+  };
+}
+
+export interface VerificationScreenshotRuntimeV2Expectation
+  extends Omit<
+    VerificationScreenshotRuntimeV2Plan,
+    "initial_url" | "expected_url_source" | "captures"
+  > {
+  readonly url: string;
+  readonly captures: readonly VerificationScreenshotCaptureRequest[];
+}
+
+export interface VerificationScreenshotRuntimeV2Result
+  extends Omit<
+    VerificationScreenshotRuntimeResult,
+    "schema_version" | "contract_id"
+  > {
+  readonly schema_version: 2;
+  readonly contract_id: "verification_screenshot_runtime_result_v2";
+}
+
+export interface VerificationBrowserScreenshotReadiness {
+  readonly selector: string;
+  readonly timeout_ms: 60_000;
+  readonly wait: "auto";
+}
+
 export interface VerificationScreenshotRuntimeImage {
   readonly sequence: number;
   readonly viewport: Viewport;
@@ -358,6 +404,172 @@ export function createVerificationScreenshotRequest(input: {
       post_processing: "disabled",
     },
   });
+}
+
+export function createVerificationScreenshotRuntimeV2Plan(input: {
+  readonly snapshot: unknown;
+  readonly case_id: string;
+  readonly attempt_id: string;
+}): VerificationScreenshotRuntimeV2Plan {
+  const parsed = screenshotRequestInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw visualError(
+      "SCREENSHOT_CAPTURE_FAILED",
+      "screenshot v2 plan input is invalid",
+      parsed.error,
+    );
+  }
+  const browserCase = parsed.data.snapshot.ui_contract.enabled
+    ? parsed.data.snapshot.ui_contract.browser_cases.find(
+        (candidate) => candidate.id === parsed.data.case_id,
+      )
+    : undefined;
+  if (browserCase === undefined) {
+    throw visualError(
+      "SCREENSHOT_CAPTURE_FAILED",
+      "screenshot v2 plan requires a declared browser case",
+    );
+  }
+  const request = createVerificationScreenshotRequest(input);
+
+  return deepFreeze({
+    schema_version: 2,
+    contract_id: "verification_screenshot_runtime_v2",
+    run_id: request.run_id,
+    snapshot_id: request.snapshot_id,
+    case_id: request.case_id,
+    attempt_id: request.attempt_id,
+    case_sha256: request.case_sha256,
+    package_fingerprint: request.package_fingerprint,
+    source_fingerprint: request.source_fingerprint,
+    adapter: { ...request.adapter },
+    browser_build: request.browser_build,
+    engine: request.engine,
+    execution: { ...request.execution },
+    origin: request.origin,
+    initial_url: request.url,
+    expected_url_source: "validated-browser-final-url",
+    context: { ...request.context },
+    network: { ...request.network },
+    readiness: {
+      selector: browserCase.readiness,
+      timeout_ms: request.timeout_ms,
+      wait: "auto",
+    },
+    captures: request.captures.map((capture) => ({
+      sequence: capture.sequence,
+      viewport: capture.viewport,
+      width: capture.width,
+      height: capture.height,
+      device_scale_factor: capture.device_scale_factor,
+      relative_path: capture.relative_path,
+      media_type: capture.media_type,
+    })),
+    timeout_ms: request.timeout_ms,
+    max_file_bytes: request.max_file_bytes,
+    policy: {
+      ...request.policy,
+      navigation: "disabled",
+      actions: "disabled",
+    },
+  });
+}
+
+export function createVerificationScreenshotRuntimeV2Expectation(input: {
+  readonly plan: VerificationScreenshotRuntimeV2Plan;
+  readonly final_url: string;
+}): VerificationScreenshotRuntimeV2Expectation {
+  const { plan, final_url: finalUrl } = input;
+  assertLocalOrigin(plan.origin);
+  assertLocalUrl(plan.initial_url, plan.origin);
+  assertLocalUrl(finalUrl, plan.origin);
+
+  return deepFreeze({
+    schema_version: 2,
+    contract_id: "verification_screenshot_runtime_v2",
+    run_id: plan.run_id,
+    snapshot_id: plan.snapshot_id,
+    case_id: plan.case_id,
+    attempt_id: plan.attempt_id,
+    case_sha256: plan.case_sha256,
+    package_fingerprint: plan.package_fingerprint,
+    source_fingerprint: plan.source_fingerprint,
+    adapter: { ...plan.adapter },
+    browser_build: plan.browser_build,
+    engine: plan.engine,
+    execution: { ...plan.execution },
+    origin: plan.origin,
+    url: finalUrl,
+    context: { ...plan.context },
+    network: { ...plan.network },
+    readiness: { ...plan.readiness },
+    captures: plan.captures.map((capture) => ({
+      ...capture,
+      url: finalUrl,
+    })),
+    timeout_ms: plan.timeout_ms,
+    max_file_bytes: plan.max_file_bytes,
+    policy: { ...plan.policy },
+  });
+}
+
+export function normalizeVerificationScreenshotRuntimeV2Result(
+  expectation: VerificationScreenshotRuntimeV2Expectation,
+  rawResult: unknown,
+): NormalizedVerificationScreenshotResult {
+  const envelope = z
+    .object({
+      schema_version: z.literal(2),
+      contract_id: z.literal("verification_screenshot_runtime_result_v2"),
+    })
+    .passthrough()
+    .safeParse(rawResult);
+  if (!envelope.success) {
+    throw visualError(
+      "SCREENSHOT_CAPTURE_FAILED",
+      "screenshot runtime v2 result is invalid",
+      envelope.error,
+    );
+  }
+
+  const requestV1: VerificationScreenshotRuntimeRequest = {
+    schema_version: 1,
+    contract_id: "verification_screenshot_runtime_v1",
+    run_id: expectation.run_id,
+    snapshot_id: expectation.snapshot_id,
+    case_id: expectation.case_id,
+    attempt_id: expectation.attempt_id,
+    case_sha256: expectation.case_sha256,
+    package_fingerprint: expectation.package_fingerprint,
+    source_fingerprint: expectation.source_fingerprint,
+    adapter: { ...expectation.adapter },
+    browser_build: expectation.browser_build,
+    engine: expectation.engine,
+    execution: { ...expectation.execution },
+    origin: expectation.origin,
+    url: expectation.url,
+    context: { ...expectation.context },
+    network: { ...expectation.network },
+    captures: expectation.captures.map((capture) => ({ ...capture })),
+    timeout_ms: expectation.timeout_ms,
+    max_file_bytes: expectation.max_file_bytes,
+    policy: {
+      browser_chrome: expectation.policy.browser_chrome,
+      full_page: expectation.policy.full_page,
+      resize: expectation.policy.resize,
+      crop: expectation.policy.crop,
+      jpeg_conversion: expectation.policy.jpeg_conversion,
+      color_space_conversion: expectation.policy.color_space_conversion,
+      alpha_normalization: expectation.policy.alpha_normalization,
+      post_processing: expectation.policy.post_processing,
+    },
+  };
+  const resultV1 = {
+    ...envelope.data,
+    schema_version: 1,
+    contract_id: "verification_screenshot_runtime_result_v1",
+  };
+  return normalizeVerificationScreenshotResult(requestV1, resultV1);
 }
 
 export function normalizeVerificationScreenshotResult(
@@ -972,7 +1184,6 @@ function assertComparisonActualIdentity(
     );
   }
   const ui = snapshot.ui_contract;
-  const url = new URL(browserCase.path, snapshot.server.api_origin).toString();
   if (
     actual.run_id !== snapshot.run_id ||
     actual.snapshot_id !== snapshot.snapshot_id ||
@@ -996,7 +1207,6 @@ function assertComparisonActualIdentity(
     actual.width !== viewport.width ||
     actual.height !== viewport.height ||
     actual.device_scale_factor !== 1 ||
-    actual.url !== url ||
     actual.relative_path !==
       `screenshots/${browserCase.id}/${viewport.name}.actual.png`
   ) {
@@ -1041,7 +1251,7 @@ function assertLocalOrigin(origin: string): void {
   }
   if (
     parsed.protocol !== "http:" ||
-    parsed.hostname !== "dev" ||
+    parsed.hostname !== "devbox" ||
     parsed.username !== "" ||
     parsed.password !== "" ||
     parsed.pathname !== "/" ||

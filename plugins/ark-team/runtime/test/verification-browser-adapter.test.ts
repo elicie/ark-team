@@ -4,16 +4,21 @@ import test from "node:test";
 
 import {
   createVerificationBrowserDriverRequest,
+  createVerificationBrowserDriverV2Request,
   normalizeVerificationBrowserDriverResult,
+  normalizeVerificationBrowserDriverV2Result,
   VerificationBrowserContractError,
   type VerificationBrowserDriverRequest,
   type VerificationBrowserDriverResult,
+  type VerificationBrowserDriverV2Request,
+  type VerificationBrowserDriverV2Result,
 } from "../src/verification-browser-adapter.js";
 import {
   APPROVED_VERIFICATION_PACKAGE,
   buildVerificationRunSnapshot,
   sha256CanonicalJson,
 } from "../src/verification-contract.js";
+import { encodeVerificationRgba8Png } from "../src/verification-png.js";
 import {
   validVerificationCoordinatorConfig,
   validVerificationSourceIdentity,
@@ -41,10 +46,10 @@ test("TEST-1710 fixes the fresh deterministic Chromium request to the snapshot",
       { name: "1440x900", width: 1_440, height: 900 },
     ],
   });
-  assert.equal(request.origin, "http://dev:10001");
-  assert.equal(request.url, "http://dev:10001/");
+  assert.equal(request.origin, "http://devbox:10001");
+  assert.equal(request.url, "http://devbox:10001/");
   assert.deepEqual(request.network, {
-    allowed_origin: "http://dev:10001",
+    allowed_origin: "http://devbox:10001",
     redirects: "same-origin-only",
     proxy: "disabled",
     credentials: "omit",
@@ -114,7 +119,7 @@ test("TEST-1710 accepts exact ordered evidence, redacts it, and separates trace 
   raw.navigation.push({
     sequence: 1,
     url:
-      "http://dev:10001/search?q=user@example.com&note=navigation-secret",
+      "http://devbox:10001/search?q=user@example.com&note=navigation-secret",
     status: 200,
     elapsed_ms: 2,
   });
@@ -284,11 +289,130 @@ test("TEST-1710 rejects invalid input cases instead of inferring browser behavio
   );
 });
 
+test("UIR-TEST-003 combines one browser action contract with three actionless screenshot captures", () => {
+  const request = createV2Request();
+
+  assert.equal(request.schema_version, 2);
+  assert.equal(request.contract_id, "verification_browser_driver_v2");
+  assert.equal(request.policy.screenshots, "required");
+  assert.equal(request.actions.length, 2);
+  assert.equal(request.screenshot.schema_version, 2);
+  assert.equal(
+    request.screenshot.contract_id,
+    "verification_screenshot_runtime_v2",
+  );
+  assert.equal("actions" in request.screenshot, false);
+  assert.equal("navigation" in request.screenshot, false);
+  assert.equal(request.screenshot.policy.actions, "disabled");
+  assert.equal(request.screenshot.policy.navigation, "disabled");
+  assert.deepEqual(
+    request.screenshot.captures.map(
+      ({ sequence, viewport, width, height }) => ({
+        sequence,
+        viewport,
+        width,
+        height,
+      }),
+    ),
+    [
+      { sequence: 0, viewport: "375x812", width: 375, height: 812 },
+      { sequence: 1, viewport: "768x1024", width: 768, height: 1_024 },
+      { sequence: 2, viewport: "1440x900", width: 1_440, height: 900 },
+    ],
+  );
+
+  const raw = validV2Result(request, "http://devbox:10001/dashboard");
+  const normalized = normalizeVerificationBrowserDriverV2Result(request, raw);
+
+  assert.equal(normalized.passed, true);
+  assert.equal(normalized.browser.evidence.final_url, raw.final_url);
+  assert.equal(
+    normalized.screenshot.evidence.url,
+    "http://devbox:10001/dashboard",
+  );
+  assert.equal(normalized.screenshot.images.length, 3);
+  assert.equal(
+    normalized.screenshot.images.every(
+      (image) =>
+        image.evidence.url === "http://devbox:10001/dashboard" &&
+        image.png_bytes.byteLength === image.evidence.byte_length,
+    ),
+    true,
+  );
+});
+
+test("UIR-TEST-004 validates browser final_url before enforcing exact screenshot URLs", () => {
+  const request = createV2Request();
+
+  const wrongContract = validV2Result(
+    request,
+    "http://devbox:10001/dashboard",
+  ) as unknown as Record<string, unknown>;
+  wrongContract.contract_id = "verification_browser_driver_result_v1";
+  assert.throws(
+    () => normalizeVerificationBrowserDriverV2Result(request, wrongContract),
+    isBrowserContractError,
+  );
+
+  const initialScreenshot = validV2Result(
+    request,
+    "http://devbox:10001/dashboard",
+  );
+  initialScreenshot.screenshot.url = request.url;
+  initialScreenshot.screenshot.screenshots.forEach((image) => {
+    image.url = request.url;
+  });
+  assert.throws(
+    () =>
+      normalizeVerificationBrowserDriverV2Result(request, initialScreenshot),
+    isBrowserContractError,
+  );
+
+  const crossOriginBrowser = validV2Result(
+    request,
+    "http://devbox:10001/dashboard",
+  );
+  crossOriginBrowser.final_url = "https://example.com/dashboard";
+  crossOriginBrowser.navigation.at(-1)!.url =
+    "https://example.com/dashboard";
+  assert.throws(
+    () =>
+      normalizeVerificationBrowserDriverV2Result(request, crossOriginBrowser),
+    (error: unknown) =>
+      isBrowserContractError(error) &&
+      error instanceof Error &&
+      error.message.includes("cross-origin"),
+  );
+
+  const crossOriginScreenshot = validV2Result(
+    request,
+    "http://devbox:10001/dashboard",
+  );
+  crossOriginScreenshot.screenshot.screenshots[0]!.url =
+    "https://example.com/dashboard";
+  assert.throws(
+    () =>
+      normalizeVerificationBrowserDriverV2Result(
+        request,
+        crossOriginScreenshot,
+      ),
+    isBrowserContractError,
+  );
+});
+
 function createRequest(): VerificationBrowserDriverRequest {
   return createVerificationBrowserDriverRequest({
     snapshot: validSnapshot(),
     case_id: "home-browser",
     attempt_id: "browser-attempt-1",
+  });
+}
+
+function createV2Request(): VerificationBrowserDriverV2Request {
+  return createVerificationBrowserDriverV2Request({
+    snapshot: validSnapshot(),
+    case_id: "home-browser",
+    attempt_id: "combined-attempt-1",
   });
 }
 
@@ -372,6 +496,114 @@ function validResult(
     },
     passed: true,
     message: "all declared deterministic assertions passed",
+  };
+}
+
+function validV2Result(
+  request: VerificationBrowserDriverV2Request,
+  finalUrl: string,
+): Mutable<VerificationBrowserDriverV2Result> {
+  const traceBytes = Uint8Array.from([80, 75, 3, 4]);
+  const navigation: Mutable<VerificationBrowserDriverResult>["navigation"] = [
+    {
+      sequence: 0,
+      url: request.url,
+      status: 200,
+      elapsed_ms: 8,
+    },
+  ];
+  if (finalUrl !== request.url) {
+    navigation.push({
+      sequence: 1,
+      url: finalUrl,
+      status: 200,
+      elapsed_ms: 12,
+    });
+  }
+  return {
+    schema_version: 2,
+    contract_id: "verification_browser_driver_result_v2",
+    case_id: request.case_id,
+    case_sha256: request.case_sha256,
+    adapter: { ...request.adapter },
+    browser_build: request.browser_build,
+    origin: request.origin,
+    final_url: finalUrl,
+    context: structuredClone(request.context) as Mutable<
+      VerificationBrowserDriverRequest["context"]
+    >,
+    elapsed_ms: 80,
+    readiness: {
+      passed: true,
+      elapsed_ms: 10,
+      message: null,
+    },
+    actions: request.actions.map(({ sequence, action }) => ({
+      sequence,
+      input_sha256: sha256CanonicalJson(action),
+      passed: true,
+      elapsed_ms: 1,
+      message: null,
+    })),
+    assertions: request.assertions.map(({ sequence, assertion }) => ({
+      sequence,
+      input_sha256: sha256CanonicalJson(assertion),
+      passed: true,
+      elapsed_ms: 5,
+      message: null,
+    })),
+    navigation,
+    console: [],
+    page_errors: [],
+    dialogs: [],
+    trace: {
+      relative_path: request.trace.relative_path,
+      media_type: "application/zip",
+      sha256: createHash("sha256").update(traceBytes).digest("hex"),
+      bytes: traceBytes,
+    },
+    passed: true,
+    message: "all declared deterministic assertions passed",
+    screenshot: {
+      schema_version: 2,
+      contract_id: "verification_screenshot_runtime_result_v2",
+      run_id: request.screenshot.run_id,
+      snapshot_id: request.screenshot.snapshot_id,
+      case_id: request.screenshot.case_id,
+      attempt_id: request.screenshot.attempt_id,
+      case_sha256: request.screenshot.case_sha256,
+      package_fingerprint: request.screenshot.package_fingerprint,
+      source_fingerprint: request.screenshot.source_fingerprint,
+      adapter: { ...request.screenshot.adapter },
+      browser_build: request.screenshot.browser_build,
+      origin: request.screenshot.origin,
+      url: finalUrl,
+      screenshots: request.screenshot.captures.map((capture) => {
+        const bytes = encodeVerificationRgba8Png({
+          width: capture.width,
+          height: capture.height,
+          rgba: new Uint8Array(capture.width * capture.height * 4),
+        });
+        return {
+          ...capture,
+          url: finalUrl,
+          captured_at_utc: "2026-07-28T00:00:01.000Z",
+          byte_length: bytes.byteLength,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          capture: {
+            browser_chrome: "excluded",
+            full_page: false,
+            resized: false,
+            cropped: false,
+            converted: false,
+            color_space_converted: false,
+            alpha_normalized: false,
+            post_processed: false,
+          },
+          bytes,
+        };
+      }),
+    },
   };
 }
 

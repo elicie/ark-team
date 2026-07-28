@@ -601,6 +601,39 @@ test("TEST-1719 UI-only bootstrap performs visual work before advisory agentic w
   );
 });
 
+test("UIR-TEST-006 production UI input loads only the approved baseline store", async (t) => {
+  const fixture = await createUiFixture(t, false, false);
+  const result = await fixture.coordinator.runBootstrap(fixture.run_id, {
+    package_fingerprint:
+      APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+    server: {
+      framework: "other",
+      allowed_dev_origins: [],
+    },
+    ui_evidence_source: "approved_store",
+    semantic_checklist_by_case: {
+      "home-browser": {
+        identity: "ark-ui-semantic-checklist",
+        version: "1.0.0",
+      },
+    },
+  });
+
+  assert.equal(result.status, "completed");
+  if (result.status !== "completed") {
+    assert.fail("approved-store UI bootstrap unexpectedly produced a delta");
+  }
+  assert.equal(result.run.verification_state?.terminal_outcome, "passed");
+  assert.equal(
+    result.run.verification_records.filter(
+      (record) =>
+        record.schema_version === 2 &&
+        record.record_type === "comparison",
+    ).length,
+    3,
+  );
+});
+
 test("TEST-1719 both-enabled bootstrap preserves Backend-before-UI order and writes two lane summaries", async (t) => {
   const fixture = await createUiFixture(t, true);
 
@@ -1227,6 +1260,9 @@ async function createUiFixture(
       return validApiResult(request);
     },
     execute_browser: async (request) => {
+      if (request.schema_version !== 1) {
+        assert.fail("legacy bootstrap fixture received a combined request");
+      }
       effects.adapter_calls.push("browser");
       return validBrowserResult(request);
     },

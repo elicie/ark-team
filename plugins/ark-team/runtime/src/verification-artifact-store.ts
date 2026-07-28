@@ -47,7 +47,20 @@ export interface VerificationApprovedBaselineResult {
   manifest: VerificationApprovedBaselineManifest;
   manifest_sha256: string;
   baseline_set_sha256: string;
+  png_bytes_by_case: VerificationApprovedBaselinePngBytesByCase;
 }
+
+export type VerificationApprovedBaselineViewport =
+  | "375x812"
+  | "768x1024"
+  | "1440x900";
+
+export type VerificationApprovedBaselinePngBytesByCase = Readonly<
+  Record<
+    string,
+    Readonly<Record<VerificationApprovedBaselineViewport, Uint8Array>>
+  >
+>;
 
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -317,6 +330,16 @@ export class VerificationArtifactStore {
     await this.verifyArtifactsAtRoot(this.artifact_root, artifacts);
   }
 
+  async readRegisteredArtifact(
+    artifact: VerificationArtifactPayload,
+  ): Promise<Uint8Array> {
+    this.assertV4Snapshot();
+    await this.assertRegisteredRoot();
+    return Uint8Array.from(
+      await this.readOneAtRoot(this.artifact_root, artifact),
+    );
+  }
+
   private async verifyArtifactsAtRoot(
     root: string,
     artifacts: readonly VerificationArtifactPayload[],
@@ -434,6 +457,17 @@ export class VerificationArtifactStore {
           "approved baseline set hash does not match its identity",
         );
       }
+      const pngBytesByCase: Record<
+        string,
+        Partial<
+          Record<VerificationApprovedBaselineViewport, Uint8Array>
+        >
+      > = Object.create(null) as Record<
+        string,
+        Partial<
+          Record<VerificationApprovedBaselineViewport, Uint8Array>
+        >
+      >;
       for (const entry of manifest.entries) {
         const object = await readSafeRegularFile(
           root,
@@ -458,11 +492,19 @@ export class VerificationArtifactStore {
             "approved baseline PNG dimensions do not match its manifest",
           );
         }
+        const viewport =
+          entry.viewport as VerificationApprovedBaselineViewport;
+        const byViewport = pngBytesByCase[entry.case_id] ?? {};
+        byViewport[viewport] = Uint8Array.from(object.bytes);
+        pngBytesByCase[entry.case_id] = byViewport;
       }
+      const immutablePngBytesByCase =
+        freezeApprovedBaselinePngBytesByCase(pngBytesByCase);
       return {
         manifest,
         manifest_sha256: sha256(manifestFile.bytes),
         baseline_set_sha256: baselineSetSha256,
+        png_bytes_by_case: immutablePngBytesByCase,
       };
     } catch (error) {
       if (
@@ -633,6 +675,13 @@ export class VerificationArtifactStore {
     root: string,
     artifact: VerificationArtifactPayload,
   ): Promise<void> {
+    await this.readOneAtRoot(root, artifact);
+  }
+
+  private async readOneAtRoot(
+    root: string,
+    artifact: VerificationArtifactPayload,
+  ): Promise<Buffer> {
     assertArtifactId(artifact.artifact_id);
     assertCanonicalRelativePath(artifact.relative_path);
     if (
@@ -671,7 +720,39 @@ export class VerificationArtifactStore {
     ) {
       throw invalidArtifact("artifact image metadata does not match its bytes");
     }
+    return file.bytes;
   }
+}
+
+function freezeApprovedBaselinePngBytesByCase(
+  value: Record<
+    string,
+    Partial<Record<VerificationApprovedBaselineViewport, Uint8Array>>
+  >,
+): VerificationApprovedBaselinePngBytesByCase {
+  const result: Record<
+    string,
+    Readonly<Record<VerificationApprovedBaselineViewport, Uint8Array>>
+  > = Object.create(null) as Record<
+    string,
+    Readonly<Record<VerificationApprovedBaselineViewport, Uint8Array>>
+  >;
+  for (const [caseId, byViewport] of Object.entries(value)) {
+    const complete = {
+      "375x812": byViewport["375x812"],
+      "768x1024": byViewport["768x1024"],
+      "1440x900": byViewport["1440x900"],
+    };
+    if (Object.values(complete).some((bytes) => bytes === undefined)) {
+      throw baselineError(
+        "approved baseline PNG bytes do not cover the exact viewport matrix",
+      );
+    }
+    result[caseId] = Object.freeze(
+      complete as Record<VerificationApprovedBaselineViewport, Uint8Array>,
+    );
+  }
+  return Object.freeze(result);
 }
 
 function validateArtifactBytes(

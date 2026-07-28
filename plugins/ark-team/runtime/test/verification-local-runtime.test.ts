@@ -27,6 +27,12 @@ import {
   localBackendIntegrationProblem,
 } from "../src/verification-local-runtime.js";
 import {
+  VERIFICATION_PLAYWRIGHT_ADAPTER,
+  VERIFICATION_PLAYWRIGHT_BROWSER_BUILD,
+  VERIFICATION_PLAYWRIGHT_BROWSER_VERSION,
+  VERIFICATION_UI_RUNTIME_SPEC_SHA256,
+} from "../src/verification-playwright-runtime.js";
+import {
   validVerificationCoordinatorConfig,
   validVerificationSourceIdentity,
 } from "./verification-fixture.js";
@@ -158,7 +164,7 @@ test("TEST-1719 runs one body-free Backend QA probe through a real local server 
     selectedPort = snapshot.server.port;
     assert.ok(selectedPort >= 10_001);
     assert.equal(snapshot.server.bind, "0.0.0.0");
-    assert.equal(snapshot.server.host, "dev");
+    assert.equal(snapshot.server.host, "devbox");
     const requestRecord = result.run.verification_records.find(
       (record) =>
         record.schema_version === 2 &&
@@ -189,6 +195,47 @@ test("TEST-1719 runs one body-free Backend QA probe through a real local server 
   await assertPortCanBind(selectedPort);
 });
 
+test("UIR-TEST-001 production runtime exposes only the exact cached Playwright identity", async () => {
+  const runtime = createLocalBackendVerificationRuntime();
+  assert.equal(runtime.runtime.browser_contract, "v2-combined");
+  assert.deepEqual(
+    runtime.runtime.capability_adapters.browser,
+    VERIFICATION_PLAYWRIGHT_ADAPTER,
+  );
+  assert.deepEqual(
+    runtime.runtime.capability_adapters.screenshot,
+    VERIFICATION_PLAYWRIGHT_ADAPTER,
+  );
+  assert.deepEqual(runtime.runtime.capability_adapters.comparison, {
+    name: "ark-team-comparison",
+    version: "1.0.0",
+  });
+  assert.equal(runtime.runtime.execute_screenshots, undefined);
+
+  const first = runtime.playwright_probe();
+  const second = runtime.playwright_probe();
+  assert.strictEqual(first, second);
+  const probe = await first;
+  assert.equal(probe.available, true, probe.reason ?? undefined);
+  assert.equal(probe.package_version, "1.62.0");
+  assert.equal(probe.browser_version, VERIFICATION_PLAYWRIGHT_BROWSER_VERSION);
+  assert.equal(probe.browser_build, VERIFICATION_PLAYWRIGHT_BROWSER_BUILD);
+  assert.equal(probe.spec_sha256, VERIFICATION_UI_RUNTIME_SPEC_SHA256);
+
+  const browser = await runtime.runtime.capability_probe(
+    "browser",
+    AbortSignal.timeout(60_000),
+  );
+  const screenshot = await runtime.runtime.capability_probe(
+    "screenshot",
+    AbortSignal.timeout(60_000),
+  );
+  assert.equal(browser.available, true);
+  assert.equal(screenshot.available, true);
+  assert.equal(browser.version, VERIFICATION_PLAYWRIGHT_ADAPTER.version);
+  assert.equal(screenshot.version, VERIFICATION_PLAYWRIGHT_ADAPTER.version);
+});
+
 test("TEST-1719 default gate records SPEC_DELTA for UI, body, and framework sources that have no approved runtime contract", async (t) => {
   const root = await temporaryProject(t);
   const projectRoot = path.join(root, "project");
@@ -210,6 +257,51 @@ test("TEST-1719 default gate records SPEC_DELTA for UI, body, and framework sour
   assert.equal(
     (await store.getVerificationSpecDelta(uiRun.run_id))?.classification,
     "environment_mismatch",
+  );
+
+  const approvedUiConfig = structuredClone(DEFAULT_PROJECT_CONFIG);
+  const approvedUiVerification = validVerificationCoordinatorConfig();
+  approvedUiVerification.backend = { enabled: false };
+  if (!approvedUiVerification.ui.enabled) {
+    assert.fail("UI fixture is disabled");
+  }
+  approvedUiVerification.ui.deterministic_adapter =
+    VERIFICATION_PLAYWRIGHT_ADAPTER.name;
+  approvedUiVerification.ui.deterministic_adapter_version =
+    VERIFICATION_PLAYWRIGHT_ADAPTER.version;
+  approvedUiVerification.ui.browser_build =
+    VERIFICATION_PLAYWRIGHT_BROWSER_BUILD;
+  for (const task of approvedUiVerification.ui.agentic_tasks) {
+    task.browser_build = VERIFICATION_PLAYWRIGHT_BROWSER_BUILD;
+  }
+  approvedUiVerification.ui.semantic_review_required = false;
+  approvedUiVerification.ui.required_capabilities = [
+    "browser",
+    "comparison",
+    "screenshot",
+    "server",
+  ];
+  approvedUiVerification.ui.optional_capabilities = [
+    "agentic_browser",
+    "semantic_review",
+  ];
+  approvedUiConfig.verification.coordinator = approvedUiVerification;
+  const approvedUiRun = await store.createRun({
+    objective: "승인 UI 런타임 사전검증",
+    project_path: projectRoot,
+    project_config: approvedUiConfig,
+  });
+  await assert.rejects(
+    () => gate.prepareOriginalPmReview(approvedUiRun.run_id),
+    isSpecDeltaBlock,
+  );
+  const approvedUiDelta = await store.getVerificationSpecDelta(
+    approvedUiRun.run_id,
+  );
+  assert.equal(approvedUiDelta?.classification, "environment_mismatch");
+  assert.match(
+    approvedUiDelta?.evidence[0]?.value ?? "",
+    /completed local_merge integration/,
   );
 
   const bodyConfig = structuredClone(DEFAULT_PROJECT_CONFIG);
@@ -243,7 +335,7 @@ test("TEST-1719 default gate records SPEC_DELTA for UI, body, and framework sour
   }
   await writeFile(
     path.join(projectRoot, "package.json"),
-    JSON.stringify({ workspaces: ["apps/*"] }),
+    JSON.stringify({ dependencies: { next: "16.0.0" } }),
     "utf8",
   );
   const frameworkConfig = structuredClone(DEFAULT_PROJECT_CONFIG);
@@ -268,6 +360,36 @@ test("TEST-1719 default gate records SPEC_DELTA for UI, body, and framework sour
     (await store.getVerificationSpecDelta(frameworkRun.run_id))
       ?.classification,
     "omission",
+  );
+
+  await writeFile(
+    path.join(projectRoot, "next.config.mjs"),
+    [
+      'throw new Error("configuration inspection must not execute source");',
+      'export default { allowedDevOrigins: ["dev", "devbox"] };',
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const registeredFrameworkRun = await store.createRun({
+    objective: "정적 Next.js dev origin 등록",
+    project_path: projectRoot,
+    project_config: frameworkConfig,
+  });
+  await assert.rejects(
+    () => gate.prepareOriginalPmReview(registeredFrameworkRun.run_id),
+    isSpecDeltaBlock,
+  );
+  const registeredFrameworkDelta =
+    await store.getVerificationSpecDelta(registeredFrameworkRun.run_id);
+  assert.equal(
+    registeredFrameworkDelta?.classification,
+    "environment_mismatch",
+    JSON.stringify(registeredFrameworkDelta),
+  );
+  assert.match(
+    registeredFrameworkDelta?.evidence[0]?.value ?? "",
+    /completed local_merge integration/,
   );
 });
 

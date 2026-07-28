@@ -534,7 +534,7 @@ function assertLocalOrigin(origin: string): void {
   const parsed = new URL(origin);
   if (
     parsed.protocol !== "http:" ||
-    parsed.hostname !== "dev" ||
+    parsed.hostname !== "devbox" ||
     parsed.username !== "" ||
     parsed.password !== "" ||
     parsed.pathname !== "/" ||

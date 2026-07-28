@@ -6,10 +6,15 @@ import { deflateSync } from "node:zlib";
 import {
   compareVerificationPngs,
   createVerificationScreenshotRequest,
+  createVerificationScreenshotRuntimeV2Expectation,
+  createVerificationScreenshotRuntimeV2Plan,
   normalizeVerificationScreenshotResult,
+  normalizeVerificationScreenshotRuntimeV2Result,
   VerificationVisualContractError,
   type VerificationScreenshotRuntimeRequest,
   type VerificationScreenshotRuntimeResult,
+  type VerificationScreenshotRuntimeV2Expectation,
+  type VerificationScreenshotRuntimeV2Result,
 } from "../src/verification-visual-adapter.js";
 import {
   decodeVerificationRgba8Png,
@@ -39,8 +44,8 @@ test("TEST-1711 fixes exactly three screenshot captures to the snapshot", () => 
 
   assert.equal(request.execution.cwd, "/tmp/ark-team-project");
   assert.equal(request.execution.shell, false);
-  assert.equal(request.origin, "http://dev:10001");
-  assert.equal(request.url, "http://dev:10001/");
+  assert.equal(request.origin, "http://devbox:10001");
+  assert.equal(request.url, "http://devbox:10001/");
   assert.deepEqual(request.adapter, {
     name: "playwright-cli",
     version: "1.62.0",
@@ -182,6 +187,172 @@ test("TEST-1711 rejects missing, reordered, transformed, wrong-dimension, hash-d
       fixtureCase.name,
     );
   }
+});
+
+test("UIR-TEST-004 derives the v2 screenshot expectation from the validated browser final URL", () => {
+  const fixture = visualFixture();
+  const plan = createVerificationScreenshotRuntimeV2Plan({
+    snapshot: fixture.snapshot,
+    case_id: "home-browser",
+    attempt_id: "combined-attempt-1",
+  });
+
+  assert.equal(plan.schema_version, 2);
+  assert.equal(plan.contract_id, "verification_screenshot_runtime_v2");
+  assert.equal(plan.initial_url, "http://devbox:10001/");
+  assert.equal(plan.expected_url_source, "validated-browser-final-url");
+  assert.deepEqual(plan.readiness, {
+    selector: "body",
+    timeout_ms: 60_000,
+    wait: "auto",
+  });
+  assert.equal("actions" in plan, false);
+  assert.equal("navigation" in plan, false);
+  assert.equal(plan.policy.actions, "disabled");
+  assert.equal(plan.policy.navigation, "disabled");
+  assert.deepEqual(
+    plan.captures.map(({ sequence, viewport, width, height }) => ({
+      sequence,
+      viewport,
+      width,
+      height,
+    })),
+    VIEWPORTS.map((viewport, sequence) => ({
+      sequence,
+      viewport: viewport.name,
+      width: viewport.width,
+      height: viewport.height,
+    })),
+  );
+  assert.equal(plan.captures.some((capture) => "url" in capture), false);
+
+  const expectation = createVerificationScreenshotRuntimeV2Expectation({
+    plan,
+    final_url: "http://devbox:10001/dashboard",
+  });
+  assert.equal(expectation.url, "http://devbox:10001/dashboard");
+  assert.equal(
+    expectation.captures.every(
+      (capture) => capture.url === "http://devbox:10001/dashboard",
+    ),
+    true,
+  );
+
+  const normalized = normalizeVerificationScreenshotRuntimeV2Result(
+    expectation,
+    validScreenshotV2Result(expectation, fixture.baselinePngs),
+  );
+  assert.equal(normalized.evidence.url, "http://devbox:10001/dashboard");
+  assert.equal(
+    normalized.images.every(
+      (image) => image.evidence.url === "http://devbox:10001/dashboard",
+    ),
+    true,
+  );
+  assert.equal(
+    compare(
+      fixture,
+      normalized.images[0]!,
+      fixture.baselinePngs.get("375x812")!,
+      "approved",
+    ).passed,
+    true,
+  );
+});
+
+test("UIR-TEST-004 rejects v2 identity, order, dimensions, hash, initial, different, and cross-origin URLs", () => {
+  const fixture = visualFixture();
+  const plan = createVerificationScreenshotRuntimeV2Plan({
+    snapshot: fixture.snapshot,
+    case_id: "home-browser",
+    attempt_id: "combined-attempt-1",
+  });
+  const expectation = createVerificationScreenshotRuntimeV2Expectation({
+    plan,
+    final_url: "http://devbox:10001/dashboard",
+  });
+  const cases: Array<{
+    name: string;
+    mutate: (result: Mutable<VerificationScreenshotRuntimeV2Result>) => void;
+  }> = [
+    {
+      name: "wrong identity",
+      mutate: (result) => {
+        result.attempt_id = "different-attempt";
+      },
+    },
+    {
+      name: "reordered captures",
+      mutate: (result) => {
+        result.screenshots.reverse();
+      },
+    },
+    {
+      name: "wrong dimensions",
+      mutate: (result) => {
+        result.screenshots[0]!.width = 376;
+      },
+    },
+    {
+      name: "hash mismatch",
+      mutate: (result) => {
+        result.screenshots[0]!.sha256 = "f".repeat(64);
+      },
+    },
+    {
+      name: "initial result URL",
+      mutate: (result) => {
+        result.url = plan.initial_url;
+      },
+    },
+    {
+      name: "initial image URL",
+      mutate: (result) => {
+        result.screenshots[0]!.url = plan.initial_url;
+      },
+    },
+    {
+      name: "different same-origin URL",
+      mutate: (result) => {
+        result.screenshots[0]!.url = "http://devbox:10001/settings";
+      },
+    },
+    {
+      name: "cross-origin result URL",
+      mutate: (result) => {
+        result.url = "https://example.com/dashboard";
+      },
+    },
+    {
+      name: "cross-origin image URL",
+      mutate: (result) => {
+        result.screenshots[0]!.url = "https://example.com/dashboard";
+      },
+    },
+  ];
+
+  for (const fixtureCase of cases) {
+    const result = validScreenshotV2Result(
+      expectation,
+      fixture.baselinePngs,
+    );
+    fixtureCase.mutate(result);
+    assert.throws(
+      () =>
+        normalizeVerificationScreenshotRuntimeV2Result(expectation, result),
+      isVisualError("SCREENSHOT_CAPTURE_FAILED"),
+      fixtureCase.name,
+    );
+  }
+
+  assert.throws(
+    () =>
+      createVerificationScreenshotRuntimeV2Expectation({
+        plan,
+        final_url: "https://example.com/dashboard",
+      }),
+    isVisualError("INVALID_RECORD"),
+  );
 });
 
 test("TEST-1713 produces deterministic transparent/magenta RGBA8 diff without mutating baseline", () => {
@@ -545,6 +716,47 @@ function validScreenshotResult(
       const bytes = Uint8Array.from(
         fixture.baselinePngs.get(capture.viewport)!,
       );
+      return {
+        ...capture,
+        captured_at_utc: "2026-07-27T00:00:01.000Z",
+        byte_length: bytes.byteLength,
+        sha256: sha256Bytes(bytes),
+        capture: {
+          browser_chrome: "excluded",
+          full_page: false,
+          resized: false,
+          cropped: false,
+          converted: false,
+          color_space_converted: false,
+          alpha_normalized: false,
+          post_processed: false,
+        },
+        bytes,
+      };
+    }),
+  };
+}
+
+function validScreenshotV2Result(
+  expectation: VerificationScreenshotRuntimeV2Expectation,
+  pngs: ReadonlyMap<(typeof VIEWPORTS)[number]["name"], Uint8Array>,
+): Mutable<VerificationScreenshotRuntimeV2Result> {
+  return {
+    schema_version: 2,
+    contract_id: "verification_screenshot_runtime_result_v2",
+    run_id: expectation.run_id,
+    snapshot_id: expectation.snapshot_id,
+    case_id: expectation.case_id,
+    attempt_id: expectation.attempt_id,
+    case_sha256: expectation.case_sha256,
+    package_fingerprint: expectation.package_fingerprint,
+    source_fingerprint: expectation.source_fingerprint,
+    adapter: { ...expectation.adapter },
+    browser_build: expectation.browser_build,
+    origin: expectation.origin,
+    url: expectation.url,
+    screenshots: expectation.captures.map((capture) => {
+      const bytes = Uint8Array.from(pngs.get(capture.viewport)!);
       return {
         ...capture,
         captured_at_utc: "2026-07-27T00:00:01.000Z",

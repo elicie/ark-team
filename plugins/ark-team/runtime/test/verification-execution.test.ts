@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import {
   createServer,
   request as requestHttp,
@@ -21,14 +27,21 @@ import type {
 import type {
   VerificationBrowserDriverRequest,
   VerificationBrowserDriverResult,
+  VerificationBrowserDriverV2Request,
+  VerificationBrowserDriverV2Result,
 } from "../src/verification-browser-adapter.js";
 import {
   APPROVED_VERIFICATION_PACKAGE,
+  canonicalJson,
   sha256CanonicalJson,
+  verificationApprovedBaselineManifestSchema,
+  verificationBaselineSetSha256,
+  type VerificationApprovedBaselineManifest,
   type VerificationLinkedRecord,
   type VerificationRunSnapshot,
 } from "../src/verification-contract.js";
 import {
+  VerificationBootstrapPmGate,
   VerificationCoordinator,
   type DeepReadonly,
 } from "../src/verification-coordinator.js";
@@ -71,6 +84,9 @@ test("IS-1705 connects registered API/browser requests to JSON and trace evidenc
       return executeApiAgainstLocalServer(request);
     },
     execute_browser: async (request) => {
+      if (request.schema_version !== 1) {
+        assert.fail("legacy execution fixture received a combined request");
+      }
       browserRequest = request;
       assert.equal(await loadLocalPage(request.url), "<h1>Home</h1>");
       return validBrowserResult(request);
@@ -211,12 +227,12 @@ test("IS-1705 connects registered API/browser requests to JSON and trace evidenc
       {
         method: "GET",
         url: "/",
-        host: `dev:${fakeServer.port}`,
+        host: `devbox:${fakeServer.port}`,
       },
       {
         method: "GET",
         url: "/",
-        host: `dev:${fakeServer.port}`,
+        host: `devbox:${fakeServer.port}`,
       },
     ],
   );
@@ -227,7 +243,12 @@ test("IS-1706 persists screenshots, semantic review, comparison guard, and advis
     t,
     {
       execute_api: async (request) => validApiResult(request),
-      execute_browser: async (request) => validBrowserResult(request),
+      execute_browser: async (request) => {
+        if (request.schema_version !== 1) {
+          assert.fail("legacy execution fixture received a combined request");
+        }
+        return validBrowserResult(request);
+      },
       execute_screenshots: async (request) => validScreenshotResult(request),
       semantic_review_active_turn: () => ({
         capability: "localImage",
@@ -384,6 +405,262 @@ test("IS-1706 persists screenshots, semantic review, comparison guard, and advis
   assert.equal(agenticRecord.artifact_references.length, 4);
 });
 
+test("UIR-TEST-004 reopens and materializes three staged combined screenshots without another browser effect", async (t) => {
+  let browserCalls = 0;
+  let actionSideEffects = 0;
+  const fixture = await createFixture(t, {
+    browser_contract: "v2-combined",
+    configure: (verification) => {
+      if (!verification.ui.enabled) {
+        assert.fail("combined fixture requires the UI lane");
+      }
+      verification.ui.browser_cases[0]!.actions = [
+        { type: "click", selector: "[data-testid=continue]" },
+      ];
+    },
+    execute_api: async (request) => validApiResult(request),
+    execute_browser: async (request) => {
+      if (request.schema_version !== 2) {
+        assert.fail("combined runtime received a legacy browser request");
+      }
+      browserCalls += 1;
+      assert.equal(request.actions.length, 1);
+      actionSideEffects += request.actions.filter(
+        ({ action }) => action.type === "click",
+      ).length;
+      return validCombinedBrowserResult(request);
+    },
+  });
+  const snapshot = requireV2Snapshot(
+    (await fixture.store.getRun(fixture.run_id)).verification_snapshot,
+  );
+
+  const browser = await fixture.coordinator.runBrowserCase(fixture.run_id, {
+    action_id: "combined-browser",
+    case_id: "home-browser",
+  });
+  if (!browser.ok) {
+    assert.fail(browser.message);
+  }
+  assert.equal(browserCalls, 1);
+  assert.equal(actionSideEffects, 1);
+
+  const afterBrowser = await fixture.store.getRun(fixture.run_id);
+  const browserRecord = findRecord(
+    afterBrowser.verification_records,
+    "browser",
+    "home-browser",
+  );
+  const stagedPngs = browserRecord.artifact_references.filter(
+    (reference) =>
+      reference.artifact_id.startsWith("combined-screenshot-") &&
+      !reference.artifact_id.startsWith("combined-screenshot-evidence-"),
+  );
+  assert.equal(stagedPngs.length, 3);
+  for (const reference of stagedPngs) {
+    const bytes = await readArtifact(snapshot, reference.relative_path);
+    assert.equal(sha256Bytes(bytes), reference.sha256);
+  }
+
+  assert.equal(
+    (await fixture.coordinator.advance(fixture.run_id, "collecting")).accepted,
+    true,
+  );
+  const reopened = fixture.reopen();
+  const screenshots = await reopened.coordinator.runScreenshots(
+    fixture.run_id,
+    {
+      action_id: "materialize-combined-screenshots",
+      case_id: "home-browser",
+    },
+  );
+  if (!screenshots.ok) {
+    assert.fail(screenshots.message);
+  }
+
+  assert.equal(browserCalls, 1);
+  assert.equal(actionSideEffects, 1);
+  assert.equal(screenshots.value.images.length, 3);
+  assert.deepEqual(
+    screenshots.value.images.map((image) => image.evidence.viewport),
+    ["375x812", "768x1024", "1440x900"],
+  );
+  assert.equal(
+    screenshots.value.images.every(
+      (image) => image.evidence.url === "http://devbox:10001/after-action",
+    ),
+    true,
+  );
+  for (const image of screenshots.value.images) {
+    assert.equal(
+      sha256Bytes(await readArtifact(snapshot, image.artifact.relative_path)),
+      image.evidence.sha256,
+    );
+  }
+  const reopenedRun = await reopened.store.getRun(fixture.run_id);
+  assert.equal(
+    reopenedRun.verification_records.filter(
+      (record) => record.record_type === "screenshot",
+    ).length,
+    3,
+  );
+});
+
+test("UIR-TEST-004 production PM gate resumes staged combined screenshots without another browser effect", async (t) => {
+  let browserCalls = 0;
+  let agenticCalls = 0;
+  let serverProbes = 0;
+  const fixture = await createFixture(t, {
+    browser_contract: "v2-combined",
+    provision_baseline: true,
+    configure: (verification) => {
+      verification.backend = { enabled: false };
+    },
+    execute_api: async (request) => validApiResult(request),
+    probe_http: async () => {
+      serverProbes += 1;
+      if (serverProbes > 1) {
+        throw new Error("the browser/screenshot recovery boundary has no server");
+      }
+      return { status: 200 };
+    },
+    execute_browser: async (request) => {
+      if (request.schema_version !== 2) {
+        assert.fail("combined runtime received a legacy browser request");
+      }
+      browserCalls += 1;
+      return validCombinedBrowserResult(request);
+    },
+    semantic_review_active_turn: () => ({
+      capability: "localImage",
+      adapter: {
+        name: "fixture-image-review",
+        version: "1.0.0",
+      },
+    }),
+    execute_semantic_review: async (request) =>
+      validSemanticReviewResult(request),
+    execute_agentic_browser: async (request) => {
+      agenticCalls += 1;
+      return validAgenticResult(request);
+    },
+  }, 10_001, true);
+  const browser = await fixture.coordinator.runBrowserCase(fixture.run_id, {
+    action_id: "combined-browser-before-pm-gate-reopen",
+    case_id: "home-browser",
+  });
+  if (!browser.ok) {
+    assert.fail(browser.message);
+  }
+  assert.equal(browserCalls, 1);
+  assert.equal(agenticCalls, 0);
+  assert.equal(serverProbes, 1);
+
+  const reopened = fixture.reopen();
+  const gate = new VerificationBootstrapPmGate(
+    reopened.coordinator,
+    async () => ({
+      package_fingerprint:
+        APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+      server: {
+        framework: "other",
+        allowed_dev_origins: [],
+      },
+      ui_evidence_source: "approved_store",
+      semantic_checklist_by_case: {
+        "home-browser": {
+          identity: "ark-ui-semantic-checklist",
+          version: "1.0.0",
+        },
+      },
+    }),
+  );
+  const reviewed = await gate.prepareOriginalPmReview(fixture.run_id);
+
+  assert.equal(browserCalls, 1);
+  assert.equal(agenticCalls, 0);
+  assert.equal(serverProbes, 1);
+  assert.equal(
+    reviewed.verification_state?.current_state,
+    "original_pm_review",
+  );
+  assert.equal(reviewed.verification_state?.terminal_outcome, "passed");
+  assert.equal(
+    reviewed.verification_records.filter(
+      (record) => record.record_type === "browser",
+    ).length,
+    1,
+  );
+  assert.equal(
+    reviewed.verification_records.filter(
+      (record) => record.record_type === "screenshot",
+    ).length,
+    3,
+  );
+});
+
+test("UIR-TEST-004 fails closed when a staged combined screenshot is missing after reopen", async (t) => {
+  let browserCalls = 0;
+  const fixture = await createFixture(t, {
+    browser_contract: "v2-combined",
+    execute_api: async (request) => validApiResult(request),
+    execute_browser: async (request) => {
+      if (request.schema_version !== 2) {
+        assert.fail("combined runtime received a legacy browser request");
+      }
+      browserCalls += 1;
+      return validCombinedBrowserResult(request);
+    },
+  });
+  const snapshot = requireV2Snapshot(
+    (await fixture.store.getRun(fixture.run_id)).verification_snapshot,
+  );
+  const browser = await fixture.coordinator.runBrowserCase(fixture.run_id, {
+    action_id: "combined-browser-missing",
+    case_id: "home-browser",
+  });
+  if (!browser.ok) {
+    assert.fail(browser.message);
+  }
+  const afterBrowser = await fixture.store.getRun(fixture.run_id);
+  const browserRecord = findRecord(
+    afterBrowser.verification_records,
+    "browser",
+    "home-browser",
+  );
+  const missing = browserRecord.artifact_references.find((reference) =>
+    reference.artifact_id.endsWith("-375x812"),
+  );
+  assert.ok(missing);
+  await rm(path.join(snapshot.artifact_root, missing.relative_path));
+
+  assert.equal(
+    (await fixture.coordinator.advance(fixture.run_id, "collecting")).accepted,
+    true,
+  );
+  const reopened = fixture.reopen();
+  const screenshots = await reopened.coordinator.runScreenshots(
+    fixture.run_id,
+    {
+      action_id: "materialize-missing-combined-screenshots",
+      case_id: "home-browser",
+    },
+  );
+
+  assert.equal(screenshots.ok, false);
+  if (!screenshots.ok) {
+    assert.equal(screenshots.code, "ARTIFACT_ROOT_INVALID");
+  }
+  assert.equal(browserCalls, 1);
+  const failedRun = await reopened.store.getRun(fixture.run_id);
+  assert.equal(
+    failedRun.verification_records.some(
+      (record) => record.record_type === "screenshot",
+    ),
+    false,
+  );
+});
+
 test("TEST-1710 fails closed when the registered browser runtime is missing", async (t) => {
   const fixture = await createFixture(t, {
     execute_api: async (request) => ({
@@ -502,11 +779,23 @@ interface ExecutionFixture {
   store: RunStore;
   coordinator: VerificationCoordinator;
   run_id: string;
+  reopen: () => {
+    store: RunStore;
+    coordinator: VerificationCoordinator;
+  };
 }
 
 async function createFixture(
   t: TestContext,
   effects: {
+    browser_contract?: "v2-combined";
+    provision_baseline?: boolean;
+    probe_http?: NonNullable<
+      Parameters<VerificationCoordinator["registerLocalRuntime"]>[0]["probe_http"]
+    >;
+    configure?: (
+      verification: ReturnType<typeof validVerificationCoordinatorConfig>,
+    ) => void;
     execute_api: NonNullable<
       Parameters<VerificationCoordinator["registerLocalRuntime"]>[0]["execute_api"]
     >;
@@ -539,22 +828,28 @@ async function createFixture(
   if (!verification.ui.enabled) {
     assert.fail("verification fixture UI lane is disabled");
   }
+  effects.configure?.(verification);
   if (!includeAgentic) {
     verification.ui.agentic_tasks = [];
     verification.ui.optional_capabilities = [];
   }
+  if (effects.provision_baseline) {
+    await provisionExecutionBaseline(projectRoot, verification);
+  }
   const projectConfig = structuredClone(DEFAULT_PROJECT_CONFIG);
   projectConfig.verification.coordinator = verification;
 
-  const store = new RunStore({
-    root_path: stateRoot,
-    now: () => new Date(CREATED_AT),
-    suffix: () => "170500",
-    verification_source_loader: async () =>
-      validVerificationSourceIdentity(projectRoot),
-    verification_package_loader: () =>
-      readFile(path.resolve("docs", "slices", "SLICE-017.md")),
-  });
+  const createStore = () =>
+    new RunStore({
+      root_path: stateRoot,
+      now: () => new Date(CREATED_AT),
+      suffix: () => "170500",
+      verification_source_loader: async () =>
+        validVerificationSourceIdentity(projectRoot),
+      verification_package_loader: () =>
+        readFile(path.resolve("docs", "slices", "SLICE-017.md")),
+    });
+  const store = createStore();
   const created = await store.createRun({
     objective: "IS-1705 deterministic execution integration",
     project_path: projectRoot,
@@ -583,7 +878,12 @@ async function createFixture(
     semantic_review: { name: "fixture-image-review", version: "1.0.0" },
     server: { name: "fixture-server", version: "1.0.0" },
   } as const;
-  coordinator.registerLocalRuntime({
+  const runtime: Parameters<
+    VerificationCoordinator["registerLocalRuntime"]
+  >[0] = {
+    ...(effects.browser_contract === undefined
+      ? {}
+      : { browser_contract: effects.browser_contract }),
     port_available: async () => true,
     capability_adapters: capabilityAdapters,
     capability_probe: async (capability) => ({
@@ -593,7 +893,8 @@ async function createFixture(
       adapter: capabilityAdapters[capability],
     }),
     start_server: async () => undefined,
-    probe_http: async () => ({ status: 200 }),
+    probe_http:
+      effects.probe_http ?? (async () => ({ status: 200 })),
     execute_local: async () => undefined,
     execute_api: effects.execute_api,
     ...(effects.execute_browser === undefined
@@ -614,7 +915,8 @@ async function createFixture(
     ...(effects.execute_agentic_browser === undefined
       ? {}
       : { execute_agentic_browser: effects.execute_agentic_browser }),
-  });
+  };
+  coordinator.registerLocalRuntime(runtime);
 
   assert.equal(
     (await coordinator.advance(created.run_id, "configured")).accepted,
@@ -644,7 +946,98 @@ async function createFixture(
       true,
     );
   }
-  return { store, coordinator, run_id: created.run_id };
+  return {
+    store,
+    coordinator,
+    run_id: created.run_id,
+    reopen: () => {
+      const reopenedStore = createStore();
+      const reopenedCoordinator = new VerificationCoordinator(reopenedStore);
+      reopenedCoordinator.registerLocalRuntime(runtime);
+      return {
+        store: reopenedStore,
+        coordinator: reopenedCoordinator,
+      };
+    },
+  };
+}
+
+async function provisionExecutionBaseline(
+  projectRoot: string,
+  config: ReturnType<typeof validVerificationCoordinatorConfig>,
+): Promise<void> {
+  if (!config.ui.enabled) {
+    assert.fail("approved baseline requires an enabled UI lane");
+  }
+  const baselinePngs: Record<string, Uint8Array> = {};
+  for (const viewport of config.ui.viewports) {
+    const [width, height] = viewport.split("x").map(Number) as [
+      number,
+      number,
+    ];
+    const rgba = new Uint8Array(width * height * 4);
+    rgba.fill(255);
+    baselinePngs[viewport] = encodeVerificationRgba8Png({
+      width,
+      height,
+      rgba,
+    });
+  }
+  const entries = config.ui.viewports.map((viewport) => {
+    const [width, height] = viewport.split("x").map(Number) as [
+      number,
+      number,
+    ];
+    const bytes = baselinePngs[viewport]!;
+    const sha256 = sha256Bytes(bytes);
+    return {
+      case_id: "home-browser",
+      viewport,
+      width,
+      height,
+      path: `objects/sha256/${sha256}.png`,
+      sha256,
+    };
+  });
+  const manifest: VerificationApprovedBaselineManifest =
+    verificationApprovedBaselineManifestSchema.parse({
+      schema_version: 1,
+      baseline_id: config.ui.baseline_identity.id,
+      approval_id: "baseline-approval-1708",
+      approver: "local-user",
+      approved_at_utc: "2026-07-27T19:59:00.000Z",
+      source_commit: config.ui.baseline_identity.source_commit,
+      source_tree: config.ui.baseline_identity.source_tree,
+      environment: config.ui.baseline_identity.environment,
+      adapter: {
+        name: config.ui.deterministic_adapter,
+        version: config.ui.deterministic_adapter_version,
+      },
+      browser_build: config.ui.browser_build,
+      entries,
+    });
+  const baselineSetSha256 = verificationBaselineSetSha256(manifest);
+  config.ui.baseline_identity.sha256 = baselineSetSha256;
+  const baselineRoot = path.join(projectRoot, ".ark-team", "baselines");
+  for (const entry of manifest.entries) {
+    const target = path.join(baselineRoot, entry.path);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, baselinePngs[entry.viewport]!, {
+      flag: "wx",
+      mode: 0o444,
+    });
+  }
+  const manifestPath = path.join(
+    baselineRoot,
+    "manifests",
+    manifest.baseline_id,
+    `${baselineSetSha256}.json`,
+  );
+  await mkdir(path.dirname(manifestPath), { recursive: true });
+  await writeFile(manifestPath, canonicalJson(manifest), {
+    flag: "wx",
+    mode: 0o444,
+  });
 }
 
 function validBrowserResult(
@@ -699,6 +1092,118 @@ function validBrowserResult(
     },
     passed: true,
     message: "declared deterministic assertions passed",
+  };
+}
+
+function validCombinedBrowserResult(
+  request: DeepReadonly<VerificationBrowserDriverV2Request>,
+): VerificationBrowserDriverV2Result {
+  const finalUrl = new URL("/after-action", request.origin).toString();
+  return {
+    schema_version: 2,
+    contract_id: "verification_browser_driver_result_v2",
+    case_id: request.case_id,
+    case_sha256: request.case_sha256,
+    adapter: { ...request.adapter },
+    browser_build: request.browser_build,
+    origin: request.origin,
+    final_url: finalUrl,
+    context: structuredClone(
+      request.context,
+    ) as VerificationBrowserDriverRequest["context"],
+    elapsed_ms: 50,
+    readiness: {
+      passed: true,
+      elapsed_ms: 5,
+      message: null,
+    },
+    actions: request.actions.map(({ sequence, action }) => ({
+      sequence,
+      input_sha256: sha256CanonicalJson(action),
+      passed: true,
+      elapsed_ms: 1,
+      message: null,
+    })),
+    assertions: request.assertions.map(({ sequence, assertion }) => ({
+      sequence,
+      input_sha256: sha256CanonicalJson(assertion),
+      passed: true,
+      elapsed_ms: 2,
+      message: null,
+    })),
+    navigation: [
+      {
+        sequence: 0,
+        url: request.url,
+        status: 200,
+        elapsed_ms: 4,
+      },
+      {
+        sequence: 1,
+        url: finalUrl,
+        status: 200,
+        elapsed_ms: 8,
+      },
+    ],
+    console: [],
+    page_errors: [],
+    dialogs: [],
+    trace: {
+      relative_path: request.trace.relative_path,
+      media_type: request.trace.media_type,
+      sha256: sha256Bytes(TRACE_BYTES),
+      bytes: TRACE_BYTES,
+    },
+    passed: true,
+    message: "declared deterministic assertions passed",
+    screenshot: {
+      schema_version: 2,
+      contract_id: "verification_screenshot_runtime_result_v2",
+      run_id: request.screenshot.run_id,
+      snapshot_id: request.screenshot.snapshot_id,
+      case_id: request.screenshot.case_id,
+      attempt_id: request.screenshot.attempt_id,
+      case_sha256: request.screenshot.case_sha256,
+      package_fingerprint: request.screenshot.package_fingerprint,
+      source_fingerprint: request.screenshot.source_fingerprint,
+      adapter: { ...request.screenshot.adapter },
+      browser_build: request.screenshot.browser_build,
+      origin: request.screenshot.origin,
+      url: finalUrl,
+      screenshots: request.screenshot.captures.map((capture) => {
+        const rgba = new Uint8Array(capture.width * capture.height * 4);
+        rgba.fill(255);
+        const bytes = encodeVerificationRgba8Png({
+          width: capture.width,
+          height: capture.height,
+          rgba,
+        });
+        return {
+          sequence: capture.sequence,
+          viewport: capture.viewport,
+          width: capture.width,
+          height: capture.height,
+          device_scale_factor: 1,
+          url: finalUrl,
+          relative_path: capture.relative_path,
+          media_type: "image/png",
+          captured_at_utc: "2026-07-27T20:00:01.000Z",
+          byte_length: bytes.byteLength,
+          sha256: sha256Bytes(bytes),
+          capture: {
+            browser_chrome: "excluded",
+            full_page: false,
+            resized: false,
+            cropped: false,
+            converted: false,
+            color_space_converted: false,
+            alpha_normalized: false,
+            post_processed: false,
+          },
+          bytes,
+        };
+      }),
+    },
   };
 }
 

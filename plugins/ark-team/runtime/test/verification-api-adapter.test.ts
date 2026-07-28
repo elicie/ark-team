@@ -30,7 +30,7 @@ test("TEST-1709 builds one literal local curl request and normalizes bounded red
   ]);
   assert.equal(
     request.request.url,
-    "http://dev:10001/items?a=x%26y&b=two+words",
+    "http://devbox:10001/items?a=x%26y&b=two+words",
   );
   assert.equal(request.execution.shell, false);
   assert.equal(request.request.proxy, false);
@@ -54,7 +54,7 @@ test("TEST-1709 builds one literal local curl request and normalizes bounded red
       request.execution.argv.indexOf("--resolve"),
       request.execution.argv.indexOf("--resolve") + 2,
     ),
-    ["--resolve", "dev:10001:127.0.0.1"],
+    ["--resolve", "devbox:10001:127.0.0.1"],
   );
   assert.equal(request.execution.argv[1], "--disable");
   assert.ok(
@@ -210,7 +210,7 @@ test("TEST-1709 reports strict status, content-type, redirect, and result-shape 
   assert.equal(invalid.evidence.response_sha256, null);
 
   const changedRequest = structuredClone(request);
-  changedRequest.request.url = "http://dev:10001/other";
+  changedRequest.request.url = "http://devbox:10001/other";
   const changed = normalizeVerificationApiResult(
     changedRequest,
     runtimeResult(changedRequest),
