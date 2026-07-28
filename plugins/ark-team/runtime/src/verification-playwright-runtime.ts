@@ -83,14 +83,14 @@ type PlaywrightRuntime = Pick<
 type PlaywrightExpect = PlaywrightRuntime["expect"];
 let playwrightRuntimePromise: Promise<PlaywrightRuntime> | undefined;
 
-const repositoryRoot = fileURLToPath(
-  new URL("../../../../", import.meta.url),
+const pluginRoot = fileURLToPath(
+  new URL("../../", import.meta.url),
 );
 const runtimeSpecPath = path.join(
-  repositoryRoot,
-  "docs/specs/verification-ui-runtime/SPEC.md",
+  pluginRoot,
+  "runtime/contracts/verification-ui-runtime/SPEC.md",
 );
-const packageLockPath = path.join(repositoryRoot, "package-lock.json");
+const packageLockPath = path.join(pluginRoot, "package-lock.json");
 
 export interface VerificationPlaywrightRuntimeProbe {
   readonly available: boolean;
