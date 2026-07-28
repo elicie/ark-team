@@ -24,7 +24,7 @@ const PLAYWRIGHT_INTEGRITY =
 const CHROMIUM_REVISION = "1234";
 const CHROMIUM_VERSION = "151.0.7922.34";
 const SPEC_SHA256 =
-  "29f69eda06ba8bf47d32e0e3914686f147ef0e5e7c01d3d18f4cd3b4549f4047";
+  "571b5cae52473b6dc5b0e8416406f881062b2a8c8729c401aaa06667efe6e383";
 const RESOLVER_ARGUMENT =
   "--host-resolver-rules=MAP devbox 127.0.0.1";
 const parityFiles = [
