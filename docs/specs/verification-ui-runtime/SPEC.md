@@ -1,13 +1,15 @@
 # SLICE-017 결정론적 UI 런타임 보완 명세
 
-- Spec identity: `ark-team-verification-ui-runtime-v1.0.0`
+- Spec identity: `ark-team-verification-ui-runtime-v1.0.1`
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
-- Authority date: 2026-07-27 UTC
+- Delta status: `SPEC_DELTA_APPLIED`
+- Supersedes: `ark-team-verification-ui-runtime-v1.0.0`
+- Authority date: 2026-07-28 UTC
 - Authority: 사용자가 요청한 실제 UI QA 실행 기능, Backend/UI 독립 실행
   요구, `verification-spec-v4`, 그리고 이 보완안으로 진행하라는 사용자 승인
 - Target source:
-  `GIT-COMMIT:9e6f16b2024bf65ce897479180415340a944cf31`
-- Target tree: `e5c9f071d68ab5e2e46e28cf8f0c33ccca2187b3`
+  `GIT-COMMIT:fcebe022dd00add51ece1e98e40be81f78f8a28b`
+- Target tree: `62445c044022e23f0389f826b5c6e460edc9ae65`
 - Parent contract: `docs/slices/SLICE-017.md`
   (`verification-spec-v4`)
 - Reference boundary: `NONE`
@@ -17,9 +19,9 @@
 
 현재 기본 검증 게이트는 Backend `curl` QA만 실사용 경로에 연결하고, UI가
 활성화되면 정확한 실행 계약이 없다는 이유로 `SPEC_DELTA_REQUIRED`를
-기록한다. 이 문서는 기존 schema-2 browser/screenshot/comparison 계약을
-바꾸지 않고 생산용 Playwright 실행기를 연결하는 다음 구현 슬라이스
-`IS-1708`을 닫는다.
+기록한다. 이 문서는 기존 schema-2 browser/screenshot/comparison evidence
+계약을 바꾸지 않고 생산용 Playwright 실행기를 연결하는 다음 구현
+슬라이스 `IS-1708`을 닫는다.
 
 완료 신호는 다음과 같다.
 
@@ -40,12 +42,15 @@
 | --- | --- | --- |
 | `UIR-EVID-001` | `verification-local-runtime.ts`가 browser와 screenshot을 `unavailable-v1`로 등록하고 UI 활성화를 `SPEC_DELTA_REQUIRED`로 차단한다. | 생산 UI 실행기는 아직 없다. |
 | `UIR-EVID-002` | `verification-browser-adapter.ts`와 `verification-visual-adapter.ts`에 strict request/result, trace, PNG, 비교 계약이 이미 있다. | 새 coordinator나 새 QA 플랫폼은 필요 없다. |
-| `UIR-EVID-003` | screenshot request는 `case_state = "after-declared-actions"`를 요구하지만 readiness/action bytes를 전달하지 않는다. | 생산 실행기가 상태를 추론하지 않도록 request를 보완해야 한다. |
+| `UIR-EVID-003` | screenshot request는 `case_state = "after-declared-actions"`를 요구하지만 별도 browser request의 context를 전달받지 않는다. | 두 effect가 상태를 추론하거나 actions를 재실행하지 않도록 하나의 combined UI-case effect가 필요하다. |
 | `UIR-EVID-004` | 기본 bootstrap 입력은 UI baseline PNG와 semantic checklist를 외부 호출자가 넣어야 한다. | 기본 PM 게이트가 승인 baseline store에서 읽는 production resolver가 필요하다. |
 | `UIR-EVID-005` | 저장소 `package.json`과 lockfile에 Playwright 의존성이 없다. | 실행 중 자동 설치하지 말고 구현 commit에서 exact dependency를 추가한다. |
 | `UIR-EVID-006` | Codex Playwright wrapper SHA-256은 `aa3fdff5d0e4556177f4dfd5f04117e772aa54f94b6a2e34b6c0edf629c6b9b5`이며 `npx --yes --package @playwright/cli`를 사용한다. | 버전이 고정되지 않은 agent CLI wrapper는 gate 실행기가 아니다. |
 | `UIR-EVID-007` | 관측된 `@playwright/cli 0.1.17`은 alpha Playwright와 Chromium `151.0.7922.10`을 사용한다. | 안정판 browser identity와 일치하지 않는다. |
 | `UIR-EVID-008` | 현재 host에서 `dev` lookup은 `EAI_AGAIN`이다. | 시스템 DNS나 `/etc/hosts`를 변경하지 않고 Chromium 안에서 exact `dev → 127.0.0.1` mapping을 사용한다. |
+| `UIR-EVID-009` | 현재 bootstrap은 `runBrowserCase` 뒤 `runScreenshots`를 별도 호출하고 두 runtime contract는 context/state 전달 경로가 없다. | v1.0.0대로 구현하면 선언 action이 정상 UI gate에서 두 번 실행될 수 있으므로 combined execution으로 보정해야 한다. |
+| `UIR-EVID-010` | screenshot v1 request/result는 각 capture URL을 action 전 초기 URL과 같게 강제한다. | same-origin navigation action 뒤 실제 화면을 증명하려면 검증된 browser `final_url`을 screenshot 기대 URL로 연결해야 한다. |
+| `UIR-EVID-011` | coordinator ownership은 browser action에서 screenshot record 제출을 거부하고, 두 action 사이 in-memory result는 crash/reopen 때 사라진다. | Combined effect의 PNG/metadata를 먼저 등록 artifact로 내구성 있게 쓰고 screenshot action은 그 bytes를 strict-read해 record만 materialize해야 한다. |
 
 ### 2.2 공식 reference
 
@@ -119,13 +124,16 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
   resolution을 하지 않는다. Browser provisioning은 별도 setup 단계에서
   exact locked CLI로 수행하며 runtime capability probe가 설치를 대신하지
   않는다.
-- `UIR-DEC-004`: 한 browser/screenshot 요청마다 local headless browser를
-  시작하고 `finally`에서 닫는다. daemon, persistent session, CDP attach,
-  system Chrome을 재사용하지 않는다.
-- `UIR-DEC-005`: 결정론적 browser case는 `1440x900`에서 한 번 실행한다.
-  visual capture도 하나의 fresh context에서 navigation/readiness/action을
-  한 번만 실행하고 viewport layout만 고정 순서로 바꿔 캡처한다. 따라서
-  click이나 submit의 server side effect를 세 번 반복하지 않는다.
+- `UIR-DEC-004`: default PM gate는 browser case마다 screenshot capture를
+  포함한 combined browser-driver effect를 호출한다. 이 effect가 local
+  headless browser와 fresh context를 한 번 시작하고 `finally`에서 닫는다.
+  daemon, persistent session, CDP attach, system Chrome을 재사용하지 않는다.
+- `UIR-DEC-005`: combined effect는 `1440x900`에서
+  navigation/readiness/ordered actions/deterministic assertions를 한 번
+  실행한다. 같은 context에서 viewport layout만 `375x812`, `768x1024`,
+  `1440x900` 순서로 바꾸고 readiness를 재확인해 캡처한다. 따라서 한
+  bootstrap 정상 경로의 case당 declared action과 click/submit side effect는
+  총 한 번이다.
 - `UIR-DEC-006`: system resolver를 바꾸지 않고 유일한 Chromium launch
   argument `--host-resolver-rules=MAP dev 127.0.0.1`을 사용한다. URL gate는
   여전히 exact `http://dev:<recorded-port>` origin을 검사한다.
@@ -134,6 +142,19 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
   `unavailable`로 닫는다.
 - `UIR-DEC-008`: 승인 baseline은 읽기 전용으로 검증·로딩한다. 이번
   slice는 baseline bytes를 만들거나 바꾸지 않는다.
+- `UIR-DEC-009`: combined effect는 기존 deterministic-browser retry
+  ceiling인 두 번을 보존한다. Declared actions는 runtime attempt마다 한
+  번이며 실패 뒤 retry는 같은 immutable input을 다시 실행할 수 있다.
+  Exactly-once external mutation은 이 계약의 보장이 아니고 credential/data
+  mutation 시나리오는 계속 제외한다.
+- `UIR-DEC-010`: combined browser result가 same-origin 검증을 통과한
+  `final_url`을 세 screenshot의 exact URL로 사용한다. Action 전 초기 URL,
+  다른 screenshot URL 또는 cross-origin URL은 통과할 수 없다.
+- `UIR-DEC-011`: combined browser attempt는 세 PNG와 canonical capture
+  metadata를 등록 artifact root에 먼저 저장하고 browser record가 그
+  reference를 소유한다. 이어지는 screenshot action은 해당 artifact를
+  strict-read해 기존 screenshot evidence를 materialize할 뿐 browser를
+  호출하지 않는다. In-memory-only handoff는 금지한다.
 
 ### 알려진 경고
 
@@ -146,6 +167,10 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
   baseline으로 승격하지 않는다.
 - Next.js 프로젝트는 기존 요구대로 `allowedDevOrigins`에 `dev`가 있음을
   별도 source inspection으로 증명해야 한다.
+- 기존 deterministic-browser retry ceiling은 두 번이다. Combined effect는
+  attempt 내부 중복을 제거하지만 첫 attempt가 effect 뒤 실패하면 immutable
+  actions를 retry에서 다시 실행할 수 있으며 exactly-once mutation을
+  보장하지 않는다.
 
 ## 5. 요구사항
 
@@ -201,14 +226,42 @@ sleep, evaluate, run-code, codegen, self-heal을 금지한다.
 `AbortSignal`로 제한한다. console, page error, dialog, navigation, step
 evidence는 기존 bound와 redaction을 따른다. Dialog는 기록 후 dismiss한다.
 
+Production runtime은 `verification_browser_driver_v2` combined request
+하나로 v1의 exact deterministic fields와 세 viewport capture contract를
+함께 받는다. Result contract는 `verification_browser_driver_result_v2`이며
+v1-compatible browser result와 raw screenshot result를 함께 반환한다. Case
+identity, origin, adapter/browser identity와 capture matrix가 다르면 effect
+전에 거부한다. 하나의 context에서 두 결과를 만들고 coordinator는 기존
+browser normalizer와 versioned screenshot normalizer로 각각 검증해 기존
+schema-2 browser와 screenshot evidence를 순서대로 기록한다. V1 runtime
+request/result는 fixture/unit compatibility만 유지한다.
+
 ### UIR-REQ-004 — Reproducible screenshots
 
-`VerificationScreenshotRuntimeRequest`는 snapshotted case의 exact
-readiness와 ordered actions를 포함하도록 versioned 보완한다. 실행기는
-하나의 fresh context를 `1440x900`으로 열고 navigation/readiness/actions를
-한 번 실행한다. 그 뒤 `375x812`, `768x1024`, `1440x900` 순서로 browser
-viewport를 설정하고 readiness를 다시 확인한 뒤 캡처한다. 이 viewport
-layout 변경은 browser rendering 입력이며 bitmap resize가 아니다.
+`verification_screenshot_runtime_v2` expectation의 `case_state`는 같은
+combined browser attempt가 만든 동일 context의
+`after-declared-actions` 상태만 참조한다. Screenshot effect가 별도로
+navigate하거나 actions를 재실행해서는 안 된다. Browser assertions가
+통과한 뒤 `375x812`, `768x1024`, `1440x900` 순서로 viewport를 설정하고
+readiness를 다시 확인해 캡처한다. 이 viewport layout 변경은 browser
+rendering 입력이며 bitmap resize가 아니다.
+
+Versioned combined result normalization은 v1-compatible browser result를
+먼저 검증하고, snapshot capture matrix와 검증된 `final_url`로
+`verification_screenshot_runtime_v2` expectation을 파생한다. 그
+`final_url`이 screenshot result와 세 capture의 exact expected URL이다.
+Initial URL은 navigation action 뒤 기대값으로 재사용하지 않는다.
+`final_url`은 기존 browser normalizer의 exact recorded-origin 검사를 먼저
+통과해야 한다.
+
+Combined browser action이 성공으로 완료되기 전에 normalized capture
+metadata와 세 PNG를 등록 artifact root에 content-addressed reference로
+persist하고 browser evidence가 이를 참조한다. 다음 screenshot action은
+strict artifact reader로 media type, path, size, hash와 bytes를 다시
+검증한 뒤 기존 screenshot records를 만든다. 이 단계는
+`execute_screenshots`나 다른 browser effect를 호출하지 않는다. Process
+crash/reopen 뒤에도 같은 references에서 materialize할 수 있어야 하며
+누락·변조는 fail-close한다.
 
 캡처는 `type: "png"`, `fullPage: false`, `animations: "disabled"`,
 `caret: "hide"`, `omitBackground: false`, `scale: "css"`, DPR `1`을
@@ -233,6 +286,18 @@ profile, browser process가 남지 않아야 하며 cleanup 실패는 pass가 �
 
 기본 PM gate는 UI가 켜졌다는 이유만으로 `SPEC_DELTA_REQUIRED`를 만들지
 않는다. 대신 exact capability discovery 결과를 사용한다.
+
+Default bootstrap은 `execute_browser` combined effect를 runtime attempt당
+한 번 호출하고 별도 `execute_screenshots` 경로를 선택하지 않는다. 기존
+분리 screenshot 실행 API는 fixture/unit compatibility용으로만 남기며
+production runtime에 등록하지 않는다. Combined effect 결과에서 기존
+browser action과 screenshot action/evidence를 순서대로 정규화·기록하되
+외부 browser effect를 두 번째로 호출하지 않는다.
+
+Browser action 뒤 screenshot action은 이미 persisted된 combined capture
+artifact를 materialize하는 coordinator-owned 단계다. Browser action과
+screenshot action 사이에서 process가 재시작돼도 runtime을 다시 실행하지
+않고 기존 browser evidence reference를 사용한다.
 
 Production bootstrap은 caller가 임의 baseline bytes를 주입하게 하지 않고,
 immutable snapshot 생성 후 기존 approved-baseline verifier가 검증한
@@ -290,10 +355,13 @@ wiring, focused tests와 전체 회귀를 함께 완료해야 한다. 일부만 
   spec hash mismatch는 fail-close한다.
 - `UIR-AC-002`: browser가 local exact origin 밖의 HTTP(S)/WebSocket과
   persistent/credential/proxy 경계를 넘지 않는다.
-- `UIR-AC-003`: 선언된 action/assertion만 고정 mapping과 timeout으로
-  실행되고 구조화 evidence가 pass authority다.
-- `UIR-AC-004`: 한 fresh context에서 action을 한 번만 실행한 상태로 각
-  viewport의 exact PNG가 캡처되고 기존 normalizer를 통과한다.
+- `UIR-AC-003`: 하나의 combined effect에서 선언된 action/assertion만 고정
+  mapping과 timeout으로 실행되고 구조화 evidence가 pass authority다.
+- `UIR-AC-004`: 성공한 combined runtime attempt의 browser와 visual
+  evidence 전체에서 한 fresh context와 action 실행 1회만 사용해 각
+  viewport의 exact PNG가 검증된 browser `final_url`에서 캡처되고 versioned
+  normalizer를 통과한다. Screenshot records는 durable combined artifacts로
+  materialize되며 reopen이 browser effect를 반복하지 않는다.
 - `UIR-AC-005`: trace와 child lifecycle이 성공·실패 모두 닫히고 raw/private
   data가 구조화 record에 복제되지 않는다.
 - `UIR-AC-006`: 승인 baseline이 있는 UI-only/both-enabled run은 default
@@ -309,12 +377,19 @@ wiring, focused tests와 전체 회귀를 함께 완료해야 한다. 일부만 
 - `UIR-TEST-002`: local HTTP/WS positive와 외부 origin, 다른 port,
   redirect, service worker, proxy env, file/chrome URL, persistent context
   negative를 실제 headless browser로 검증한다.
-- `UIR-TEST-003`: action/assertion 종류별 positive, strict multi-match,
-  missing selector, response listener timing, hash mismatch, timeout,
-  undeclared/evaluate/force negative를 검증한다.
-- `UIR-TEST-004`: 세 viewport dimensions/DPR/PNG/hash, action 1회 실행,
-  viewport order를 확인하고 repeated side effect, bitmap
-  crop/resize/JPEG, wrong build, reordered result를 거부한다.
+- `UIR-TEST-003`: combined request identity와 action/assertion 종류별
+  positive, strict multi-match, missing selector, response listener timing,
+  hash mismatch, timeout, undeclared/evaluate/force negative를 검증한다.
+- `UIR-TEST-004`: first-attempt success인 default bootstrap에서 combined
+  runtime 호출 1회, declared action/side effect 1회, 세 viewport
+  dimensions/DPR/PNG/hash와 viewport order를 확인한다. 별도 screenshot
+  effect, 같은 attempt 안의 repeated side effect, bitmap crop/resize/JPEG,
+  wrong build, reordered result를 거부한다. Same-origin navigation 뒤
+  browser `final_url` positive와 initial/different/cross-origin screenshot
+  URL negative를 포함한다. 별도 failure fixture는 기존 browser retry
+  ceiling과 immutable input을 검증한다. Browser/screenshot 단계 사이
+  reopen positive와 missing/tampered staged artifact negative도 검증하며
+  browser effect 호출 수는 그대로 1이어야 한다.
 - `UIR-TEST-005`: pass/fail/timeout/abort에서 trace flush, artifact bound,
   context/browser 종료, temporary cleanup, no raw structured copy를 확인한다.
 - `UIR-TEST-006`: backend-only, UI-only, both-enabled, missing baseline,
@@ -325,6 +400,11 @@ wiring, focused tests와 전체 회귀를 함께 완료해야 한다. 일부만 
   바꾸지 않음을 검증한다.
 
 ## 9. 문서 작업 상태
+
+v1.0.1은 구현 검토에서 확인된 `AMBIGUITY`를 보정한다. v1.0.0의
+viewport당 action 반복은 제거됐지만 별도 browser/screenshot effect 사이의
+중복은 남아 있었다. Combined UI-case effect가 두 기존 evidence contract를
+한 context에서 생성하도록 결정했으며 다른 제품 동작은 바꾸지 않는다.
 
 이 package 작성 중 제품 의존성 설치, browser 다운로드, server 실행,
 browser QA, model/agentic 실행, baseline 생성, Docker, 인프라 변경은 하지
