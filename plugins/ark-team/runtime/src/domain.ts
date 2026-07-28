@@ -575,6 +575,38 @@ function expectedVerificationCheckRequired(
   return null;
 }
 
+function isOptionalSemanticEvidence(
+  snapshot: VerificationRunSnapshotV2,
+  record: VerificationRecordV2,
+  attempts: readonly {
+    readonly action_id: string;
+    readonly kind: VerificationActionKind;
+  }[],
+): boolean {
+  if (
+    record.lane !== "ui" ||
+    !snapshot.ui_contract.enabled ||
+    snapshot.ui_contract.semantic_review_required
+  ) {
+    return false;
+  }
+  if (record.payload.kind === "review") {
+    return true;
+  }
+  const actionId =
+    record.payload.kind === "error"
+      ? record.payload.action_id
+      : undefined;
+  return (
+    actionId !== undefined &&
+    attempts.some(
+      (attempt) =>
+        attempt.action_id === actionId &&
+        attempt.kind === "semantic_review",
+    )
+  );
+}
+
 function verificationRecordMatchesAttempt(
   kind: VerificationActionKind,
   lane: "backend" | "ui" | null,
@@ -1319,7 +1351,7 @@ export const runRecordSchema = z
                   verificationEvidenceDisposition(candidate) !== null,
               )
               .map((candidate) => candidate.record_id);
-            const dispositions = evidence.flatMap((candidate) => {
+            const evidenceDispositions = evidence.flatMap((candidate) => {
               if (
                 candidate === undefined ||
                 candidate.schema_version !== 2
@@ -1327,17 +1359,34 @@ export const runRecordSchema = z
                 return [];
               }
               const disposition = verificationEvidenceDisposition(candidate);
-              return disposition === null ? [] : [disposition];
+              return disposition === null
+                ? []
+                : [{ candidate, disposition }];
             });
-            const expectedIntegrityFailure = dispositions.some(
-              (disposition) => disposition.integrity_failure,
-            );
+            const authoritativeDispositions =
+              evidenceDispositions.filter(
+                ({ candidate, disposition }) =>
+                  disposition.integrity_failure ||
+                  snapshot.schema_version !== 2 ||
+                  !isOptionalSemanticEvidence(
+                    snapshot,
+                    candidate,
+                    run.verification_state?.attempts ?? [],
+                  ),
+              );
+            const expectedIntegrityFailure =
+              authoritativeDispositions.some(
+                ({ disposition }) => disposition.integrity_failure,
+              );
             const expectedCheckOutcome = expectedIntegrityFailure
               ? "error"
               : aggregatePersistedVerificationOutcomes(
-                  dispositions.map((disposition) => disposition.outcome),
+                  authoritativeDispositions.map(
+                    ({ disposition }) => disposition.outcome,
+                  ),
                 );
             if (
+              authoritativeDispositions.length === 0 ||
               evidence.some(
                 (candidate) =>
                   candidate === undefined ||
@@ -1347,7 +1396,7 @@ export const runRecordSchema = z
                   candidate.check_required !== check.required ||
                   verificationEvidenceDisposition(candidate) === null,
               ) ||
-              dispositions.length !== evidence.length ||
+              evidenceDispositions.length !== evidence.length ||
               allEvidenceRecordIds.length !==
                 check.evidence_record_ids.length ||
               allEvidenceRecordIds.some(

@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const EXPECTED_SHA256 =
-  "29f69eda06ba8bf47d32e0e3914686f147ef0e5e7c01d3d18f4cd3b4549f4047";
+  "571b5cae52473b6dc5b0e8416406f881062b2a8c8729c401aaa06667efe6e383";
 const pluginRoot = fileURLToPath(new URL("../../", import.meta.url));
 const repositoryRoot = path.resolve(pluginRoot, "../..");
 const sourcePath = path.join(

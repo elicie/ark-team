@@ -860,7 +860,7 @@ export function compareVerificationPngs(
   } catch (error) {
     throw visualError(
       "BASELINE_NOT_APPROVED",
-      "approved baseline is not a strict RGBA8 PNG",
+      "approved baseline is not a strict RGB8 or RGBA8 PNG",
       error,
     );
   }
@@ -869,7 +869,7 @@ export function compareVerificationPngs(
   } catch (error) {
     throw visualError(
       "INVALID_RECORD",
-      "actual screenshot is not a strict RGBA8 PNG",
+      "actual screenshot is not a strict RGB8 or RGBA8 PNG",
       error,
     );
   }
