@@ -35,8 +35,10 @@ import {
   captureVerificationSource,
   verificationApprovedBaselineManifestSchema,
   verificationBaselineSetSha256,
+  verificationCoordinatorConfigV2Schema,
   type VerificationApprovedBaselineManifest,
   type VerificationCoordinatorConfigV2,
+  type VerificationProjectCoordinatorConfigV2,
   type VerificationSourceIdentity,
 } from "../src/verification-contract.js";
 import { VerificationCoordinator } from "../src/verification-coordinator.js";
@@ -56,10 +58,9 @@ const execFileAsync = promisify(execFile);
 const viewports = ["375x812", "768x1024", "1440x900"] as const;
 
 test(
-  "UIR-TEST-006 qa-smoke runs a real both-lane gate and fails a required UI assertion",
+  "UIR-TEST-006/008 qa-smoke resolves a tracked selector and runs a real both-lane gate",
   { concurrency: false, timeout: 180_000 },
   async (t) => {
-    const fixture = await createSmokeProject(t);
     const initialRuntime = createLocalBackendVerificationRuntime();
     if (initialRuntime.curl_version === null) {
       t.skip("curl is unavailable");
@@ -73,12 +74,19 @@ test(
       await initialRuntime.stop();
     }
 
-    const verification = createSmokeVerification(fixture.source, curlVersion);
-    const baseline = await provisionApprovedBaseline(fixture, verification);
+    const projectVerification = createSmokeVerification(curlVersion);
+    const fixture = await createSmokeProject(t, projectVerification);
+    const resolvedVerification = resolveSmokeVerification(
+      projectVerification,
+      fixture.source,
+    );
+    const baseline = await provisionApprovedBaseline(
+      fixture,
+      resolvedVerification,
+    );
 
     const passed = await runSmokeGate(
       fixture,
-      verification,
       "qa-smoke-pass",
     );
     assert.equal(
@@ -102,6 +110,33 @@ test(
     assert.equal(passed.verification_snapshot?.server.host, "devbox");
     assert.equal(passed.verification_snapshot?.server.bind, "0.0.0.0");
     assert.ok((passed.verification_snapshot?.server.port ?? 0) >= 10_001);
+    const passedCoordinator =
+      passed.project_config.verification.coordinator;
+    if (
+      passedCoordinator === null ||
+      passedCoordinator.schema_version !== 2 ||
+      !passedCoordinator.enabled ||
+      !passedCoordinator.ui.enabled ||
+      !("baseline_selector" in passedCoordinator.ui)
+    ) {
+      assert.fail("qa-smoke project config did not retain its selector");
+    }
+    assert.equal(passedCoordinator.ui.baseline_selector.id, "qa-smoke-v1");
+    assert.equal(
+      "source_commit" in passedCoordinator.ui.baseline_selector,
+      false,
+    );
+    assert.equal(
+      passed.verification_snapshot?.baseline_identity?.sha256,
+      resolvedVerification.ui.enabled
+        ? resolvedVerification.ui.baseline_identity.sha256
+        : null,
+    );
+    assert.equal(
+      passed.verification_snapshot?.resolved_config.ui.enabled &&
+        "baseline_selector" in passed.verification_snapshot.resolved_config.ui,
+      false,
+    );
     assert.equal(recordCount(passed, "request"), 1);
     assert.equal(recordCount(passed, "browser"), 1);
     assert.equal(recordCount(passed, "screenshot"), 3);
@@ -127,7 +162,7 @@ test(
     await assertBaselineUnchanged(baseline);
     await assertPortCanBind(passed.verification_snapshot?.server.port ?? 0);
 
-    const failingVerification = structuredClone(verification);
+    const failingVerification = structuredClone(resolvedVerification);
     if (!failingVerification.ui.enabled) {
       assert.fail("qa-smoke UI lane is disabled");
     }
@@ -139,8 +174,8 @@ test(
     ];
     const failed = await runSmokeGate(
       fixture,
-      failingVerification,
       "qa-smoke-fail",
+      failingVerification,
     );
     assert.equal(failed.verification_state?.terminal_outcome, "failed");
     assert.equal(recordCount(failed, "request"), 1);
@@ -171,6 +206,7 @@ interface BaselineSnapshot {
 
 async function createSmokeProject(
   t: TestContext,
+  verification: VerificationProjectCoordinatorConfigV2,
 ): Promise<SmokeFixture> {
   const root = await mkdtemp(path.join(tmpdir(), "ark-team-qa-smoke-"));
   const projectRoot = path.join(root, "project");
@@ -179,6 +215,9 @@ async function createSmokeProject(
   });
   t.after(() => rm(root, { recursive: true, force: true }));
 
+  const projectConfig = structuredClone(DEFAULT_PROJECT_CONFIG);
+  projectConfig.verification.coordinator = verification;
+  await writeProjectConfig(projectRoot, projectConfig);
   await execFileAsync("git", ["init", "-b", "main"], {
     cwd: projectRoot,
   });
@@ -192,6 +231,11 @@ async function createSmokeProject(
   await execFileAsync("git", ["commit", "-m", "QA smoke fixture"], {
     cwd: projectRoot,
   });
+  await execFileAsync(
+    "git",
+    ["ls-files", "--error-unmatch", ".codex/team-orchestrator.toml"],
+    { cwd: projectRoot },
+  );
 
   const source = await captureVerificationSource(projectRoot);
   assert.equal(source.worktree_state, "GIT_CLEAN");
@@ -206,9 +250,8 @@ async function createSmokeProject(
 }
 
 function createSmokeVerification(
-  source: VerificationSourceIdentity,
   curlVersion: string,
-): VerificationCoordinatorConfigV2 {
+): VerificationProjectCoordinatorConfigV2 {
   const verification = validVerificationCoordinatorConfig();
   verification.server_argv = ["npm", "run", "dev"];
   verification.server_readiness_path = "/health";
@@ -248,13 +291,6 @@ function createSmokeVerification(
       required: true,
     },
   ];
-  verification.ui.baseline_identity = {
-    ...verification.ui.baseline_identity,
-    id: "qa-smoke-v1",
-    sha256: "0".repeat(64),
-    source_commit: source.source_commit,
-    source_tree: source.source_tree,
-  };
   verification.ui.semantic_review_required = false;
   verification.ui.agentic_tasks = [];
   verification.ui.required_capabilities = [
@@ -264,7 +300,43 @@ function createSmokeVerification(
     "server",
   ];
   verification.ui.optional_capabilities = ["semantic_review"];
-  return verification;
+  const { baseline_identity: baselineIdentity, ...ui } = verification.ui;
+  return {
+    ...verification,
+    ui: {
+      ...ui,
+      baseline_selector: {
+        id: "qa-smoke-v1",
+        environment: baselineIdentity.environment,
+      },
+    },
+  };
+}
+
+function resolveSmokeVerification(
+  verification: VerificationProjectCoordinatorConfigV2,
+  source: VerificationSourceIdentity,
+): VerificationCoordinatorConfigV2 {
+  if (
+    !verification.ui.enabled ||
+    !("baseline_selector" in verification.ui)
+  ) {
+    throw new Error("qa-smoke requires an enabled baseline selector");
+  }
+  const { baseline_selector: selector, ...ui } = verification.ui;
+  return verificationCoordinatorConfigV2Schema.parse({
+    ...verification,
+    ui: {
+      ...ui,
+      baseline_identity: {
+        id: selector.id,
+        sha256: "0".repeat(64),
+        source_commit: source.source_commit,
+        source_tree: source.source_tree,
+        environment: selector.environment,
+      },
+    },
+  });
 }
 
 async function provisionApprovedBaseline(
@@ -376,12 +448,9 @@ async function provisionApprovedBaseline(
 
 async function runSmokeGate(
   fixture: SmokeFixture,
-  verification: VerificationCoordinatorConfigV2,
   stateName: string,
+  verificationOverride?: VerificationCoordinatorConfigV2,
 ) {
-  const projectConfig = structuredClone(DEFAULT_PROJECT_CONFIG);
-  projectConfig.verification.coordinator = verification;
-  await writeProjectConfig(fixture.project_root, projectConfig);
   const resolved = await loadProjectConfig(fixture.project_root);
   const source = await captureVerificationSource(fixture.project_root);
   assert.equal(source.worktree_state, "GIT_CLEAN");
@@ -391,10 +460,14 @@ async function runSmokeGate(
   const store = new RunStore({
     root_path: path.join(fixture.root, stateName),
   });
+  const projectConfig = structuredClone(resolved.config);
+  if (verificationOverride !== undefined) {
+    projectConfig.verification.coordinator = verificationOverride;
+  }
   const run = await store.createRun({
     objective: stateName,
     project_path: fixture.project_root,
-    project_config: resolved.config,
+    project_config: projectConfig,
   });
   const runtime = createLocalBackendVerificationRuntime();
   const coordinator = new VerificationCoordinator(store);
