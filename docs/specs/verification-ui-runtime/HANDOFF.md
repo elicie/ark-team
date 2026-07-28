@@ -1,14 +1,16 @@
 # Implementation Handoff — SLICE-017 UI Runtime
 
-- Package: `ark-team-verification-ui-runtime-v1.0.0`
+- Package: `ark-team-verification-ui-runtime-v1.0.1`
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
+- Delta status: `SPEC_DELTA_APPLIED`
+- Supersedes: `ark-team-verification-ui-runtime-v1.0.0`
 - Parent: `verification-spec-v4`
 - Exact next slice: `IS-1708`
 - Normative contract: [SPEC.md](./SPEC.md)
 - Normative SPEC SHA-256:
-  `9a67ffa8a80ed73088691670e27e47033fe1a1eb83d108933553b7ce4e4734f3`
+  `2194c4be9360843a319e1532776004380e8678862c329b6243360ddf6a808a4e`
 - Source baseline:
-  `9e6f16b2024bf65ce897479180415340a944cf31`
+  `fcebe022dd00add51ece1e98e40be81f78f8a28b`
 
 ## 구현 결과
 
@@ -23,13 +25,19 @@
 - `verification-local-runtime.ts`
   - UI preflight, capability, lifecycle, default bootstrap input
 - `verification-coordinator.ts`
-  - `ui_evidence_source` marker와 snapshot 이후 baseline loading
+  - combined `execute_browser` 단일 effect, durable capture materialization,
+    기존 evidence 기록,
+    `ui_evidence_source` marker와 snapshot 이후 baseline loading
+- `verification-browser-adapter.ts`
+  - `verification_browser_driver_v2` /
+    `verification_browser_driver_result_v2` combined contract
 - 새 runtime 파일 한 개
-  - Playwright browser/screenshot effect
+  - 단일 Playwright browser/assertion/screenshot effect
 - `verification-visual-adapter.ts`
-  - screenshot request에 readiness/actions 전달
+  - `verification_screenshot_runtime_v2` expectation, 동일-context state와
+    검증된 browser `final_url` 기준 screenshot 검증
 - approved baseline store
-  - 검증된 object bytes의 read-only production loading API
+  - 검증된 baseline/capture object bytes의 read-only production loading API
 - 관련 focused tests와 build output
 
 파일 배치는 기존 repository convention에 맞춰 조정할 수 있지만
@@ -55,10 +63,11 @@ browser_build   = chromium-headless-shell-151.0.7922.34-r1234
 
 1. exact dependency와 browser identity preflight
 2. local exact-origin browser driver
-3. screenshot request state 정보와 action 1회/세 viewport capture
-4. `ui_evidence_source`와 approved baseline bytes의 snapshot 이후 resolver
-5. default PM gate UI wiring과 comparison capability
-6. focused real-browser tests, 전체 회귀, build/CodeGraph
+3. combined UI-case attempt에서 action 1회/세 viewport capture
+4. durable capture artifact를 통한 screenshot record materialization/reopen
+5. `ui_evidence_source`와 approved baseline bytes의 snapshot 이후 resolver
+6. default PM gate UI wiring과 comparison capability
+7. focused real-browser tests, 전체 회귀, build/CodeGraph
 
 Implementation setup에서 exact dependency를 lock한 뒤
 `npx --no-install playwright install chromium`으로 해당 revision만
@@ -118,10 +127,14 @@ npm test
 - stable Playwright/Chromium exact match
 - external HTTP와 WebSocket effect 전 차단
 - action/assertion/trace positive
-- action 1회 후 세 viewport screenshot과 comparison positive
+- first-attempt success에서 combined runtime 호출과 declared action/side
+  effect 각 1회
+- 같은 context의 세 viewport screenshot과 comparison positive
+- same-origin action navigation 뒤 browser `final_url`과 screenshot URL 일치
+- browser/screenshot 단계 사이 reopen 시 runtime 재호출 없는 materialization
 - missing package/browser/baseline/required semantic fail-close
 - Backend-only 전체 회귀
-- browser/context/server process 잔존 없음
+- browser/context process 잔존 없음
 
 ## 구현 금지
 
@@ -130,6 +143,9 @@ npm test
 - remote browser/model
 - test generation/healing
 - schema-3 또는 새 coordinator
+- default bootstrap의 별도 browser/screenshot effect 호출
+- 기존 browser retry ceiling을 exactly-once mutation 보장으로 해석
+- combined capture를 process memory로만 전달
 - UI mode, dashboard, generic plugin system
 - 기존 v4 package fingerprint 변경
 
@@ -138,7 +154,7 @@ npm test
 다음이 발견되면 추론해 구현하지 말고 `SPEC_DELTA_REQUIRED`로 반환한다.
 
 - Playwright v1.62.0에서 exact network/WS 차단이 불가능함
-- screenshot request의 readiness/action bytes가 기존 immutable case와
+- combined browser/screenshot request identity가 기존 immutable case와
   일치할 수 없음
 - production baseline bytes를 strict verifier 경계 안에서 읽을 수 없음
 - trace 또는 process cleanup이 기존 artifact/lifecycle 계약과 충돌함

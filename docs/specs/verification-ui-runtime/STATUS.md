@@ -1,21 +1,23 @@
 # Package Status — SLICE-017 UI Runtime
 
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
-- Identity: `ark-team-verification-ui-runtime-v1.0.0`
-- Authority date: 2026-07-27 UTC
+- Delta status: `SPEC_DELTA_APPLIED`
+- Identity: `ark-team-verification-ui-runtime-v1.0.1`
+- Supersedes: `ark-team-verification-ui-runtime-v1.0.0`
+- Authority date: 2026-07-28 UTC
 - Package root: `docs/specs/verification-ui-runtime`
 - Parent contract: `verification-spec-v4`
 - Approved implementation slice: `IS-1708`
 - Exact next action: `sdd-implementation-loop`로 `IS-1708` 하나만 구현
 - Normative SPEC SHA-256:
-  `9a67ffa8a80ed73088691670e27e47033fe1a1eb83d108933553b7ce4e4734f3`
+  `2194c4be9360843a319e1532776004380e8678862c329b6243360ddf6a808a4e`
 
 ## Source
 
 - Commit:
-  `9e6f16b2024bf65ce897479180415340a944cf31`
+  `fcebe022dd00add51ece1e98e40be81f78f8a28b`
 - Tree:
-  `e5c9f071d68ab5e2e46e28cf8f0c33ccca2187b3`
+  `62445c044022e23f0389f826b5c6e460edc9ae65`
 - Worktree state at capture: clean
 
 ## 확정
@@ -27,7 +29,11 @@
   `chromium-headless-shell-151.0.7922.34-r1234`
 - runtime capability는 위 승인 `SPEC.md` SHA-256도 검증한다.
 - 기존 Backend runtime, contract-v2/schema-2, package-v4를 유지한다.
-- screenshot request와 production baseline input만 필요한 만큼 보완한다.
+- default gate는 combined UI-case effect 한 번으로 browser와 screenshot
+  evidence를 만들며 declared actions를 runtime attempt당 한 번 실행한다.
+- combined capture는 durable artifact로 전달해 reopen이 browser effect를
+  반복하지 않는다.
+- production baseline input만 필요한 만큼 보완한다.
 - agentic browser는 optional unavailable/advisory 상태를 유지한다.
 
 ## 경고
@@ -40,6 +46,8 @@
   owner-only artifact 경계를 지켜야 한다.
 - visual comparison은 기존 baseline environment 계약보다 넓은 OS/font
   동일성을 자동 증명하지 않는다.
+- combined effect는 attempt당 action 1회를 보장하지만 기존 browser retry
+  ceiling 때문에 실패 뒤 재시도까지 exactly-once mutation을 보장하지 않는다.
 
 ## 조사만 완료된 후속 후보
 
