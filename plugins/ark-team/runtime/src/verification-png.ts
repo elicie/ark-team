@@ -42,22 +42,33 @@ export function decodeVerificationRgba8Png(
   const { metadata } = parsed;
   if (
     metadata.bit_depth !== 8 ||
-    metadata.color_type !== 6 ||
+    ![2, 6].includes(metadata.color_type) ||
     metadata.interlace !== 0
   ) {
     throw new Error(
-      "comparison PNG must be non-interlaced RGBA8 without format conversion",
+      "comparison PNG must be non-interlaced RGB8 or RGBA8",
     );
   }
-  const rowBytes = checkedProduct(metadata.width, 4, "PNG row");
-  const expectedInflatedBytes = checkedProduct(
-    metadata.height,
-    rowBytes + 1,
-    "PNG scanlines",
+  const channels = metadata.color_type === 2 ? 3 : 4;
+  const sourceRowBytes = checkedProduct(
+    metadata.width,
+    channels,
+    "PNG source row",
   );
-  if (expectedInflatedBytes > MAX_RGBA_BYTES + metadata.height) {
+  const rgbaRowBytes = checkedProduct(metadata.width, 4, "PNG RGBA row");
+  const rgbaByteLength = checkedProduct(
+    metadata.height,
+    rgbaRowBytes,
+    "PNG RGBA pixels",
+  );
+  if (rgbaByteLength > MAX_RGBA_BYTES) {
     throw new Error("PNG decoded bytes exceed the fixed RGBA8 limit");
   }
+  const expectedInflatedBytes = checkedProduct(
+    metadata.height,
+    sourceRowBytes + 1,
+    "PNG scanlines",
+  );
 
   let inflated: Buffer;
   try {
@@ -73,21 +84,25 @@ export function decodeVerificationRgba8Png(
     throw new Error("PNG decoded scanline length is invalid");
   }
 
-  const rgba = new Uint8Array(
-    checkedProduct(metadata.height, rowBytes, "PNG pixels"),
+  const decoded = new Uint8Array(
+    checkedProduct(metadata.height, sourceRowBytes, "PNG source pixels"),
   );
   let sourceOffset = 0;
   for (let y = 0; y < metadata.height; y += 1) {
     const filterType = inflated[sourceOffset] ?? 255;
     sourceOffset += 1;
-    const rowOffset = y * rowBytes;
-    for (let x = 0; x < rowBytes; x += 1) {
+    const rowOffset = y * sourceRowBytes;
+    for (let x = 0; x < sourceRowBytes; x += 1) {
       const raw = inflated[sourceOffset + x] ?? 0;
-      const left = x >= 4 ? rgba[rowOffset + x - 4] ?? 0 : 0;
-      const above = y > 0 ? rgba[rowOffset - rowBytes + x] ?? 0 : 0;
+      const left =
+        x >= channels ? decoded[rowOffset + x - channels] ?? 0 : 0;
+      const above =
+        y > 0 ? decoded[rowOffset - sourceRowBytes + x] ?? 0 : 0;
       const upperLeft =
-        y > 0 && x >= 4
-          ? rgba[rowOffset - rowBytes + x - 4] ?? 0
+        y > 0 && x >= channels
+          ? decoded[
+              rowOffset - sourceRowBytes + x - channels
+            ] ?? 0
           : 0;
       let value: number;
       switch (filterType) {
@@ -109,9 +124,28 @@ export function decodeVerificationRgba8Png(
         default:
           throw new Error("PNG uses an unsupported scanline filter");
       }
-      rgba[rowOffset + x] = value & 0xff;
+      decoded[rowOffset + x] = value & 0xff;
     }
-    sourceOffset += rowBytes;
+    sourceOffset += sourceRowBytes;
+  }
+
+  if (channels === 4) {
+    return {
+      width: metadata.width,
+      height: metadata.height,
+      rgba: decoded,
+    };
+  }
+  const rgba = new Uint8Array(rgbaByteLength);
+  for (
+    let sourceIndex = 0, targetIndex = 0;
+    sourceIndex < decoded.byteLength;
+    sourceIndex += 3, targetIndex += 4
+  ) {
+    rgba[targetIndex] = decoded[sourceIndex]!;
+    rgba[targetIndex + 1] = decoded[sourceIndex + 1]!;
+    rgba[targetIndex + 2] = decoded[sourceIndex + 2]!;
+    rgba[targetIndex + 3] = 255;
   }
   return {
     width: metadata.width,

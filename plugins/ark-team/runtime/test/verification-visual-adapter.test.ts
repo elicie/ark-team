@@ -381,6 +381,52 @@ test("TEST-1713 produces deterministic transparent/magenta RGBA8 diff without mu
   assert.deepEqual(decodedDiff.rgba.subarray(0, 4), Uint8Array.of(0, 0, 0, 0));
 });
 
+test("UIR-TEST-004 compares RGB8 Chromium pixels with RGBA8 and rejects unsupported PNG formats", () => {
+  const expectedLeadingRgba = Uint8Array.of(
+    10,
+    20,
+    30,
+    255,
+    40,
+    50,
+    60,
+    255,
+  );
+  const fixture = visualFixture({
+    opaqueBaseline: true,
+    leadingBaselineRgba: expectedLeadingRgba,
+  });
+  const rgbPixels = new Uint8Array(375 * 812 * 3);
+  rgbPixels.set([10, 20, 30, 40, 50, 60]);
+  const rgb = rgb8Png(375, 812, rgbPixels, true);
+  const decoded = decodeVerificationRgba8Png(rgb);
+  assert.deepEqual(
+    decoded.rgba.subarray(0, expectedLeadingRgba.byteLength),
+    expectedLeadingRgba,
+  );
+
+  const result = compare(
+    fixture,
+    actualImage(fixture, "375x812", rgb),
+    fixture.baselinePngs.get("375x812")!,
+    "approved",
+  );
+  assert.equal(result.passed, true);
+  assert.equal(result.evidence.changed_pixel_count, 0);
+
+  for (const unsupported of [
+    gray8Png(1, 1),
+    unsupportedPng({ bitDepth: 8, colorType: 3, interlace: 0 }),
+    unsupportedPng({ bitDepth: 16, colorType: 2, interlace: 0 }),
+    unsupportedPng({ bitDepth: 8, colorType: 2, interlace: 1 }),
+  ]) {
+    assert.throws(
+      () => decodeVerificationRgba8Png(unsupported),
+      /comparison PNG must be non-interlaced RGB8 or RGBA8/,
+    );
+  }
+});
+
 test("TEST-1713 accepts the exact threshold boundary and rejects one pixel beyond it", () => {
   const fixture = visualFixture();
   const pixelCount = 1_440 * 900;
@@ -523,7 +569,7 @@ test("TEST-1713 enforces critical regions and required semantic review while opt
   assert.equal(optional.passed, true);
 });
 
-test("TEST-1713 rejects dimension, RGBA8 format, baseline identity, and hash mismatches", () => {
+test("TEST-1713 rejects dimension, unsupported PNG format, baseline identity, and hash mismatches", () => {
   const fixture = visualFixture();
   const actual = actualImage(
     fixture,
@@ -604,6 +650,8 @@ interface VisualFixture {
 function visualFixture(options: {
   semanticReviewRequired?: boolean;
   criticalRegion?: boolean;
+  opaqueBaseline?: boolean;
+  leadingBaselineRgba?: Uint8Array;
 } = {}): VisualFixture {
   const config = validVerificationCoordinatorConfig();
   if (!config.ui.enabled) {
@@ -635,7 +683,12 @@ function visualFixture(options: {
   for (const viewport of VIEWPORTS) {
     baselinePngs.set(
       viewport.name,
-      rgbaPng(viewport.width, viewport.height),
+      rgbaPng(
+        viewport.width,
+        viewport.height,
+        options.opaqueBaseline === true,
+        options.leadingBaselineRgba,
+      ),
     );
   }
   const manifest: VerificationApprovedBaselineManifest = {
@@ -826,26 +879,110 @@ function compare(
   });
 }
 
-function rgbaPng(width: number, height: number): Uint8Array {
+function rgbaPng(
+  width: number,
+  height: number,
+  opaque = false,
+  leadingRgba?: Uint8Array,
+): Uint8Array {
+  const rgba = new Uint8Array(width * height * 4);
+  if (opaque) {
+    for (let index = 3; index < rgba.byteLength; index += 4) {
+      rgba[index] = 255;
+    }
+  }
+  if (leadingRgba !== undefined) {
+    rgba.set(leadingRgba);
+  }
   return encodeVerificationRgba8Png({
     width,
     height,
-    rgba: new Uint8Array(width * height * 4),
+    rgba,
+  });
+}
+
+function rgb8Png(
+  width: number,
+  height: number,
+  rgb = new Uint8Array(width * height * 3),
+  firstRowUsesSubFilter = false,
+): Uint8Array {
+  const rowBytes = width * 3;
+  assert.equal(rgb.byteLength, height * rowBytes);
+  const scanlines = Buffer.alloc(height * (rowBytes + 1));
+  for (let y = 0; y < height; y += 1) {
+    const sourceOffset = y * rowBytes;
+    const targetOffset = y * (rowBytes + 1);
+    const filter = firstRowUsesSubFilter && y === 0 ? 1 : 0;
+    scanlines[targetOffset] = filter;
+    for (let x = 0; x < rowBytes; x += 1) {
+      const value = rgb[sourceOffset + x] ?? 0;
+      const left =
+        filter === 1 && x >= 3 ? rgb[sourceOffset + x - 3] ?? 0 : 0;
+      scanlines[targetOffset + x + 1] =
+        filter === 1 ? (value - left) & 0xff : value;
+    }
+  }
+  return rawPng({
+    width,
+    height,
+    bitDepth: 8,
+    colorType: 2,
+    interlace: 0,
+    scanlines,
   });
 }
 
 function gray8Png(width: number, height: number): Uint8Array {
+  return rawPng({
+    width,
+    height,
+    bitDepth: 8,
+    colorType: 0,
+    interlace: 0,
+    scanlines: Buffer.alloc(height * (width + 1)),
+  });
+}
+
+function unsupportedPng(input: {
+  bitDepth: number;
+  colorType: number;
+  interlace: number;
+}): Uint8Array {
+  return rawPng({
+    width: 1,
+    height: 1,
+    ...input,
+    scanlines: Buffer.from([0, 0]),
+    ...(input.colorType === 3
+      ? { palette: Buffer.from([0, 0, 0]) }
+      : {}),
+  });
+}
+
+function rawPng(input: {
+  width: number;
+  height: number;
+  bitDepth: number;
+  colorType: number;
+  interlace: number;
+  scanlines: Buffer;
+  palette?: Buffer;
+}): Uint8Array {
   const signature = Buffer.from("89504e470d0a1a0a", "hex");
   const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8;
-  ihdr[9] = 0;
-  const scanlines = Buffer.alloc(height * (width + 1));
+  ihdr.writeUInt32BE(input.width, 0);
+  ihdr.writeUInt32BE(input.height, 4);
+  ihdr[8] = input.bitDepth;
+  ihdr[9] = input.colorType;
+  ihdr[12] = input.interlace;
   return Buffer.concat([
     signature,
     pngChunk("IHDR", ihdr),
-    pngChunk("IDAT", deflateSync(scanlines)),
+    ...(input.palette === undefined
+      ? []
+      : [pngChunk("PLTE", input.palette)]),
+    pngChunk("IDAT", deflateSync(input.scanlines)),
     pngChunk("IEND", Buffer.alloc(0)),
   ]);
 }

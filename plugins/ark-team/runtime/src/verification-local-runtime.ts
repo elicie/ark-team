@@ -4,6 +4,7 @@ import {
   type ChildProcess,
 } from "node:child_process";
 import { lstat, readFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import path from "node:path";
 
 import type { IntegrationRecord, RunRecord } from "./domain.js";
@@ -531,19 +532,16 @@ async function probeRegisteredServer(
   while (!signal.aborted && Date.now() < deadline) {
     try {
       const target = loopbackUrl(request.readiness.url);
-      const response = await fetch(target, {
-        redirect: "manual",
+      const status = await requestReadinessStatus(
+        target,
+        new URL(request.readiness.url).host,
         signal,
-        headers: {
-          host: new URL(request.readiness.url).host,
-        },
-      });
-      await response.body?.cancel();
-      if (response.status === request.readiness.expected_status) {
-        return { status: response.status };
+      );
+      if (status === request.readiness.expected_status) {
+        return { status };
       }
       lastError = new Error(
-        `registered local server returned readiness status ${response.status}`,
+        `registered local server returned readiness status ${status}`,
       );
     } catch (error) {
       lastError = error;
@@ -558,6 +556,29 @@ async function probeRegisteredServer(
     "registered local server readiness timed out",
     { cause: lastError },
   );
+}
+
+async function requestReadinessStatus(
+  target: string,
+  hostHeader: string,
+  signal: AbortSignal,
+): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const request = httpRequest(
+      target,
+      {
+        method: "GET",
+        headers: { host: hostHeader },
+        signal,
+      },
+      (response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      },
+    );
+    request.once("error", reject);
+    request.end();
+  });
 }
 
 async function executeCurlRequest(

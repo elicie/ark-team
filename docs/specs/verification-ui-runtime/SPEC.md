@@ -1,37 +1,41 @@
 # SLICE-017 결정론적 UI 런타임 보완 명세
 
-- Spec identity: `ark-team-verification-ui-runtime-v1.0.2`
+- Spec identity: `ark-team-verification-ui-runtime-v1.0.3`
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
 - Delta status: `SPEC_DELTA_APPLIED`
-- Supersedes: `ark-team-verification-ui-runtime-v1.0.1`
+- Supersedes: `ark-team-verification-ui-runtime-v1.0.2`
 - Authority date: 2026-07-28 UTC
 - Authority: 사용자가 요청한 실제 UI QA 실행 기능, Backend/UI 독립 실행
-  요구, `verification-spec-v4`, 그리고 이 보완안으로 진행하라는 사용자 승인
+  요구, `verification-spec-v4`, 보완안 진행 승인, 실제 Chromium
+  RGB8/RGBA8 계약 수정 승인
 - Target source:
-  `GIT-COMMIT:8dcea3d5a117f1197b8fee3d33808bfa9406372d`
-- Target tree: `5d18c1cdfcd93de147b0470577532c84d5504c4e`
+  `GIT-COMMIT:0e3dd1609406406b948a96894ed57f0d7181c76e`
+- Target tree: `a0e533f0a2ef4136e8f913750a82723f876c9043`
 - Parent contract: `docs/slices/SLICE-017.md`
   (`verification-spec-v4`)
 - Parent host-token override: 이 보완 명세에서 parent의 로컬 hostname
   `dev`는 `devbox`로 읽는다. Parent 문서 bytes와 package fingerprint는
   바꾸지 않으며 이 override는 아래 승인 SPEC SHA-256으로 검증한다.
+- Parent PNG-token override: parent의 비교 입력 `RGBA8 PNG`는 비인터레이스
+  8-bit `RGB` 또는 `RGBA` PNG로 읽는다. RGB는 색 공간을 바꾸지 않고
+  각 픽셀의 alpha를 `255`로 확장한 뒤 기존 RGBA 비교를 수행한다.
 - Reference boundary: `NONE`
 - Deliverable: 이 문서 package만 작성하며 제품 코드나 의존성을 변경하지 않는다.
 
 ## 1. 목적과 완료 신호
 
-현재 기본 검증 게이트는 Backend `curl` QA만 실사용 경로에 연결하고, UI가
-활성화되면 정확한 실행 계약이 없다는 이유로 `SPEC_DELTA_REQUIRED`를
-기록한다. 이 문서는 기존 schema-2 browser/screenshot/comparison evidence
-계약을 바꾸지 않고 생산용 Playwright 실행기를 연결하는 다음 구현
-슬라이스 `IS-1708`을 닫는다.
+현재 기본 검증 게이트는 Backend `curl`과 생산용 Playwright를 연결하지만,
+실제 Chromium의 RGB8 PNG를 기존 RGBA8-only 비교기가 거부한다. 이 문서는
+기존 schema-2 browser/screenshot/comparison evidence record 형식을
+유지하면서 실제 Chromium PNG를 기존 비교기에 연결해 구현 슬라이스
+`IS-1708`을 닫는다.
 
 완료 신호는 다음과 같다.
 
 1. Backend-only 동작은 그대로 유지된다.
 2. 승인된 UI 설정은 저장소에 고정된 Playwright와 번들 Chromium만 사용한다.
-3. 결정론적 UI action/assertion, 세 viewport PNG, 기존 비교기가 실제 로컬
-   서버를 대상으로 실행된다.
+3. 결정론적 UI action/assertion, 세 viewport RGB8/RGBA8 PNG, 기존
+   비교기가 실제 로컬 서버를 대상으로 실행된다.
 4. 누락된 Playwright, 브라우저, 승인 baseline 또는 환경 불일치는 설치나
    대체 없이 fail-close한다.
 5. Browser Use, Playwright agent CLI/MCP, Stagehand 결과는 UI 통과 근거가
@@ -57,6 +61,7 @@
 | `UIR-EVID-012` | Chromium 151은 `http://dev:10091`을 HSTS로 HTTPS 승격해 HTTP 서버 요청 전 `ERR_SSL_PROTOCOL_ERROR`를 냈다. | `dev`는 승인 HTTP QA hostname으로 사용할 수 없다. |
 | `UIR-EVID-013` | `0.0.0.0:10091` fixture와 유일한 `--host-resolver-rules=MAP devbox 127.0.0.1` argument로 Chromium이 `http://devbox:10091/`에서 HTTP 200, exact URL, heading을 확인했다. | `devbox`는 기존 HTTP/port/bind/network 계약을 바꾸지 않고 실행 가능하다. |
 | `UIR-EVID-014` | Playwright `route.fetch/fulfill`로 navigation redirect를 선검사하면 같은 document의 정상 WebSocket이 연결되지 않았고, `route.continue`만 사용하면 cross-origin redirect 대상에 effect가 발생한 뒤 차단됐다. Chromium `Fetch.requestPaused`의 request-stage guard는 정상 local HTTP/WS를 통과시키면서 redirect HTTP와 external WS를 effect 전에 차단했다. | 시작한 exact Chromium target 내부의 request-stage guard가 HTTP(S) 경계를 소유하고 Playwright WebSocket route가 WS 경계를 중복 검증해야 한다. |
+| `UIR-EVID-015` | 승인 capture 옵션 `omitBackground: false`로 exact Chromium `151.0.7922.34`를 실행한 실제 세 viewport PNG는 bit depth `8`, color type `2`(RGB), interlace `0`이었다. 기존 비교기는 color type `6`(RGBA)만 받아 `BASELINE_NOT_APPROVED`로 종료했다. | 캡처 표현을 바꾸지 않고 strict RGB8/RGBA8 decoder가 두 형식을 같은 불투명 픽셀 의미로 비교해야 한다. |
 
 ### 2.2 공식 reference
 
@@ -98,6 +103,7 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
 - repo-local exact Playwright dependency와 stable bundled Chromium
 - 결정론적 browser action/assertion 실행
 - 세 viewport의 exact PNG 캡처
+- 비인터레이스 8-bit RGB/RGBA PNG의 결정론적 픽셀 비교
 - 기존 read-only baseline 검증과 비교기에 필요한 production input 연결
 - exact-origin HTTP(S)/WebSocket 차단
 - trace, screenshot, process/context lifecycle 정리
@@ -170,6 +176,12 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
   이는 외부/system browser에 attach하거나 persistent CDP session을
   재사용하는 동작이 아니다. WebSocket route는 같은 origin을 별도로
   검증하고 정상 연결만 server로 전달한다.
+- `UIR-DEC-014`: 캡처의 `omitBackground: false`와 원본 PNG bytes/hash는
+  바꾸지 않는다. 비교 decoder는 bit depth `8`, interlace `0`, color type
+  `2`(RGB) 또는 `6`(RGBA)만 허용한다. RGB scanline은 원래 RGB 값을
+  그대로 두고 alpha `255`를 붙여 RGBA 비교 버퍼로 확장한다. Resize,
+  crop, color-space 변환과 다른 alpha 정규화는 하지 않으며 다른 PNG
+  형식은 fail-close한다.
 
 ### 알려진 경고
 
@@ -286,6 +298,13 @@ crash/reopen 뒤에도 같은 references에서 materialize할 수 있어야 하�
 기존 strict result normalizer가 dimensions, bytes, SHA-256과 identity를
 검증한다.
 
+비교기는 원본 capture와 승인 baseline의 bytes/hash를 그대로 검증한 뒤
+비인터레이스 8-bit RGB 또는 RGBA scanline을 decode한다. RGB 입력은 각
+픽셀의 alpha를 `255`로 확장하고 RGBA 입력은 alpha를 보존한다. 두 입력은
+같은 dimensions여야 하며 내부 RGBA 버퍼로 기존 threshold와 diff PNG
+계산을 수행한다. Grayscale, indexed color, 16-bit, interlaced PNG와
+잘못된 scanline은 `INVALID_RECORD` 또는 `BASELINE_NOT_APPROVED`로 닫는다.
+
 ### UIR-REQ-005 — Trace, privacy, and cleanup
 
 Trace는 navigation 전에 owner-only temporary path에서 시작하고 exact
@@ -378,7 +397,10 @@ wiring, focused tests와 전체 회귀를 함께 완료해야 한다. 일부만 
   evidence 전체에서 한 fresh context와 action 실행 1회만 사용해 각
   viewport의 exact PNG가 검증된 browser `final_url`에서 캡처되고 versioned
   normalizer를 통과한다. Screenshot records는 durable combined artifacts로
-  materialize되며 reopen이 browser effect를 반복하지 않는다.
+  materialize되며 reopen이 browser effect를 반복하지 않는다. 실제
+  Chromium RGB8와 승인 RGB8/RGBA8 baseline은 원본 hash를 보존한 채
+  동일 dimensions의 RGBA 픽셀 의미로 비교되고, 그 외 PNG 형식은
+  fail-close한다.
 - `UIR-AC-005`: trace와 child lifecycle이 성공·실패 모두 닫히고 raw/private
   data가 구조화 record에 복제되지 않는다.
 - `UIR-AC-006`: 승인 baseline이 있는 UI-only/both-enabled run은 default
@@ -399,7 +421,9 @@ wiring, focused tests와 전체 회귀를 함께 완료해야 한다. 일부만 
   hash mismatch, timeout, undeclared/evaluate/force negative를 검증한다.
 - `UIR-TEST-004`: first-attempt success인 default bootstrap에서 combined
   runtime 호출 1회, declared action/side effect 1회, 세 viewport
-  dimensions/DPR/PNG/hash와 viewport order를 확인한다. 별도 screenshot
+  dimensions/DPR/PNG/hash와 viewport order를 확인한다. 실제 Chromium
+  RGB8, strict RGBA8와 동일 픽셀 RGB8↔RGBA8 비교를 positive로 검증하고
+  grayscale/indexed/16-bit/interlaced 입력을 거부한다. 별도 screenshot
   effect, 같은 attempt 안의 repeated side effect, bitmap crop/resize/JPEG,
   wrong build, reordered result를 거부한다. Same-origin navigation 뒤
   browser `final_url` positive와 initial/different/cross-origin screenshot
@@ -411,12 +435,21 @@ wiring, focused tests와 전체 회귀를 함께 완료해야 한다. 일부만 
   context/browser 종료, temporary cleanup, no raw structured copy를 확인한다.
 - `UIR-TEST-006`: backend-only, UI-only, both-enabled, missing baseline,
   required/optional semantic review, comparison failure와 PM gate 결과를
-  검증한다. Baseline create/update는 시도하지 않는다.
+  검증한다. 실제 `devbox` Host를 요구하는 local fixture에서 Backend curl,
+  Chromium assertion, 세 viewport comparison의 성공과 required UI
+  assertion 실패를 end-to-end로 검증한다. 제품 baseline create/update는
+  시도하지 않는다.
 - `UIR-TEST-007`: Browser Use, Playwright agent CLI/MCP, Stagehand이
   dependency/runtime call graph에 없고 agentic absence가 deterministic pass를
   바꾸지 않음을 검증한다.
 
 ## 9. 문서 작업 상태
+
+v1.0.3은 실제 combined runtime acceptance 실행에서 확인된 PNG 계약
+`CONTRADICTION`을 보정한다. Exact Chromium은 승인된
+`omitBackground: false` 조건에서 RGB8 PNG를 생성하지만 기존 비교기는
+RGBA8만 허용했다. 사용자가 승인한 대로 원본 캡처 의미를 유지하고 strict
+decoder만 RGB8/RGBA8로 확장한다.
 
 v1.0.2는 실브라우저 구현 검증에서 확인된 잘못된 `dev` hostname을 사용자
 정정대로 `devbox`로 보정한다. 또한 redirect 선검사용
@@ -430,7 +463,9 @@ viewport당 action 반복은 제거됐지만 별도 browser/screenshot effect �
 중복은 남아 있었다. Combined UI-case effect가 두 기존 evidence contract를
 한 context에서 생성하도록 결정했으며 다른 제품 동작은 바꾸지 않는다.
 
-v1.0.2 host 보정 evidence에는 `0.0.0.0:10091` local fixture와 exact
-Chromium 접속을 사용했다. Baseline 생성·변경, model/agentic 실행, Docker,
-인프라 또는 시스템 설정 변경은 하지 않았다. 나머지 `UIR-TEST-001`부터
-`UIR-TEST-007`까지는 `IS-1708` implementation loop에서 실행한다.
+v1.0.3 delta evidence는
+`GIT-COMMIT:0e3dd1609406406b948a96894ed57f0d7181c76e`의 exact Playwright
+runtime과 test-only local fixture에서 관측했다. 제품 baseline
+생성·변경, model/agentic 실행, Docker, 인프라 또는 시스템 설정 변경은
+하지 않았다. 변경된 `UIR-TEST-004`와 `UIR-TEST-006`은 `IS-1708`
+implementation loop에서 실행한다.

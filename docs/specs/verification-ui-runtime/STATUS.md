@@ -2,22 +2,22 @@
 
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
 - Delta status: `SPEC_DELTA_APPLIED`
-- Identity: `ark-team-verification-ui-runtime-v1.0.2`
-- Supersedes: `ark-team-verification-ui-runtime-v1.0.1`
+- Identity: `ark-team-verification-ui-runtime-v1.0.3`
+- Supersedes: `ark-team-verification-ui-runtime-v1.0.2`
 - Authority date: 2026-07-28 UTC
 - Package root: `docs/specs/verification-ui-runtime`
 - Parent contract: `verification-spec-v4`
 - Approved implementation slice: `IS-1708`
 - Exact next action: `sdd-implementation-loop`로 `IS-1708` 하나만 구현
 - Normative SPEC SHA-256:
-  `29f69eda06ba8bf47d32e0e3914686f147ef0e5e7c01d3d18f4cd3b4549f4047`
+  `571b5cae52473b6dc5b0e8416406f881062b2a8c8729c401aaa06667efe6e383`
 
 ## Source
 
 - Commit:
-  `fcebe022dd00add51ece1e98e40be81f78f8a28b`
+  `0e3dd1609406406b948a96894ed57f0d7181c76e`
 - Tree:
-  `62445c044022e23f0389f826b5c6e460edc9ae65`
+  `a0e533f0a2ef4136e8f913750a82723f876c9043`
 - Worktree state at capture: clean
 
 ## 확정
@@ -39,10 +39,11 @@
   반복하지 않는다.
 - production baseline input만 필요한 만큼 보완한다.
 - agentic browser는 optional unavailable/advisory 상태를 유지한다.
+- 실제 Chromium RGB8와 strict RGBA8 PNG를 원본 hash 보존 후 동일한
+  RGBA 픽셀 의미로 비교한다.
 
 ## 경고
 
-- 현재 저장소에는 Playwright dependency/browser가 없다.
 - 승인 baseline이 없으면 UI visual gate는 pass할 수 없다.
 - required semantic review는 local-image adapter가 등록되기 전까지
   unavailable이다.
@@ -61,10 +62,16 @@
 두 후보는 exact-origin egress와 positive action mapping의 별도 승인 전에는
 설치하거나 실행하지 않는다.
 
-## 이번 문서 작업에서 실행하지 않음
+## v1.0.3 delta 근거
 
-- 제품 구현과 테스트
-- dependency/browser 설치
-- server/browser/model 실행
+- exact Chromium `151.0.7922.34`의 세 viewport capture가 bit depth `8`,
+  color type `2`, interlace `0`임을 test-only local fixture에서 확인했다.
+- 기존 RGBA8-only 비교가 같은 PNG를 `BASELINE_NOT_APPROVED`로 거부함을
+  확인했다.
+
+## v1.0.3 delta에서 제외
+
+- dependency/browser 추가 설치
 - baseline 생성·갱신
+- model/agentic 실행
 - Docker 또는 인프라 변경
