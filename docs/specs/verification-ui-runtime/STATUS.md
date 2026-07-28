@@ -2,23 +2,44 @@
 
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
 - Delta status: `SPEC_DELTA_APPLIED`
+- Implementation closeout: `IS-1709 IMPLEMENTED`
 - Identity: `ark-team-verification-ui-runtime-v1.1.0`
 - Supersedes: `ark-team-verification-ui-runtime-v1.0.3`
 - Authority date: 2026-07-28 UTC
+- Closeout date: 2026-07-28 UTC
 - Package root: `docs/specs/verification-ui-runtime`
 - Parent contract: `verification-spec-v4`
-- Approved implementation slice: `IS-1709`
-- Exact next action: `sdd-implementation-loop`로 `IS-1709` 하나만 구현
+- Implemented slice: `IS-1709`
+- Remaining approved slices: 없음
+- Exact next action: v1.1.0 범위에는 없음. 실제 제품 QA가 필요하면 대상
+  프로젝트와 product baseline 1회 승인을 별도 spec으로 정의
 - Normative SPEC SHA-256:
   `d04abb88e86f9f6feb7c912eacbb9abba2a720ad5361cffe8836430c26afefde`
 
-## Source
+## Spec source baseline
 
 - Commit:
   `ee08739dc7a985933955db5e2d830b62ca4a6efb`
 - Tree:
   `862780afda6f650ad27bb9f7d49c56528b8856fa`
 - Worktree state at capture: clean
+
+## 구현 완료 근거
+
+- Selector resolver와 기존 full-identity snapshot 호환은 PR #23,
+  merge commit `f256718a3a03e2cb7a75230893b0db76a1396a6c`에서 구현됐다.
+- Tracked selector를 실제 `devbox` Backend/UI gate까지 연결한 acceptance는
+  PR #24, merge commit
+  `da5b1cc8fa4d013aa3073b5a0cef7b1bf0b6f101`에서 보강됐다.
+- Closeout evidence tree는
+  `9f0b13a98d9dfdfb253bcb6e0672705195c2541e`이며 capture 당시 worktree는
+  clean이었다.
+- 구현 commit은 typecheck, unit 200개, verification runtime 12개,
+  provider e2e 3개, CLI 1개, MCP 8개, build와 plugin validation 통과를
+  기록했다. Acceptance commit은 typecheck, 실제 QA smoke와 verification
+  runtime 12개 통과를 기록했다.
+- Normative `SPEC.md`와 runtime 배포 copy는 byte-identical하며 위 승인
+  SHA-256을 유지한다.
 
 ## 확정
 

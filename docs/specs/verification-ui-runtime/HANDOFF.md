@@ -1,21 +1,31 @@
-# Implementation Handoff — SLICE-017 UI Runtime
+# Implementation Closeout — SLICE-017 UI Runtime
 
 - Package: `ark-team-verification-ui-runtime-v1.1.0`
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
 - Delta status: `SPEC_DELTA_APPLIED`
+- Implementation closeout: `IS-1709 IMPLEMENTED`
 - Supersedes: `ark-team-verification-ui-runtime-v1.0.3`
 - Parent: `verification-spec-v4`
 - Reference boundary: `NONE`
 - Evidence coverage: committed config/snapshot/artifact/bootstrap source와
   test fixture inspection
-- Exact next slice: `IS-1709`
+- Exact next slice: 없음
+- Next recommended action: 실제 제품 QA가 필요하면 대상 프로젝트와
+  product baseline 1회 승인을 별도 spec으로 정의
 - Normative contract: [SPEC.md](./SPEC.md)
 - Normative SPEC SHA-256:
   `d04abb88e86f9f6feb7c912eacbb9abba2a720ad5361cffe8836430c26afefde`
 - Source baseline:
   `ee08739dc7a985933955db5e2d830b62ca4a6efb`
+- Implementation merge:
+  `f256718a3a03e2cb7a75230893b0db76a1396a6c`
+- Acceptance merge:
+  `da5b1cc8fa4d013aa3073b5a0cef7b1bf0b6f101`
 
-## 구현 계약
+이 문서는 완료된 v1.1.0 계약과 회귀 조건을 보존한다. `IS-1709` 구현을
+다시 시작하는 지시로 사용하지 않는다.
+
+## 구현된 계약
 
 `IS-1708`의 production Playwright, RGB8/RGBA8 comparison과 strict
 approved-store reader는 유지한다. 이번 delta는 tracked project config의
@@ -23,7 +33,7 @@ source-hash 자기참조를 제거하고, stable selector를 clean source captur
 뒤 exact full identity로 해석한다. 새 baseline generator, QA framework,
 agent workflow 또는 범용 registry를 만들지 않는다.
 
-예상 변경 surface는 다음으로 제한한다.
+승인된 변경 surface는 다음으로 제한했다.
 
 - `verification-contract.ts`
   - strict `baseline_selector = { id, environment }` project config
@@ -36,8 +46,8 @@ agent workflow 또는 범용 registry를 만들지 않는다.
 - `project-config`, contract/artifact/store/bootstrap focused tests
 - approved SPEC copy/hash, plugin cachebuster와 build output
 
-파일 배치는 기존 repository convention에 맞춰 조정할 수 있지만
-`SPEC.md`의 boundary는 바꾸지 않는다.
+파일은 기존 repository convention에 맞춰 배치됐고 normative
+`SPEC.md` boundary는 변경되지 않았다.
 
 ## 고정 identity
 
@@ -55,12 +65,12 @@ browser_build   = chromium-headless-shell-151.0.7922.34-r1234
 - `npx --package`
 - system Chrome 또는 외부/persistent CDP attach
 
-## 구현 순서
+## 구현 이력
 
-1. selector/full-identity config compatibility와 strict parser
-2. bounded read-only manifest discovery 및 exactly-one match
-3. pre-snapshot resolution과 full identity persistence/reopen
-4. focused real-Git negatives, 전체 회귀, build/CodeGraph
+1. 완료 — selector/full-identity config compatibility와 strict parser
+2. 완료 — bounded read-only manifest discovery 및 exactly-one match
+3. 완료 — pre-snapshot resolution과 full identity persistence/reopen
+4. 완료 — focused real-Git negatives, 전체 회귀, build/CodeGraph
 
 ## 필수 안전 조건
 
