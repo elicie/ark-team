@@ -530,7 +530,10 @@ test("TEST-1705 persists one immutable verification snapshot and reopens it byte
   );
 
   assert.equal(config.verification.coordinator.ui.enabled, true);
-  if (config.verification.coordinator.ui.enabled) {
+  if (
+    config.verification.coordinator.ui.enabled &&
+    "baseline_identity" in config.verification.coordinator.ui
+  ) {
     config.verification.coordinator.ui.baseline_identity.id = "mutated-input";
   }
   let replaySourceReads = 0;

@@ -25,6 +25,7 @@ import {
   verificationEvidenceDisposition,
   verificationLinkedRecordSchema,
   verificationRecordMatchesSnapshot,
+  verificationResolvedConfigMatchesProjectConfig,
   verificationRunSnapshotSchema,
   verificationRunSnapshotSha256,
   type VerificationActionKind,
@@ -825,8 +826,10 @@ export const runRecordSchema = z
           message: "verification snapshot requires coordinator configuration",
         });
       } else if (
-        sha256CanonicalJson(coordinator) !==
-        sha256CanonicalJson(run.verification_snapshot.resolved_config)
+        !verificationResolvedConfigMatchesProjectConfig(
+          coordinator,
+          run.verification_snapshot.resolved_config,
+        )
       ) {
         context.addIssue({
           code: "custom",

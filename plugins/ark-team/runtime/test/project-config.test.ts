@@ -12,6 +12,7 @@ import {
   DEFAULT_PROJECT_CONFIG,
   loadProjectConfig,
   projectConfigSha256,
+  projectConfigSchema,
   resolveVerificationCommands,
 } from "../src/project-config.js";
 import { RunStore } from "../src/state-store.js";
@@ -160,6 +161,55 @@ test("TEST-1704 loads one strict coordinator config and hashes resolved bytes de
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("UIR-TEST-008 accepts exactly one selector or compatibility identity", () => {
+  const coordinator = validVerificationCoordinatorConfig();
+  assert.equal(coordinator.ui.enabled, true);
+  if (!coordinator.ui.enabled) {
+    assert.fail("fixture UI lane must be enabled");
+  }
+  const { baseline_identity: identity, ...ui } = coordinator.ui;
+  const selectorConfig = structuredClone(DEFAULT_PROJECT_CONFIG);
+  selectorConfig.verification.coordinator = {
+    ...coordinator,
+    ui: {
+      ...ui,
+      baseline_selector: {
+        id: identity.id,
+        environment: identity.environment,
+      },
+    },
+  };
+  assert.equal(projectConfigSchema.safeParse(selectorConfig).success, true);
+
+  const both = structuredClone(selectorConfig) as Record<string, unknown>;
+  const bothCoordinator = (
+    (both.verification as { coordinator: { ui: Record<string, unknown> } })
+      .coordinator
+  );
+  bothCoordinator.ui.baseline_identity = identity;
+  assert.equal(projectConfigSchema.safeParse(both).success, false);
+
+  const neither = structuredClone(selectorConfig) as Record<string, unknown>;
+  const neitherUi = (
+    (neither.verification as { coordinator: { ui: Record<string, unknown> } })
+      .coordinator.ui
+  );
+  delete neitherUi.baseline_selector;
+  assert.equal(projectConfigSchema.safeParse(neither).success, false);
+
+  const unknownSelector = structuredClone(selectorConfig) as Record<string, unknown>;
+  const selector = (
+    (unknownSelector.verification as {
+      coordinator: { ui: { baseline_selector: Record<string, unknown> } };
+    }).coordinator.ui.baseline_selector
+  );
+  selector.latest = true;
+  assert.equal(
+    projectConfigSchema.safeParse(unknownSelector).success,
+    false,
+  );
 });
 
 test("TEST-1404 reopens and enforces a persisted zero-retry policy", async () => {

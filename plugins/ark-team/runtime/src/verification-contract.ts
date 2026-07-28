@@ -377,6 +377,21 @@ export const verificationBaselineIdentitySchema = z
   })
   .strict();
 
+export type VerificationBaselineIdentity = z.infer<
+  typeof verificationBaselineIdentitySchema
+>;
+
+export const verificationBaselineSelectorSchema = z
+  .object({
+    id: identifierSchema,
+    environment: browserEnvironmentSchema,
+  })
+  .strict();
+
+export type VerificationBaselineSelector = z.infer<
+  typeof verificationBaselineSelectorSchema
+>;
+
 const verificationComparisonPolicySchema = z
   .object({
     pixel_diff_fraction_max: z.literal(0.005),
@@ -860,7 +875,7 @@ const verificationBackendLaneSchema = z.discriminatedUnion("enabled", [
   enabledBackendLaneSchema,
 ]);
 
-const enabledUiLaneSchema = z
+const enabledUiLaneBaseSchema = z
   .object({
     enabled: z.literal(true),
     required: z.boolean(),
@@ -879,78 +894,105 @@ const enabledUiLaneSchema = z
         isCanonicalRelativePath,
         "baseline_root must be canonical and project-relative",
       ),
-    baseline_identity: verificationBaselineIdentitySchema,
     pixel_diff_fraction_max: z.literal(0.005),
     max_channel_delta: z.literal(8),
     critical_regions: z.array(criticalRegionSchema).max(100),
     semantic_review_required: z.boolean(),
     agentic_tasks: z.array(verificationAgenticTaskSchema).max(50),
   })
+  .strict();
+
+function refineEnabledUiLane(
+  lane: z.infer<typeof enabledUiLaneBaseSchema>,
+  context: z.RefinementCtx,
+): void {
+  addDuplicateIssues(
+    lane.browser_cases.map((browserCase) => browserCase.id),
+    context,
+    ["browser_cases"],
+  );
+  addDuplicateIssues(
+    lane.agentic_tasks.map((task) => task.id),
+    context,
+    ["agentic_tasks"],
+  );
+  addDuplicateIssues(
+    lane.critical_regions.map((region) => region.id),
+    context,
+    ["critical_regions"],
+  );
+  if (lane.required && !lane.browser_cases.some((browserCase) => browserCase.required)) {
+    context.addIssue({
+      code: "custom",
+      path: ["browser_cases"],
+      message: "a required UI lane needs a required browser case",
+    });
+  }
+  const expectedRequired = [
+    "browser",
+    "comparison",
+    "screenshot",
+    ...(lane.semantic_review_required ? ["semantic_review"] : []),
+    "server",
+  ];
+  const expectedOptional = [
+    ...(lane.agentic_tasks.length > 0 ? ["agentic_browser"] : []),
+    ...(!lane.semantic_review_required ? ["semantic_review"] : []),
+  ];
+  if (canonicalJson(lane.required_capabilities) !== canonicalJson(expectedRequired)) {
+    context.addIssue({
+      code: "custom",
+      path: ["required_capabilities"],
+      message: "required UI capabilities do not match enabled checks",
+    });
+  }
+  if (canonicalJson(lane.optional_capabilities) !== canonicalJson(expectedOptional)) {
+    context.addIssue({
+      code: "custom",
+      path: ["optional_capabilities"],
+      message: "optional UI capabilities do not match enabled checks",
+    });
+  }
+  if (
+    lane.required_capabilities.some((capability) =>
+      lane.optional_capabilities.includes(capability),
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["optional_capabilities"],
+      message: "required and optional capabilities must be disjoint",
+    });
+  }
+}
+
+const enabledUiLaneSchema = enabledUiLaneBaseSchema
+  .extend({
+    baseline_identity: verificationBaselineIdentitySchema,
+  })
   .strict()
-  .superRefine((lane, context) => {
-    addDuplicateIssues(
-      lane.browser_cases.map((browserCase) => browserCase.id),
-      context,
-      ["browser_cases"],
-    );
-    addDuplicateIssues(
-      lane.agentic_tasks.map((task) => task.id),
-      context,
-      ["agentic_tasks"],
-    );
-    addDuplicateIssues(
-      lane.critical_regions.map((region) => region.id),
-      context,
-      ["critical_regions"],
-    );
-    if (lane.required && !lane.browser_cases.some((browserCase) => browserCase.required)) {
-      context.addIssue({
-        code: "custom",
-        path: ["browser_cases"],
-        message: "a required UI lane needs a required browser case",
-      });
-    }
-    const expectedRequired = [
-      "browser",
-      "comparison",
-      "screenshot",
-      ...(lane.semantic_review_required ? ["semantic_review"] : []),
-      "server",
-    ];
-    const expectedOptional = [
-      ...(lane.agentic_tasks.length > 0 ? ["agentic_browser"] : []),
-      ...(!lane.semantic_review_required ? ["semantic_review"] : []),
-    ];
-    if (canonicalJson(lane.required_capabilities) !== canonicalJson(expectedRequired)) {
-      context.addIssue({
-        code: "custom",
-        path: ["required_capabilities"],
-        message: "required UI capabilities do not match enabled checks",
-      });
-    }
-    if (canonicalJson(lane.optional_capabilities) !== canonicalJson(expectedOptional)) {
-      context.addIssue({
-        code: "custom",
-        path: ["optional_capabilities"],
-        message: "optional UI capabilities do not match enabled checks",
-      });
-    }
-    if (
-      lane.required_capabilities.some((capability) =>
-        lane.optional_capabilities.includes(capability),
-      )
-    ) {
-      context.addIssue({
-        code: "custom",
-        path: ["optional_capabilities"],
-        message: "required and optional capabilities must be disjoint",
-      });
-    }
-  });
+  .superRefine(refineEnabledUiLane);
+
+export const enabledUiSelectorLaneSchema = enabledUiLaneBaseSchema
+  .extend({
+    baseline_selector: verificationBaselineSelectorSchema,
+  })
+  .strict()
+  .superRefine(refineEnabledUiLane);
+
+export type VerificationEnabledUiSelectorLane = z.infer<
+  typeof enabledUiSelectorLaneSchema
+>;
 
 const verificationUiLaneSchema = z.discriminatedUnion("enabled", [
   disabledLaneSchema,
   enabledUiLaneSchema,
+]);
+
+const verificationProjectUiLaneSchema = z.union([
+  disabledLaneSchema,
+  enabledUiLaneSchema,
+  enabledUiSelectorLaneSchema,
 ]);
 
 const disabledVerificationCoordinatorConfigSchema = z
@@ -961,7 +1003,7 @@ const disabledVerificationCoordinatorConfigSchema = z
   })
   .strict();
 
-export const verificationCoordinatorConfigV2Schema = z
+const verificationCoordinatorConfigV2BaseSchema = z
   .object({
     schema_version: z.literal(2),
     contract_id: z.literal("verification_contract_v2"),
@@ -989,71 +1031,96 @@ export const verificationCoordinatorConfigV2Schema = z
     attempts: verificationAttemptsSchema,
     approval_policy: z.literal("explicit-one-time-user-decision"),
     backend: verificationBackendLaneSchema,
-    ui: verificationUiLaneSchema,
   })
-  .strict()
-  .superRefine((config, context) => {
-    const executable = path.basename(config.server_argv[0] ?? "").toLowerCase();
+  .strict();
+
+type VerificationCoordinatorConfigV2RefinementInput = z.infer<
+  typeof verificationCoordinatorConfigV2BaseSchema
+> & {
+  ui: z.infer<typeof verificationProjectUiLaneSchema>;
+};
+
+function refineVerificationCoordinatorConfigV2(
+  config: VerificationCoordinatorConfigV2RefinementInput,
+  context: z.RefinementCtx,
+): void {
+  const executable = path.basename(config.server_argv[0] ?? "").toLowerCase();
+  if (
+    ["sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "pwsh"].includes(
+      executable,
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["server_argv", 0],
+      message: "server_argv must not invoke a shell",
+    });
+  }
+  config.server_argv.forEach((argument, index) => {
+    const normalized = argument.trim().toLowerCase();
+    if (SECRET_ARGUMENT_PATTERN.test(argument)) {
+      context.addIssue({
+        code: "custom",
+        path: ["server_argv", index],
+        message: "server_argv must not contain credential arguments",
+      });
+    }
     if (
-      ["sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "pwsh"].includes(
-        executable,
-      )
+      FORBIDDEN_LOCAL_SERVER_TOKENS.has(path.basename(normalized)) ||
+      FORBIDDEN_LOCAL_SERVER_TOKENS.has(normalized)
     ) {
       context.addIssue({
         code: "custom",
-        path: ["server_argv", 0],
-        message: "server_argv must not invoke a shell",
+        path: ["server_argv", index],
+        message:
+          "server_argv must not invoke Docker, remote, or infrastructure tools",
       });
     }
-    config.server_argv.forEach((argument, index) => {
-      const normalized = argument.trim().toLowerCase();
-      if (SECRET_ARGUMENT_PATTERN.test(argument)) {
-        context.addIssue({
-          code: "custom",
-          path: ["server_argv", index],
-          message: "server_argv must not contain credential arguments",
-        });
-      }
-      if (
-        FORBIDDEN_LOCAL_SERVER_TOKENS.has(path.basename(normalized)) ||
-        FORBIDDEN_LOCAL_SERVER_TOKENS.has(normalized)
-      ) {
-        context.addIssue({
-          code: "custom",
-          path: ["server_argv", index],
-          message:
-            "server_argv must not invoke Docker, remote, or infrastructure tools",
-        });
-      }
-      if (
-        normalized === "3000" ||
-        /^--?port(?:=|:)3000$/.test(normalized)
-      ) {
-        context.addIssue({
-          code: "custom",
-          path: ["server_argv", index],
-          message: "server_argv must not select port 3000",
-        });
-      }
-      if (/^(?:https?|wss?):\/\//.test(normalized)) {
-        context.addIssue({
-          code: "custom",
-          path: ["server_argv", index],
-          message: "server_argv must not target a remote service",
-        });
-      }
-    });
-    const requiredLaneCount =
-      Number(config.backend.enabled && config.backend.required) +
-      Number(config.ui.enabled && config.ui.required);
-    if (requiredLaneCount === 0) {
+    if (
+      normalized === "3000" ||
+      /^--?port(?:=|:)3000$/.test(normalized)
+    ) {
       context.addIssue({
         code: "custom",
-        path: ["backend"],
-        message: "at least one enabled lane must be required",
+        path: ["server_argv", index],
+        message: "server_argv must not select port 3000",
+      });
+    }
+    if (/^(?:https?|wss?):\/\//.test(normalized)) {
+      context.addIssue({
+        code: "custom",
+        path: ["server_argv", index],
+        message: "server_argv must not target a remote service",
       });
     }
   });
+  const requiredLaneCount =
+    Number(config.backend.enabled && config.backend.required) +
+    Number(config.ui.enabled && config.ui.required);
+  if (requiredLaneCount === 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["backend"],
+      message: "at least one enabled lane must be required",
+    });
+  }
+}
+
+export const verificationCoordinatorConfigV2Schema =
+  verificationCoordinatorConfigV2BaseSchema
+    .extend({
+      ui: verificationUiLaneSchema,
+    })
+    .strict()
+    .superRefine(refineVerificationCoordinatorConfigV2);
+
+export const verificationProjectCoordinatorConfigV2Schema =
+  verificationCoordinatorConfigV2BaseSchema
+    .extend({
+      ui: verificationProjectUiLaneSchema,
+    })
+    .strict()
+    .superRefine(refineVerificationCoordinatorConfigV2);
 
 export const verificationCoordinatorConfigSchema = z.union([
   legacyVerificationCoordinatorConfigSchema,
@@ -1067,6 +1134,55 @@ export type VerificationCoordinatorConfig = z.infer<
 export type VerificationCoordinatorConfigV2 = z.infer<
   typeof verificationCoordinatorConfigV2Schema
 >;
+
+export const verificationProjectCoordinatorConfigSchema = z.union([
+  legacyVerificationCoordinatorConfigSchema,
+  disabledVerificationCoordinatorConfigSchema,
+  verificationProjectCoordinatorConfigV2Schema,
+]);
+
+export type VerificationProjectCoordinatorConfig = z.infer<
+  typeof verificationProjectCoordinatorConfigSchema
+>;
+export type VerificationProjectCoordinatorConfigV2 = z.infer<
+  typeof verificationProjectCoordinatorConfigV2Schema
+>;
+
+export function verificationResolvedConfigMatchesProjectConfig(
+  projectConfig: unknown,
+  resolvedConfig: unknown,
+): boolean {
+  const project = verificationProjectCoordinatorConfigV2Schema.safeParse(
+    projectConfig,
+  );
+  const resolved = verificationCoordinatorConfigV2Schema.safeParse(
+    resolvedConfig,
+  );
+  if (!project.success || !resolved.success) {
+    return false;
+  }
+  if (
+    project.data.ui.enabled &&
+    "baseline_selector" in project.data.ui
+  ) {
+    if (!resolved.data.ui.enabled) {
+      return false;
+    }
+    const { baseline_identity: identity, ...resolvedUi } =
+      resolved.data.ui;
+    return canonicalJson(project.data) === canonicalJson({
+      ...resolved.data,
+      ui: {
+        ...resolvedUi,
+        baseline_selector: {
+          id: identity.id,
+          environment: identity.environment,
+        },
+      },
+    });
+  }
+  return canonicalJson(project.data) === canonicalJson(resolved.data);
+}
 
 export const verificationStageSchema = z.enum([
   "integrated",

@@ -7,7 +7,7 @@ import { z } from "zod/v4";
 import { ArkTeamError } from "./errors.js";
 import {
   sha256CanonicalJson,
-  verificationCoordinatorConfigSchema,
+  verificationProjectCoordinatorConfigSchema,
 } from "./verification-contract.js";
 
 const fixedModelsSchema = z
@@ -100,7 +100,7 @@ export const projectConfigSchema = z
     verification: z
       .object({
         commands: z.array(verificationCommandSchema).max(50),
-        coordinator: verificationCoordinatorConfigSchema.nullable().default(null),
+        coordinator: verificationProjectCoordinatorConfigSchema.nullable().default(null),
       })
       .strict(),
   })
