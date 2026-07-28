@@ -1,16 +1,16 @@
 # SLICE-017 결정론적 UI 런타임 보완 명세
 
-- Spec identity: `ark-team-verification-ui-runtime-v1.0.3`
+- Spec identity: `ark-team-verification-ui-runtime-v1.1.0`
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
 - Delta status: `SPEC_DELTA_APPLIED`
-- Supersedes: `ark-team-verification-ui-runtime-v1.0.2`
+- Supersedes: `ark-team-verification-ui-runtime-v1.0.3`
 - Authority date: 2026-07-28 UTC
 - Authority: 사용자가 요청한 실제 UI QA 실행 기능, Backend/UI 독립 실행
   요구, `verification-spec-v4`, 보완안 진행 승인, 실제 Chromium
-  RGB8/RGBA8 계약 수정 승인
+  RGB8/RGBA8 계약 수정 승인, 비자기참조 baseline resolver 추천안 승인
 - Target source:
-  `GIT-COMMIT:0e3dd1609406406b948a96894ed57f0d7181c76e`
-- Target tree: `a0e533f0a2ef4136e8f913750a82723f876c9043`
+  `GIT-COMMIT:ee08739dc7a985933955db5e2d830b62ca4a6efb`
+- Target tree: `862780afda6f650ad27bb9f7d49c56528b8856fa`
 - Parent contract: `docs/slices/SLICE-017.md`
   (`verification-spec-v4`)
 - Parent host-token override: 이 보완 명세에서 parent의 로컬 hostname
@@ -24,11 +24,13 @@
 
 ## 1. 목적과 완료 신호
 
-현재 기본 검증 게이트는 Backend `curl`과 생산용 Playwright를 연결하지만,
-실제 Chromium의 RGB8 PNG를 기존 RGBA8-only 비교기가 거부한다. 이 문서는
-기존 schema-2 browser/screenshot/comparison evidence record 형식을
-유지하면서 실제 Chromium PNG를 기존 비교기에 연결해 구현 슬라이스
-`IS-1708`을 닫는다.
+현재 기본 검증 게이트는 Backend `curl`과 생산용 Playwright를 연결하고
+실제 Chromium RGB8 PNG도 비교한다. 그러나 tracked project config 안의
+full baseline identity가 자기 자신을 포함한 현재 Git commit/tree를
+요구해 실제 프로젝트 UI lane을 구성할 수 없다. 이 문서는 기존
+schema-2 snapshot과 read-only baseline 검증 형식을 유지하면서 tracked
+config의 stable selector를 실행 전 exact manifest identity로 해석하는
+구현 슬라이스 `IS-1709`를 닫는다.
 
 완료 신호는 다음과 같다.
 
@@ -40,6 +42,8 @@
    대체 없이 fail-close한다.
 5. Browser Use, Playwright agent CLI/MCP, Stagehand 결과는 UI 통과 근거가
    되지 않는다.
+6. tracked project config는 source hash를 포함하지 않고, clean source
+   캡처 뒤 정확히 하나의 승인 manifest가 선택돼야 snapshot이 생성된다.
 
 ## 2. 근거와 탐색 범위
 
@@ -62,6 +66,20 @@
 | `UIR-EVID-013` | `0.0.0.0:10091` fixture와 유일한 `--host-resolver-rules=MAP devbox 127.0.0.1` argument로 Chromium이 `http://devbox:10091/`에서 HTTP 200, exact URL, heading을 확인했다. | `devbox`는 기존 HTTP/port/bind/network 계약을 바꾸지 않고 실행 가능하다. |
 | `UIR-EVID-014` | Playwright `route.fetch/fulfill`로 navigation redirect를 선검사하면 같은 document의 정상 WebSocket이 연결되지 않았고, `route.continue`만 사용하면 cross-origin redirect 대상에 effect가 발생한 뒤 차단됐다. Chromium `Fetch.requestPaused`의 request-stage guard는 정상 local HTTP/WS를 통과시키면서 redirect HTTP와 external WS를 effect 전에 차단했다. | 시작한 exact Chromium target 내부의 request-stage guard가 HTTP(S) 경계를 소유하고 Playwright WebSocket route가 WS 경계를 중복 검증해야 한다. |
 | `UIR-EVID-015` | 승인 capture 옵션 `omitBackground: false`로 exact Chromium `151.0.7922.34`를 실행한 실제 세 viewport PNG는 bit depth `8`, color type `2`(RGB), interlace `0`이었다. 기존 비교기는 color type `6`(RGBA)만 받아 `BASELINE_NOT_APPROVED`로 종료했다. | 캡처 표현을 바꾸지 않고 strict RGB8/RGBA8 decoder가 두 형식을 같은 불투명 픽셀 의미로 비교해야 한다. |
+| `UIR-EVID-016` | contract-v2 project config의 `baseline_identity.source_commit/source_tree`는 snapshot source와 같아야 하지만, tracked config에 그 값을 쓰고 commit하면 그 config를 포함한 commit/tree가 다시 바뀐다. | tracked config의 full identity는 자기참조 고정점 때문에 실제 UI snapshot 입력이 될 수 없다. |
+| `UIR-EVID-017` | `examples/qa-smoke`는 config와 baseline root를 Git에서 제외하고 source capture 뒤 test-only full identity를 주입한다. 저장소의 production baseline manifest/object는 0개다. | 기존 test는 runtime을 검증하지만 tracked production config 문제를 증명하지 않으며 test baseline을 product baseline으로 승격할 수 없다. |
+
+`UIR-EVID-001`–`015`는 v1.0.x source identity에서 수집한 historical
+implementation/runtime evidence다. 현재 v1.1.0 target은 IS-1708 구현을
+포함하며 이번 delta의 직접 근거는 `UIR-EVID-016`–`017`이다.
+
+| Surface | Status | Evidence | Capability | Gap |
+| --- | --- | --- | --- | --- |
+| Project config schema와 source capture | `EXPLORED` | `SOURCE`, `TEST` | selector parsing, clean Git identity | production selector 미구현 |
+| Snapshot builder와 persisted run schema | `EXPLORED` | `SOURCE`, `TEST` | exact full identity persistence/reopen | pre-snapshot resolution 미구현 |
+| Artifact store와 bootstrap | `EXPLORED` | `SOURCE`, `TEST` | exact-path manifest/object verification | selector candidate discovery 미구현 |
+| QA smoke fixture | `EXPLORED` | `SOURCE`, `TEST` | test-only baseline와 both-lane gate | product baseline으로 승격 불가 |
+| Product baseline provisioning | `OUT_OF_SCOPE` | `UNVERIFIED` | none | 별도 exact one-time approval 필요 |
 
 ### 2.2 공식 reference
 
@@ -105,6 +123,7 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
 - 세 viewport의 exact PNG 캡처
 - 비인터레이스 8-bit RGB/RGBA PNG의 결정론적 픽셀 비교
 - 기존 read-only baseline 검증과 비교기에 필요한 production input 연결
+- tracked project config의 stable baseline selector와 pre-snapshot resolver
 - exact-origin HTTP(S)/WebSocket 차단
 - trace, screenshot, process/context lifecycle 정리
 - Backend-only 회귀와 UI fail-close 검증
@@ -115,6 +134,7 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
 - cloud browser/model, tunnel, proxy, persistent/real profile
 - login, credential, storage-state, upload/download UI 시나리오
 - baseline 생성·승인·갱신
+- selector가 가리키는 manifest를 자동 선택·승인·승격하는 fallback
 - semantic image reviewer 구현
 - generated/healed test 자동 적용
 - Docker, 인프라, `/etc/hosts`, DNS 또는 시스템 설정 변경
@@ -182,6 +202,22 @@ authority가 아니며 설치·원격 실행을 승인하지 않는다.
   그대로 두고 alpha `255`를 붙여 RGBA 비교 버퍼로 확장한다. Resize,
   crop, color-space 변환과 다른 alpha 정규화는 하지 않으며 다른 PNG
   형식은 fail-close한다.
+- `UIR-DEC-015`: 새 tracked contract-v2 UI config는
+  `baseline_selector = { id, environment }`만 선언한다. Source commit/tree,
+  baseline-set hash와 approval metadata는 project config에 복제하지 않는다.
+  Coordinator는 clean source capture 뒤 첫 server/API/browser effect 전에
+  `baseline_root/manifests/<id>` 아래의 bounded canonical manifest만
+  read-only로 검사한다. Baseline root는 project-relative Git-ignored
+  경로여야 하며 그 아래 tracked file은 0개여야 한다. Candidate 수는 기존
+  file-count limit `500`, 각 manifest는 metadata limit `65536` bytes를
+  넘을 수 없다. 현재 source commit/tree, selector environment,
+  snapshotted case×viewport matrix, exact adapter/version/browser build와
+  일치하는 manifest가 정확히 하나일 때 그 full identity와 hash를 기존
+  resolved config/snapshot에 고정한다. 일치 항목 0개 또는 복수, malformed,
+  writable, symlink, filename/hash, object, dimension, matrix drift는
+  `BASELINE_NOT_APPROVED`이며 baseline bytes를 만들거나 바꾸지 않는다.
+  기존 full-identity fixture 입력과 persisted schema-2 snapshot은 read-only
+  호환을 유지한다.
 
 ### 알려진 경고
 
@@ -367,6 +403,58 @@ exact origin/positive tool allowlist를 증명할 수 없으므로 agentic capab
 egress enforcement, generic-to-vendor action mapping, unknown-tool
 fail-close를 별도 승인받아야 한다. Agentic self/judge 결과는 계속 advisory다.
 
+### UIR-REQ-008 — Non-self-referential approved-baseline resolution
+
+Tracked project config의 enabled UI lane은 `baseline_root`와 strict
+`baseline_selector`를 선언한다. Selector는 bounded `id`와 exact viewport,
+DPR, locale, timezone, color scheme, reduced-motion environment만 포함하며
+source commit/tree, set hash, approval metadata 또는 mutable alias를
+포함하지 않는다.
+
+```toml
+baseline_root = ".ark-team/baselines"
+baseline_selector = {
+  id = "qa-home-v1",
+  environment = {
+    viewports = ["375x812", "768x1024", "1440x900"],
+    device_scale_factor = 1,
+    locale = "en-US",
+    timezone = "UTC",
+    color_scheme = "light",
+    reduced_motion = "no-preference"
+  }
+}
+```
+
+새 production config는 `baseline_selector`를 사용한다. 기존
+`baseline_identity` full object는 fixture/compatibility 입력으로만
+허용하며 enabled UI lane은 둘 중 정확히 하나만 가질 수 있다. 둘 다 또는
+둘 다 없음, selector의 unknown field는 `CONFIG_INVALID`다. Snapshot의
+`resolved_config.ui`는 기존 full `baseline_identity` shape만 사용한다.
+
+Coordinator는 package/config validation과 clean source capture 뒤, immutable
+snapshot을 persist하기 전에 selector directory의 regular read-only canonical
+JSON manifest를 bounded하게 열거하고 기존 strict manifest/object verifier와
+같은 path, permission, schema, hash, dimension, ordering 규칙을 적용한다.
+Baseline root는 project-relative Git ignore rule에 포함되고 그 아래 Git
+tracked file이 없어야 한다. Candidate filename은 lowercase
+`<64-hex>.json`만 허용하고 directory entry는 최대 `500`, 각 manifest는
+최대 `65536` bytes다. Pattern 밖 entry, limit 초과와 Git 경계 위반은
+`BASELINE_NOT_APPROVED`다.
+현재 source commit/tree, selector environment, configured adapter/version,
+browser build, browser case×viewport matrix와 모두 일치하는 candidate가
+정확히 하나여야 한다. Resolver는 그 manifest의 canonical baseline-set
+SHA-256과 full identity를 resolved config 및 snapshot에 고정하고, 이후
+기존 approved-store reader는 exact manifest path만 다시 읽는다.
+
+Candidate가 없거나 둘 이상이면, directory entry가 malformed/writable/
+symlink이거나 candidate manifest/object가 불일치하면 snapshot persistence,
+server start, API, browser와 baseline write 전에 `BASELINE_NOT_APPROVED`로
+중단한다. Resolver는 baseline 생성·승인·갱신, latest 선택, mtime 우선,
+fallback, directory 외부 탐색을 하지 않는다. 기존 inline full identity는
+test fixture와 이미 persisted된 schema-2 evidence의 호환 입력으로만
+유지하며 production tracked config의 신규 형식은 selector다.
+
 ## 6. Traceability와 구현 slice
 
 | Requirement | Parent contract | Acceptance | Test | Slice |
@@ -378,11 +466,13 @@ fail-close를 별도 승인받아야 한다. Agentic self/judge 결과는 계속
 | `UIR-REQ-005` | `REQ-1706`, `REQ-1716` | `UIR-AC-005` | `UIR-TEST-005` | `IS-1708` |
 | `UIR-REQ-006` | `REQ-1713`, `REQ-1719`, `REQ-1720`, `REQ-1722` | `UIR-AC-006` | `UIR-TEST-006` | `IS-1708` |
 | `UIR-REQ-007` | `REQ-1723` | `UIR-AC-007` | `UIR-TEST-007` | `IS-1708` |
+| `UIR-REQ-008` | `REQ-1701`, `REQ-1702`, `REQ-1705`, `REQ-1706`, `REQ-1719` | `UIR-AC-008` | `UIR-TEST-008` | `IS-1709` |
 
-`IS-1708`은 하나의 vertical slice다. Playwright package/browser identity,
-browser/screenshot execution, approved baseline loading, default PM gate
-wiring, focused tests와 전체 회귀를 함께 완료해야 한다. 일부만 구현한
-상태를 UI QA 완료로 보고하지 않는다.
+`IS-1708`은 Playwright package/browser identity, browser/screenshot
+execution, approved baseline loading과 default PM gate wiring을 구현했다.
+`IS-1709`는 tracked selector parsing, pre-snapshot exact-manifest resolution,
+resolved identity persistence와 focused tests를 하나의 vertical slice로
+완료한다. Baseline 생성·승인·갱신은 포함하지 않는다.
 
 ## 7. Acceptance criteria
 
@@ -407,6 +497,13 @@ wiring, focused tests와 전체 회귀를 함께 완료해야 한다. 일부만 
   gate에서 실행되며 기존 non-pass와 Backend 동작을 보존한다.
 - `UIR-AC-007`: agentic 제품은 설치·호출되지 않고 optional unavailable과
   advisory-only 경계가 유지된다.
+- `UIR-AC-008`: 실제 clean Git 프로젝트의 tracked config가 source hash
+  없이 stable selector를 선언하고, 현재 source·환경·adapter·browser·
+  case×viewport와 일치하는 read-only manifest가 정확히 하나일 때만
+  기존 full identity snapshot과 approved-store bytes가 생성 전 effect
+  없이 해석된다. Baseline root는 Git-ignored이고 tracked file이 없으며,
+  0개·복수·변조·writable·symlink·entry/byte limit 초과는 snapshot과
+  local effect 전에 fail-close하고 baseline write는 0회다.
 
 ## 8. Verification cases
 
@@ -442,8 +539,27 @@ wiring, focused tests와 전체 회귀를 함께 완료해야 한다. 일부만 
 - `UIR-TEST-007`: Browser Use, Playwright agent CLI/MCP, Stagehand이
   dependency/runtime call graph에 없고 agentic absence가 deterministic pass를
   바꾸지 않음을 검증한다.
+- `UIR-TEST-008`: real Git fixture에서 selector가 든 config를 commit하고
+  source capture 뒤 별도 test-only read-only store에 현재 source와 일치하는
+  manifest/object를 provision한다. Resolver가 exactly-one candidate를
+  선택해 full identity와 canonical hash를 snapshot에 고정하고 기존
+  approved-store reader가 같은 bytes를 읽는지 검증한다. Missing, 두 개의
+  matching manifest, wrong source/tree/environment/adapter/browser/matrix,
+  malformed filename/JSON, writable/symlink manifest/object와 hash/dimension
+  drift, non-ignored 또는 tracked baseline root, 500-entry/65536-byte
+  boundary를 각각 거부하고 server/browser 호출과 baseline write가 0회임을
+  확인한다. 기존 inline full-identity fixture와 persisted schema-2
+  snapshot reopen도 회귀 검증한다.
 
 ## 9. 문서 작업 상태
+
+v1.1.0은 실제 프로젝트 적용 검토에서 확인된 tracked config의
+`CONTRADICTION`을 보정한다. Full baseline identity가 현재 source commit/tree를
+포함하면서 그 identity 자체가 같은 tracked tree에 들어가야 해 고정점이
+존재하지 않았다. 사용자가 승인한 추천안대로 project config에는 stable
+selector만 두고, clean source 캡처 뒤 기존 read-only store에서 정확히
+하나의 full identity를 pre-snapshot 해석한다. Product baseline 생성·승인·
+갱신은 여전히 별도 exact one-time approval 없이는 수행하지 않는다.
 
 v1.0.3은 실제 combined runtime acceptance 실행에서 확인된 PNG 계약
 `CONTRADICTION`을 보정한다. Exact Chromium은 승인된
@@ -462,6 +578,12 @@ v1.0.1은 구현 검토에서 확인된 `AMBIGUITY`를 보정했다. v1.0.0의
 viewport당 action 반복은 제거됐지만 별도 browser/screenshot effect 사이의
 중복은 남아 있었다. Combined UI-case effect가 두 기존 evidence contract를
 한 context에서 생성하도록 결정했으며 다른 제품 동작은 바꾸지 않는다.
+
+v1.1.0 delta evidence는
+`GIT-COMMIT:ee08739dc7a985933955db5e2d830b62ca4a6efb`의 config schema,
+snapshot builder, artifact store, coordinator bootstrap과 test fixture에서
+관측했다. Source worktree는 clean이었고 target tree는
+`862780afda6f650ad27bb9f7d49c56528b8856fa`였다.
 
 v1.0.3 delta evidence는
 `GIT-COMMIT:0e3dd1609406406b948a96894ed57f0d7181c76e`의 exact Playwright

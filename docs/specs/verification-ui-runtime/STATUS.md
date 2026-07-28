@@ -2,22 +2,22 @@
 
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
 - Delta status: `SPEC_DELTA_APPLIED`
-- Identity: `ark-team-verification-ui-runtime-v1.0.3`
-- Supersedes: `ark-team-verification-ui-runtime-v1.0.2`
+- Identity: `ark-team-verification-ui-runtime-v1.1.0`
+- Supersedes: `ark-team-verification-ui-runtime-v1.0.3`
 - Authority date: 2026-07-28 UTC
 - Package root: `docs/specs/verification-ui-runtime`
 - Parent contract: `verification-spec-v4`
-- Approved implementation slice: `IS-1708`
-- Exact next action: `sdd-implementation-loop`로 `IS-1708` 하나만 구현
+- Approved implementation slice: `IS-1709`
+- Exact next action: `sdd-implementation-loop`로 `IS-1709` 하나만 구현
 - Normative SPEC SHA-256:
-  `571b5cae52473b6dc5b0e8416406f881062b2a8c8729c401aaa06667efe6e383`
+  `d04abb88e86f9f6feb7c912eacbb9abba2a720ad5361cffe8836430c26afefde`
 
 ## Source
 
 - Commit:
-  `0e3dd1609406406b948a96894ed57f0d7181c76e`
+  `ee08739dc7a985933955db5e2d830b62ca4a6efb`
 - Tree:
-  `a0e533f0a2ef4136e8f913750a82723f876c9043`
+  `862780afda6f650ad27bb9f7d49c56528b8856fa`
 - Worktree state at capture: clean
 
 ## 확정
@@ -41,6 +41,9 @@
 - agentic browser는 optional unavailable/advisory 상태를 유지한다.
 - 실제 Chromium RGB8와 strict RGBA8 PNG를 원본 hash 보존 후 동일한
   RGBA 픽셀 의미로 비교한다.
+- tracked config에는 stable baseline selector만 기록하고, clean source
+  capture 뒤 exactly-one read-only manifest를 full identity로 해석한다.
+- resolved config와 snapshot은 기존 full identity 형식을 유지한다.
 
 ## 경고
 
@@ -53,6 +56,7 @@
   동일성을 자동 증명하지 않는다.
 - combined effect는 attempt당 action 1회를 보장하지만 기존 browser retry
   ceiling 때문에 실패 뒤 재시도까지 exactly-once mutation을 보장하지 않는다.
+- 제품 baseline provisioning은 여전히 별도 exact one-time 승인이 필요하다.
 
 ## 조사만 완료된 후속 후보
 
@@ -61,6 +65,22 @@
 
 두 후보는 exact-origin egress와 positive action mapping의 별도 승인 전에는
 설치하거나 실행하지 않는다.
+
+## v1.1.0 delta 근거
+
+- tracked config의 `baseline_identity.source_commit/source_tree`가 같은
+  config를 포함한 current Git identity를 요구해 자기참조 고정점이 생긴다.
+- 기존 QA smoke는 config/baseline을 Git에서 제외한 test-only fixture라
+  tracked production config 문제를 검증하지 않는다.
+- 사용자가 stable selector와 pre-snapshot exact-manifest resolver를
+  추천안대로 승인했다.
+
+## v1.1.0 delta에서 제외
+
+- baseline 생성·승인·갱신
+- product baseline bytes 작성
+- model/agentic 실행
+- Docker 또는 인프라 변경
 
 ## v1.0.3 delta 근거
 
