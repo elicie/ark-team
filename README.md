@@ -47,7 +47,8 @@ plugins/ark-team/
 
 - 스킬과 서브에이전트를 지원하는 Codex 릴리스를 사용합니다.
 - 멀티 에이전트 지원을 활성화합니다.
-- 번들로 제공되는 로컬 MCP 서버를 실행하려면 Node.js 18 이상을 사용합니다.
+- Backend-only 로컬 MCP 서버는 Node.js 18 이상에서 로드되며, UI QA
+  setup과 실행에는 Node.js 20 이상을 사용합니다.
 - 작성 팀을 격리하려면 worktree를 지원하는 Git을 설치하거나, 이에 준하는 관리형 런타임 격리 백엔드를 제공합니다.
 - 네이티브 폴백은 호스트의 동시 실행 제한을 따릅니다.
 - 네이티브 커스텀 에이전트는 PM을 Sol/xhigh, PL을 Terra/xhigh, worker를
@@ -448,8 +449,21 @@ $ark-team implement this feature
 
 ```sh
 codex plugin marketplace add elicie/ark-team --ref main
-codex plugin add ark-team@ark-team-marketplace
+codex plugin add ark-team@ark-team-marketplace --json
 ```
+
+Codex Plugin 설치는 npm lifecycle을 실행하지 않습니다. 위 JSON 출력의
+`installedPath`에 고정된 Playwright와 Chromium을 준비하고 설치본 smoke
+검증을 실행합니다.
+
+```sh
+ARK_TEAM_INSTALLED_PLUGIN_ROOT="<installedPath>" \
+  node plugins/ark-team/runtime/scripts/setup-installed-plugin.mjs
+```
+
+위 명령은 저장소 루트의 검증된 소스 스크립트로 실행합니다. 설치본이 현재
+소스와 정확히 같은지 먼저 비교한 뒤에만 의존성을 준비하고 검증 성공을
+보고합니다.
 
 전역으로 설치되고 활성화된 플러그인을 확인합니다.
 
@@ -459,10 +473,11 @@ codex plugin list --available --json
 
 업데이트를 배포한 뒤에는 마켓플레이스를 새로 고치고, 현재 CLI가
 안내하는 Codex 플러그인 명령으로 플러그인을 다시 설치하거나
-업데이트합니다. 스킬과 MCP 서버를 다시 불러올 수 있도록 새 Codex
-세션을 시작합니다. 전역 설치는 런타임과 `$ark-team`을 제공하며, 각
-대상 프로젝트는 `.codex/team-orchestrator.toml`을 통해 자체적인 안전한
-재정의를 계속 관리합니다.
+업데이트한 다음 새 `installedPath`에서 setup 검증을 다시 실행합니다.
+스킬과 MCP 서버를 다시 불러올 수 있도록 새 Codex 세션을 시작합니다.
+전역 설치는 런타임과 `$ark-team`을 제공하며, 각 대상 프로젝트는
+`.codex/team-orchestrator.toml`을 통해 자체적인 안전한 재정의를 계속
+관리합니다.
 
 ## 다른 저장소에서 참조하기
 
