@@ -3,7 +3,7 @@ import {
   spawnSync,
   type ChildProcess,
 } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { IntegrationRecord, RunRecord } from "./domain.js";
@@ -29,6 +29,13 @@ import {
   type VerificationCoordinatorRuntime,
   type VerificationServerStartRequest,
 } from "./verification-coordinator.js";
+import {
+  executeVerificationPlaywrightBrowserDriverV2,
+  probeVerificationPlaywrightRuntime,
+  VERIFICATION_PLAYWRIGHT_ADAPTER,
+  VERIFICATION_PLAYWRIGHT_BROWSER_BUILD,
+  type VerificationPlaywrightRuntimeProbe,
+} from "./verification-playwright-runtime.js";
 
 const LOOPBACK_ADDRESS = "127.0.0.1";
 const SERVER_SHUTDOWN_GRACE_MS = 2_000;
@@ -40,6 +47,7 @@ const defaultGates = new WeakMap<RunStore, VerificationPmGate>();
 export interface LocalBackendVerificationRuntimeHandle {
   readonly runtime: VerificationCoordinatorRuntime;
   readonly curl_version: string | null;
+  readonly playwright_probe: () => Promise<VerificationPlaywrightRuntimeProbe>;
   stop(): Promise<void>;
 }
 
@@ -55,7 +63,7 @@ export function createDefaultVerificationPmGate(
   coordinator.registerLocalRuntime(runtime.runtime);
   const delegate = new VerificationBootstrapPmGate(
     coordinator,
-    async () => resolveBackendBootstrapInput(),
+    (runId) => resolveProductionBootstrapInput(store, runId),
   );
 
   const gate: VerificationPmGate = {
@@ -73,6 +81,7 @@ export function createDefaultVerificationPmGate(
         context.run,
         context.integration,
         runtime.curl_version,
+        runtime.playwright_probe,
       );
       if (problem !== null) {
         await coordinator.recordSpecDelta(runId, problem);
@@ -101,9 +110,17 @@ export function createLocalBackendVerificationRuntime(
     name: "curl",
     version: curlVersion ?? "unavailable-v1",
   };
+  let playwrightProbePromise:
+    | Promise<VerificationPlaywrightRuntimeProbe>
+    | undefined;
+  const playwrightProbe = (): Promise<VerificationPlaywrightRuntimeProbe> => {
+    playwrightProbePromise ??= probeVerificationPlaywrightRuntime();
+    return playwrightProbePromise;
+  };
   let serverProcess: ChildProcess | null = null;
 
   const runtime: VerificationCoordinatorRuntime = {
+    browser_contract: "v2-combined",
     capability_adapters: {
       agentic_browser: {
         name: "unavailable-agentic-browser",
@@ -111,16 +128,14 @@ export function createLocalBackendVerificationRuntime(
       },
       api: apiAdapter,
       browser: {
-        name: "playwright-cli",
-        version: "unavailable-v1",
+        ...VERIFICATION_PLAYWRIGHT_ADAPTER,
       },
       comparison: {
         name: "ark-team-comparison",
-        version: "unavailable-v1",
+        version: "1.0.0",
       },
       screenshot: {
-        name: "playwright-cli",
-        version: "unavailable-v1",
+        ...VERIFICATION_PLAYWRIGHT_ADAPTER,
       },
       semantic_review: {
         name: "unavailable-local-image",
@@ -131,8 +146,8 @@ export function createLocalBackendVerificationRuntime(
         version: "1.0.0",
       },
     },
-    capability_probe: async (capability) =>
-      capabilityProbe(capability, curlVersion),
+    capability_probe: (capability) =>
+      capabilityProbe(capability, curlVersion, playwrightProbe),
     start_server: async (request, signal) => {
       if (serverProcess !== null && processTreeIsActive(serverProcess)) {
         throw new ArkTeamError(
@@ -154,6 +169,18 @@ export function createLocalBackendVerificationRuntime(
         "the reduced local runtime exposes only registered server and API effects",
       );
     },
+    execute_browser: async (request, signal) => {
+      if (request.schema_version !== 2) {
+        throw new ArkTeamError(
+          "CONTRACT_VERSION_MISMATCH",
+          "the production browser runtime accepts only the combined v2 contract",
+        );
+      }
+      return executeVerificationPlaywrightBrowserDriverV2(
+        request,
+        signal,
+      );
+    },
     ...(curlVersion === null
       ? {}
       : {
@@ -167,6 +194,7 @@ export function createLocalBackendVerificationRuntime(
   return {
     runtime,
     curl_version: curlVersion,
+    playwright_probe: playwrightProbe,
     async stop(): Promise<void> {
       const active = serverProcess;
       serverProcess = null;
@@ -212,6 +240,7 @@ async function localBackendPreflightProblem(
   run: RunRecord,
   integration: IntegrationRecord | null,
   curlVersion: string | null,
+  playwrightProbe: () => Promise<VerificationPlaywrightRuntimeProbe>,
 ): Promise<SpecDeltaInput | null> {
   const config = run.project_config.verification.coordinator;
   if (
@@ -226,23 +255,8 @@ async function localBackendPreflightProblem(
       "enable one approved contract-v2 coordinator configuration",
     );
   }
-  if (config.ui.enabled) {
-    return delta(
-      "environment_mismatch",
-      "the registered production runtime has no approved deterministic UI executor",
-      "UI actions, screenshots, semantic review, and comparison cannot run without inventing an adapter contract",
-      "approve and register one exact local Playwright runtime contract before enabling the UI lane",
-    );
-  }
-  if (!config.backend.enabled) {
-    return delta(
-      "contradiction",
-      "the reduced production runtime requires one enabled Backend lane",
-      "no supported QA lane can execute",
-      "enable the Backend lane or approve a deterministic UI runtime contract",
-    );
-  }
   if (
+    config.backend.enabled &&
     config.backend.api_probes.some(
       (probe) => probe.body_digest !== "none",
     )
@@ -255,8 +269,9 @@ async function localBackendPreflightProblem(
     );
   }
   if (
-    curlVersion === null ||
-    config.backend.api_adapter_version !== curlVersion
+    config.backend.enabled &&
+    (curlVersion === null ||
+      config.backend.api_adapter_version !== curlVersion)
   ) {
     return delta(
       "environment_mismatch",
@@ -265,19 +280,52 @@ async function localBackendPreflightProblem(
       "install and configure the same exact local curl version",
     );
   }
-  const framework = await inspectProjectFramework(
+  if (config.ui.enabled) {
+    if (
+      config.ui.deterministic_adapter !==
+        VERIFICATION_PLAYWRIGHT_ADAPTER.name ||
+      config.ui.deterministic_adapter_version !==
+        VERIFICATION_PLAYWRIGHT_ADAPTER.version ||
+      config.ui.browser_build !== VERIFICATION_PLAYWRIGHT_BROWSER_BUILD
+    ) {
+      return delta(
+        "environment_mismatch",
+        "configured UI adapter or browser build differs from the approved production identity",
+        "UI evidence could not claim the configured deterministic runtime",
+        "configure the exact approved Playwright adapter and bundled Chromium build",
+      );
+    }
+    const probe = await playwrightProbe();
+    if (
+      !probe.available ||
+      probe.adapter.name !== VERIFICATION_PLAYWRIGHT_ADAPTER.name ||
+      probe.adapter.version !== VERIFICATION_PLAYWRIGHT_ADAPTER.version ||
+      probe.browser_build !== VERIFICATION_PLAYWRIGHT_BROWSER_BUILD
+    ) {
+      return delta(
+        "environment_mismatch",
+        `approved Playwright runtime is unavailable: ${probe.reason ?? "identity mismatch"}`,
+        "deterministic UI actions and screenshots cannot execute",
+        "provision the exact locked Chromium revision without changing the runtime contract",
+      );
+    }
+  }
+  const serverInspection = await inspectProjectServerRegistration(
     run.project_path,
     config.server_argv,
   );
-  if (framework === "nextjs") {
+  if (
+    !serverInspection.ok &&
+    serverInspection.reason === "next_allowed_origin"
+  ) {
     return delta(
       "omission",
-      "a Next.js project needs an explicit verified allowedDevOrigins registration",
-      "the reduced runtime cannot prove that dev is accepted by the target Next.js configuration",
-      "add an approved Next.js server registration source that includes dev",
+      "a Next.js project needs one statically verified allowedDevOrigins literal",
+      "the runtime cannot prove that devbox is an accepted development origin",
+      "include devbox in one statically literal root Next.js allowedDevOrigins array",
     );
   }
-  if (framework === "unknown") {
+  if (!serverInspection.ok) {
     return delta(
       "omission",
       "the target framework cannot be proven from bounded root project metadata",
@@ -288,21 +336,65 @@ async function localBackendPreflightProblem(
   return localBackendIntegrationProblem(integration);
 }
 
-function resolveBackendBootstrapInput(): RunVerificationBootstrapInput {
+async function resolveProductionBootstrapInput(
+  store: RunStore,
+  runId: string,
+): Promise<RunVerificationBootstrapInput> {
+  const context = await store.getRunContext(runId);
+  const config = context.run.project_config.verification.coordinator;
+  if (
+    config === null ||
+    config.schema_version !== 2 ||
+    !config.enabled
+  ) {
+    throw new ArkTeamError(
+      "CONFIG_INVALID",
+      "production verification bootstrap has no enabled v2 configuration",
+    );
+  }
+  const inspection = await inspectProjectServerRegistration(
+    context.run.project_path,
+    config.server_argv,
+  );
+  if (!inspection.ok) {
+    throw new ArkTeamError(
+      "CONFIG_INVALID",
+      "production verification server registration is not statically verified",
+    );
+  }
+  const semanticChecklistByCase = config.ui.enabled
+    ? Object.fromEntries(
+        config.ui.browser_cases.map((browserCase) => [
+          browserCase.id,
+          {
+            identity: "ark-ui-semantic-checklist",
+            version: "1.0.0",
+          },
+        ]),
+      )
+    : undefined;
   return {
     package_fingerprint:
       APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
-    server: {
-      framework: "other",
-      allowed_dev_origins: [],
-    },
+    server: inspection.registration,
+    ...(config.ui.enabled
+      ? {
+          ui_evidence_source: "approved_store" as const,
+          semantic_checklist_by_case: semanticChecklistByCase!,
+        }
+      : {}),
   };
 }
 
-function capabilityProbe(
+async function capabilityProbe(
   capability: VerificationCapability,
   curlVersion: string | null,
+  playwrightProbe: () => Promise<VerificationPlaywrightRuntimeProbe>,
 ) {
+  const browserProbe =
+    capability === "browser" || capability === "screenshot"
+      ? await playwrightProbe()
+      : null;
   const adapter =
     capability === "api"
       ? {
@@ -315,14 +407,11 @@ function capabilityProbe(
             version: "1.0.0",
           }
         : capability === "browser" || capability === "screenshot"
-          ? {
-              name: "playwright-cli",
-              version: "unavailable-v1",
-            }
+          ? VERIFICATION_PLAYWRIGHT_ADAPTER
           : capability === "comparison"
             ? {
                 name: "ark-team-comparison",
-                version: "unavailable-v1",
+                version: "1.0.0",
               }
             : capability === "semantic_review"
               ? {
@@ -335,7 +424,10 @@ function capabilityProbe(
                 };
   const available =
     capability === "server" ||
-    (capability === "api" && curlVersion !== null);
+    capability === "comparison" ||
+    (capability === "api" && curlVersion !== null) ||
+    ((capability === "browser" || capability === "screenshot") &&
+      browserProbe?.available === true);
   return {
     available,
     version:
@@ -343,10 +435,17 @@ function capabilityProbe(
         ? "1.0.0"
         : capability === "api" && curlVersion !== null
           ? curlVersion
+          : capability === "comparison"
+            ? "1.0.0"
+            : (capability === "browser" ||
+                  capability === "screenshot") &&
+                browserProbe?.available
+              ? VERIFICATION_PLAYWRIGHT_ADAPTER.version
           : null,
     diagnostic: available
       ? `registered local ${capability} capability`
-      : `${capability} capability is not registered in the reduced runtime`,
+      : browserProbe?.reason ??
+        `${capability} capability is not registered in the reduced runtime`,
     adapter,
   };
 }
@@ -696,7 +795,7 @@ function commandEnvironment(
 
 function loopbackUrl(rawUrl: string): string {
   const url = new URL(rawUrl);
-  if (url.protocol !== "http:" || url.hostname !== "dev") {
+  if (url.protocol !== "http:" || url.hostname !== "devbox") {
     throw new ArkTeamError(
       "CONFIG_INVALID",
       "local verification URL is not the registered dev origin",
@@ -706,10 +805,24 @@ function loopbackUrl(rawUrl: string): string {
   return url.toString();
 }
 
-async function inspectProjectFramework(
+type ProjectServerInspection =
+  | {
+      readonly ok: true;
+      readonly registration: {
+        readonly framework: "nextjs" | "other";
+        readonly allowed_dev_origins: readonly string[];
+      };
+    }
+  | {
+      readonly ok: false;
+      readonly reason: "next_allowed_origin" | "unknown";
+    };
+
+async function inspectProjectServerRegistration(
   projectPath: string,
   serverArgv: readonly string[],
-): Promise<"nextjs" | "other" | "unknown"> {
+): Promise<ProjectServerInspection> {
+  let framework: "nextjs" | "other" | "unknown" = "unknown";
   if (
     serverArgv.some((value) =>
       ["next", "next.cmd", "next.exe"].includes(
@@ -717,45 +830,135 @@ async function inspectProjectFramework(
       ),
     )
   ) {
-    return "nextjs";
+    framework = "nextjs";
+  } else {
+    let raw: string;
+    try {
+      raw = await readFile(path.join(projectPath, "package.json"), "utf8");
+    } catch (error) {
+      framework = isNodeError(error, "ENOENT") ? "other" : "unknown";
+      raw = "";
+    }
+    if (raw !== "") {
+      try {
+        const parsed = JSON.parse(raw) as {
+          dependencies?: Record<string, unknown>;
+          devDependencies?: Record<string, unknown>;
+          workspaces?: unknown;
+        };
+        if (
+          typeof parsed !== "object" ||
+          parsed === null ||
+          Array.isArray(parsed) ||
+          (parsed.dependencies !== undefined &&
+            (typeof parsed.dependencies !== "object" ||
+              parsed.dependencies === null ||
+              Array.isArray(parsed.dependencies))) ||
+          (parsed.devDependencies !== undefined &&
+            (typeof parsed.devDependencies !== "object" ||
+              parsed.devDependencies === null ||
+              Array.isArray(parsed.devDependencies)))
+        ) {
+          framework = "unknown";
+        } else if (
+          Object.hasOwn(parsed.dependencies ?? {}, "next") ||
+          Object.hasOwn(parsed.devDependencies ?? {}, "next")
+        ) {
+          framework = "nextjs";
+        } else {
+          framework = Object.hasOwn(parsed, "workspaces")
+            ? "unknown"
+            : "other";
+        }
+      } catch {
+        framework = "unknown";
+      }
+    }
   }
-  let raw: string;
-  try {
-    raw = await readFile(path.join(projectPath, "package.json"), "utf8");
-  } catch (error) {
-    return isNodeError(error, "ENOENT") ? "other" : "unknown";
+  if (framework === "unknown") {
+    return { ok: false, reason: "unknown" };
   }
-  try {
-    const parsed = JSON.parse(raw) as {
-      dependencies?: Record<string, unknown>;
-      devDependencies?: Record<string, unknown>;
-      workspaces?: unknown;
+  if (framework === "other") {
+    return {
+      ok: true,
+      registration: {
+        framework: "other",
+        allowed_dev_origins: [],
+      },
     };
-    if (
-      typeof parsed !== "object" ||
-      parsed === null ||
-      Array.isArray(parsed) ||
-      (parsed.dependencies !== undefined &&
-        (typeof parsed.dependencies !== "object" ||
-          parsed.dependencies === null ||
-          Array.isArray(parsed.dependencies))) ||
-      (parsed.devDependencies !== undefined &&
-        (typeof parsed.devDependencies !== "object" ||
-          parsed.devDependencies === null ||
-          Array.isArray(parsed.devDependencies)))
-    ) {
-      return "unknown";
-    }
-    if (
-      Object.hasOwn(parsed.dependencies ?? {}, "next") ||
-      Object.hasOwn(parsed.devDependencies ?? {}, "next")
-    ) {
-      return "nextjs";
-    }
-    return Object.hasOwn(parsed, "workspaces") ? "unknown" : "other";
-  } catch {
-    return "unknown";
   }
+  const candidates = [
+    "next.config.js",
+    "next.config.mjs",
+    "next.config.cjs",
+    "next.config.ts",
+  ];
+  const files: string[] = [];
+  for (const candidate of candidates) {
+    const candidatePath = path.join(projectPath, candidate);
+    try {
+      const metadata = await lstat(candidatePath);
+      if (
+        metadata.isSymbolicLink() ||
+        !metadata.isFile() ||
+        metadata.size > 256 * 1_024
+      ) {
+        return { ok: false, reason: "next_allowed_origin" };
+      }
+      files.push(candidatePath);
+    } catch (error) {
+      if (!isNodeError(error, "ENOENT")) {
+        return { ok: false, reason: "next_allowed_origin" };
+      }
+    }
+  }
+  if (files.length !== 1) {
+    return { ok: false, reason: "next_allowed_origin" };
+  }
+  let configSource: string;
+  try {
+    configSource = await readFile(files[0]!, "utf8");
+  } catch {
+    return { ok: false, reason: "next_allowed_origin" };
+  }
+  const literalMatches = [
+    ...configSource.matchAll(
+      /\ballowedDevOrigins\s*:\s*\[([^\]]{0,1000})\]/g,
+    ),
+  ];
+  const allowedOrigins =
+    literalMatches.length === 1
+      ? parseStaticAllowedDevOrigins(literalMatches[0]![1]!)
+      : null;
+  if (allowedOrigins === null || !allowedOrigins.includes("devbox")) {
+    return { ok: false, reason: "next_allowed_origin" };
+  }
+  return {
+    ok: true,
+    registration: {
+      framework: "nextjs",
+      allowed_dev_origins: ["devbox"],
+    },
+  };
+}
+
+function parseStaticAllowedDevOrigins(source: string): string[] | null {
+  const parts = source.split(",").map((value) => value.trim());
+  if (parts.at(-1) === "") {
+    parts.pop();
+  }
+  if (parts.length === 0 || parts.length > 10) {
+    return null;
+  }
+  const values: string[] = [];
+  for (const part of parts) {
+    const match = /^(["'])([A-Za-z0-9.-]+)\1$/.exec(part);
+    if (match === null || values.includes(match[2]!)) {
+      return null;
+    }
+    values.push(match[2]!);
+  }
+  return values;
 }
 
 function delta(

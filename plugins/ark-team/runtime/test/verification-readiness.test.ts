@@ -266,7 +266,7 @@ test("TEST-1714 preserves required, optional, and disabled capability gates with
     };
     const readiness = await fixture.coordinator.runReadiness(fixture.run_id, {
       action_id: `readiness-${capabilityCase.unavailable}-${capabilityCase.mode}`,
-      server: { framework: "nextjs", allowed_dev_origins: ["dev"] },
+      server: { framework: "nextjs", allowed_dev_origins: ["devbox"] },
     });
     assert.equal(readiness.ok, true, capabilityCase.name);
     if (!readiness.ok) {
@@ -446,7 +446,7 @@ test("TEST-1715 selects the next free port and retries one registered Next.js se
   assert.equal(snapshotted.verification_snapshot?.server.port, 10_002);
   assert.equal(
     snapshotted.verification_snapshot?.server.api_origin,
-    "http://dev:10002",
+    "http://devbox:10002",
   );
   assert.equal(
     (await fixture.coordinator.advance(fixture.run_id, "capabilities"))
@@ -464,11 +464,11 @@ test("TEST-1715 selects the next free port and retries one registered Next.js se
     assert.deepEqual(request.argv, ["npm", "run", "dev"]);
     assert.equal(request.cwd, fixture.project_root);
     assert.equal(request.bind, "0.0.0.0");
-    assert.equal(request.host, "dev");
+    assert.equal(request.host, "devbox");
     assert.equal(request.port, 10_002);
-    assert.equal(request.origin, "http://dev:10002");
+    assert.equal(request.origin, "http://devbox:10002");
     assert.deepEqual(request.readiness, {
-      url: "http://dev:10002/",
+      url: "http://devbox:10002/",
       expected_status: 200,
       timeout_ms: 30_000,
       redirect: "manual",
@@ -484,7 +484,7 @@ test("TEST-1715 selects the next free port and retries one registered Next.js se
   };
   const readiness = await fixture.coordinator.runReadiness(fixture.run_id, {
     action_id: "registered-next-readiness",
-    server: { framework: "nextjs", allowed_dev_origins: ["dev"] },
+    server: { framework: "nextjs", allowed_dev_origins: ["devbox"] },
   });
   assert.equal(readiness.ok, true);
   if (!readiness.ok) {
@@ -624,7 +624,7 @@ test("TEST-1715 rejects unregistered and misconfigured Next.js children before H
       },
     },
     {
-      name: "Next.js without dev allowedDevOrigins",
+      name: "Next.js without devbox allowedDevOrigins",
       server: {
         framework: "nextjs",
         allowed_dev_origins: ["localhost"],
@@ -678,7 +678,7 @@ test("TEST-1716 stops every dangerous local request before effect and persists o
     },
     {
       kind: "network" as const,
-      url: "http://dev:10001/health",
+      url: "http://devbox:10001/health",
     },
   ]) {
     const allowed = await allowedFixture.coordinator.runGuardedLocalEffect(
@@ -701,7 +701,7 @@ test("TEST-1716 stops every dangerous local request before effect and persists o
       kind: "agentic_session",
       task_id: "home-agentic",
       profile: "fresh_ephemeral",
-      origin_allowlist: ["http://dev:10001"],
+      origin_allowlist: ["http://devbox:10001"],
       allowed_actions: [
         "navigate",
         "snapshot",
@@ -800,7 +800,7 @@ test("TEST-1716 stops every dangerous local request before effect and persists o
       name: "network unknown headers and proxy",
       request: () => ({
         kind: "network",
-        url: "http://dev:10001/",
+        url: "http://devbox:10001/",
         headers: { authorization: "Bearer hidden" },
         proxy: "https://example.invalid/",
       }),
@@ -938,7 +938,7 @@ test("TEST-1716 stops every dangerous local request before effect and persists o
           fixture.run_id,
           {
             kind: "network",
-            url: "http://dev:10001/",
+            url: "http://devbox:10001/",
           },
         ),
       isArkError("INVALID_TRANSITION"),

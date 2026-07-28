@@ -2,15 +2,15 @@
 
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
 - Delta status: `SPEC_DELTA_APPLIED`
-- Identity: `ark-team-verification-ui-runtime-v1.0.1`
-- Supersedes: `ark-team-verification-ui-runtime-v1.0.0`
+- Identity: `ark-team-verification-ui-runtime-v1.0.2`
+- Supersedes: `ark-team-verification-ui-runtime-v1.0.1`
 - Authority date: 2026-07-28 UTC
 - Package root: `docs/specs/verification-ui-runtime`
 - Parent contract: `verification-spec-v4`
 - Approved implementation slice: `IS-1708`
 - Exact next action: `sdd-implementation-loop`로 `IS-1708` 하나만 구현
 - Normative SPEC SHA-256:
-  `2194c4be9360843a319e1532776004380e8678862c329b6243360ddf6a808a4e`
+  `29f69eda06ba8bf47d32e0e3914686f147ef0e5e7c01d3d18f4cd3b4549f4047`
 
 ## Source
 
@@ -27,6 +27,10 @@
   `playwright-cli / ark-ui-1.0.0-pw-1.62.0`
 - exact browser:
   `chromium-headless-shell-151.0.7922.34-r1234`
+- exact local hostname/origin:
+  `devbox / http://devbox:<recorded-port>`
+- initial navigation 전 exact Chromium target의 request-stage guard가
+  redirect를 포함한 HTTP(S) effect를 차단한다.
 - runtime capability는 위 승인 `SPEC.md` SHA-256도 검증한다.
 - 기존 Backend runtime, contract-v2/schema-2, package-v4를 유지한다.
 - default gate는 combined UI-case effect 한 번으로 browser와 screenshot

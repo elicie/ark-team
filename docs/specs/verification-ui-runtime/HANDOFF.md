@@ -1,16 +1,16 @@
 # Implementation Handoff — SLICE-017 UI Runtime
 
-- Package: `ark-team-verification-ui-runtime-v1.0.1`
+- Package: `ark-team-verification-ui-runtime-v1.0.2`
 - Status: `SPEC_APPROVED_WITH_WARNINGS`
 - Delta status: `SPEC_DELTA_APPLIED`
-- Supersedes: `ark-team-verification-ui-runtime-v1.0.0`
+- Supersedes: `ark-team-verification-ui-runtime-v1.0.1`
 - Parent: `verification-spec-v4`
 - Exact next slice: `IS-1708`
 - Normative contract: [SPEC.md](./SPEC.md)
 - Normative SPEC SHA-256:
-  `2194c4be9360843a319e1532776004380e8678862c329b6243360ddf6a808a4e`
+  `29f69eda06ba8bf47d32e0e3914686f147ef0e5e7c01d3d18f4cd3b4549f4047`
 - Source baseline:
-  `fcebe022dd00add51ece1e98e40be81f78f8a28b`
+  `8dcea3d5a117f1197b8fee3d33808bfa9406372d`
 
 ## 구현 결과
 
@@ -57,7 +57,7 @@ browser_build   = chromium-headless-shell-151.0.7922.34-r1234
 - Codex Playwright wrapper
 - MCP
 - `npx --package`
-- system Chrome 또는 CDP attach
+- system Chrome 또는 외부/persistent CDP attach
 
 ## 구현 순서
 
@@ -79,9 +79,10 @@ provision할 수 있다. QA runtime 자체는 install을 호출하지 않으며
 - `headless: true`
 - custom executable/channel/persistent profile 없음
 - 유일한 launch arg:
-  `--host-resolver-rules=MAP dev 127.0.0.1`
+  `--host-resolver-rules=MAP devbox 127.0.0.1`
 - `serviceWorkers: "block"`
 - HTTP(S)/WebSocket exact-origin firewall
+- initial navigation 전 exact Chromium target의 request-stage HTTP(S) guard
 - proxy/credential environment 제거
 - credential/storage-state/upload/download/permission 없음
 - literal local server argv와 기존 port `10001+` 규칙 유지
@@ -120,7 +121,7 @@ npm test
 ```
 
 추가 real-browser fixture는 port `10001` 이상, bind `0.0.0.0`, URL
-`http://dev:<port>`를 사용한다. Docker를 사용하지 않는다.
+`http://devbox:<port>`를 사용한다. Docker를 사용하지 않는다.
 
 다음 positive/negative evidence가 모두 있어야 한다.
 
@@ -158,4 +159,4 @@ npm test
   일치할 수 없음
 - production baseline bytes를 strict verifier 경계 안에서 읽을 수 없음
 - trace 또는 process cleanup이 기존 artifact/lifecycle 계약과 충돌함
-- Next.js `allowedDevOrigins`를 source에서 증명할 수 없음
+- Next.js `allowedDevOrigins`의 `devbox`를 source에서 증명할 수 없음

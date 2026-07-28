@@ -968,7 +968,7 @@ export const verificationCoordinatorConfigV2Schema = z
     enabled: z.literal(true),
     server_argv: z.array(boundedStringSchema).min(1).max(32),
     server_bind: z.literal("0.0.0.0"),
-    server_host: z.literal("dev"),
+    server_host: z.literal("devbox"),
     server_port_floor: z.literal(10_001),
     server_readiness_path: z
       .string()
@@ -2687,6 +2687,24 @@ export const APPROVED_VERIFICATION_PACKAGE = Object.freeze({
 
 const verificationServerSnapshotSchema = z
   .object({
+    host: z.literal("devbox"),
+    bind: z.literal("0.0.0.0"),
+    port: z.number().int().min(10_001).max(65_535),
+    api_origin: z.string().url(),
+  })
+  .strict()
+  .superRefine((server, context) => {
+    if (server.api_origin !== `http://devbox:${server.port}`) {
+      context.addIssue({
+        code: "custom",
+        path: ["api_origin"],
+        message: "api_origin does not match the recorded local port",
+      });
+    }
+  });
+
+const legacyVerificationServerSnapshotSchema = z
+  .object({
     host: z.literal("dev"),
     bind: z.literal("0.0.0.0"),
     port: z.number().int().min(10_001).max(65_535),
@@ -2698,7 +2716,7 @@ const verificationServerSnapshotSchema = z
       context.addIssue({
         code: "custom",
         path: ["api_origin"],
-        message: "api_origin does not match the recorded local port",
+        message: "legacy api_origin does not match the recorded local port",
       });
     }
   });
@@ -2720,7 +2738,7 @@ const legacyVerificationRunSnapshotSchema = z
     artifact_references: z.array(boundedStringSchema).max(500),
     baseline_root: z.string().min(1).refine(path.isAbsolute, "baseline_root must be absolute"),
     baseline_identity: verificationBaselineIdentitySchema,
-    server: verificationServerSnapshotSchema,
+    server: legacyVerificationServerSnapshotSchema,
     browser_environment: browserEnvironmentSchema,
     required_capabilities: legacyRequiredCapabilitiesSchema,
     api_contract: z
@@ -3310,7 +3328,7 @@ export function buildVerificationRunSnapshot(
       host: config.server_host,
       bind: config.server_bind,
       port: input.server_port,
-      api_origin: `http://dev:${input.server_port}`,
+      api_origin: `http://devbox:${input.server_port}`,
     },
     browser_environment: config.ui.enabled
       ? config.ui.baseline_identity.environment

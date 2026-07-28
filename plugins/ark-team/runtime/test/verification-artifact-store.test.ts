@@ -398,6 +398,89 @@ test("TEST-1706 stores supported evidence as linked, hashed, opaque bytes", asyn
   assert.equal(await pathExists(traceEscape), false);
 });
 
+test("UIR-TEST-004 strict-reads only one exact registered artifact", async () => {
+  const { store, run } = await createSnapshottedRun();
+  const snapshot = requireV2Snapshot(run);
+  const png = pngWithIhdr(375, 812);
+  const written = await store.writeVerificationArtifact(run.run_id, {
+    artifact_id: "combined-home-375",
+    relative_path: "screenshots/home-browser/375x812.combined.png",
+    media_type: "image/png",
+    bytes: png,
+    sha256: sha256Bytes(png),
+    lane: "ui",
+  });
+  const reference = written.record.artifact_references[0]!;
+  const input = {
+    reference,
+    media_type: "image/png" as const,
+    byte_length: png.byteLength,
+  };
+
+  const read = await store.readVerificationArtifact(run.run_id, input);
+  assert.deepEqual(read.reference, reference);
+  assert.equal(read.media_type, "image/png");
+  assert.equal(read.byte_length, png.byteLength);
+  assert.deepEqual(Buffer.from(read.bytes), png);
+  assert.equal(Object.isFrozen(read), true);
+  assert.equal(Object.isFrozen(read.reference), true);
+
+  read.bytes[0] = 0;
+  const reopened = await store.readVerificationArtifact(run.run_id, input);
+  assert.deepEqual(Buffer.from(reopened.bytes), png);
+  assert.notStrictEqual(reopened.bytes, read.bytes);
+
+  const invalidInputs: Parameters<RunStore["readVerificationArtifact"]>[1][] = [
+    {
+      ...input,
+      reference: { ...reference, artifact_id: "other-artifact" },
+    },
+    {
+      ...input,
+      reference: { ...reference, relative_path: "../combined.png" },
+    },
+    {
+      ...input,
+      reference: {
+        ...reference,
+        sha256: "0".repeat(64),
+      },
+    },
+    { ...input, media_type: "application/json" },
+    { ...input, byte_length: png.byteLength + 1 },
+  ];
+  for (const invalidInput of invalidInputs) {
+    await assert.rejects(
+      () => store.readVerificationArtifact(run.run_id, invalidInput),
+      isArkError("INVALID_RECORD"),
+    );
+  }
+
+  const target = path.join(snapshot.artifact_root, reference.relative_path);
+  const backup = path.join(testRoot, "combined-home-375.backup.png");
+  await rename(target, backup);
+  await assert.rejects(
+    () => store.readVerificationArtifact(run.run_id, input),
+    isArkError("ARTIFACT_ROOT_INVALID"),
+  );
+  await rename(backup, target);
+
+  await rename(target, backup);
+  await symlink(backup, target);
+  await assert.rejects(
+    () => store.readVerificationArtifact(run.run_id, input),
+    isArkError("ARTIFACT_ROOT_INVALID"),
+  );
+  await rm(target);
+  await rename(backup, target);
+
+  await writeFile(target, pngWithIhdr(376, 812));
+  await assert.rejects(
+    () => store.readVerificationArtifact(run.run_id, input),
+    isArkError("INVALID_RECORD"),
+  );
+});
+
 test("TEST-1706 verifies but never mutates an approved baseline set", async () => {
   const baseline = await provisionBaseline();
   const { store, run } = await createSnapshottedRun({
@@ -409,6 +492,53 @@ test("TEST-1706 verifies but never mutates an approved baseline set", async () =
   assert.equal(
     verified.manifest_sha256,
     sha256Bytes(Buffer.from(canonicalJson(baseline.manifest), "utf8")),
+  );
+  const expectedCaseIds = baseline.config.ui.enabled
+    ? baseline.config.ui.browser_cases
+        .map((browserCase) => browserCase.id)
+        .sort()
+    : [];
+  assert.deepEqual(
+    Object.keys(verified.png_bytes_by_case),
+    expectedCaseIds,
+  );
+  assert.equal(Object.isFrozen(verified.png_bytes_by_case), true);
+  for (const caseId of expectedCaseIds) {
+    const byViewport = verified.png_bytes_by_case[caseId]!;
+    assert.equal(Object.isFrozen(byViewport), true);
+    assert.deepEqual(Object.keys(byViewport), [
+      "375x812",
+      "768x1024",
+      "1440x900",
+    ]);
+    for (const viewport of [
+      "375x812",
+      "768x1024",
+      "1440x900",
+    ] as const) {
+      const entry = baseline.manifest.entries.find(
+        (candidate) =>
+          candidate.case_id === caseId &&
+          candidate.viewport === viewport,
+      )!;
+      const expectedBytes = baseline.objectBytes.get(entry.path)!;
+      assert.deepEqual(Buffer.from(byViewport[viewport]), expectedBytes);
+      assert.notStrictEqual(byViewport[viewport], expectedBytes);
+    }
+  }
+
+  const returnedBytes =
+    verified.png_bytes_by_case[expectedCaseIds[0]!]!["375x812"];
+  const originalFirstByte = returnedBytes[0]!;
+  returnedBytes[0] = originalFirstByte ^ 0xff;
+  const reopened = await store.verifyApprovedBaseline(run.run_id);
+  assert.equal(
+    reopened.png_bytes_by_case[expectedCaseIds[0]!]!["375x812"][0],
+    originalFirstByte,
+  );
+  assert.notStrictEqual(
+    reopened.png_bytes_by_case[expectedCaseIds[0]!]!["375x812"],
+    returnedBytes,
   );
 
   const firstEntry = baseline.manifest.entries[0]!;

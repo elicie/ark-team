@@ -6,6 +6,14 @@ import {
   sha256CanonicalJson,
   verificationRunSnapshotV2Schema,
 } from "./verification-contract.js";
+import {
+  createVerificationScreenshotRuntimeV2Expectation,
+  createVerificationScreenshotRuntimeV2Plan,
+  normalizeVerificationScreenshotRuntimeV2Result,
+  type NormalizedVerificationScreenshotResult,
+  type VerificationScreenshotRuntimeV2Plan,
+  type VerificationScreenshotRuntimeV2Result,
+} from "./verification-visual-adapter.js";
 
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -131,6 +139,34 @@ export interface VerificationBrowserDriverResult {
   readonly message: string;
 }
 
+export interface VerificationBrowserDriverV2Request
+  extends Omit<
+    VerificationBrowserDriverRequest,
+    "schema_version" | "contract_id" | "policy"
+  > {
+  readonly schema_version: 2;
+  readonly contract_id: "verification_browser_driver_v2";
+  readonly package_fingerprint: string;
+  readonly source_fingerprint: string;
+  readonly screenshot: VerificationScreenshotRuntimeV2Plan;
+  readonly policy: Omit<
+    VerificationBrowserDriverRequest["policy"],
+    "screenshots"
+  > & {
+    readonly screenshots: "required";
+  };
+}
+
+export interface VerificationBrowserDriverV2Result
+  extends Omit<
+    VerificationBrowserDriverResult,
+    "schema_version" | "contract_id"
+  > {
+  readonly schema_version: 2;
+  readonly contract_id: "verification_browser_driver_result_v2";
+  readonly screenshot: VerificationScreenshotRuntimeV2Result;
+}
+
 export interface VerificationBrowserStepEvidence {
   readonly sequence: number;
   readonly input_sha256: string;
@@ -176,6 +212,13 @@ export interface VerificationBrowserEvidence
 export interface NormalizedVerificationBrowserDriverResult {
   readonly evidence: VerificationBrowserEvidence;
   readonly trace_bytes: Uint8Array;
+  readonly passed: boolean;
+  readonly message: string;
+}
+
+export interface NormalizedVerificationBrowserDriverV2Result {
+  readonly browser: NormalizedVerificationBrowserDriverResult;
+  readonly screenshot: NormalizedVerificationScreenshotResult;
   readonly passed: boolean;
   readonly message: string;
 }
@@ -293,6 +336,88 @@ export function createVerificationBrowserDriverRequest(input: {
       baseline_update: "disabled",
       undeclared_actions: "disabled",
     },
+  });
+}
+
+export function createVerificationBrowserDriverV2Request(input: {
+  readonly snapshot: unknown;
+  readonly case_id: string;
+  readonly attempt_id: string;
+}): VerificationBrowserDriverV2Request {
+  const browser = createVerificationBrowserDriverRequest(input);
+  let screenshot: VerificationScreenshotRuntimeV2Plan;
+  try {
+    screenshot = createVerificationScreenshotRuntimeV2Plan(input);
+  } catch (error) {
+    throw contractError("combined screenshot request is invalid", error);
+  }
+  assertCombinedRequestIdentity(browser, screenshot);
+
+  return deepFreeze({
+    ...browser,
+    schema_version: 2,
+    contract_id: "verification_browser_driver_v2",
+    package_fingerprint: screenshot.package_fingerprint,
+    source_fingerprint: screenshot.source_fingerprint,
+    screenshot,
+    policy: {
+      ...browser.policy,
+      screenshots: "required",
+    },
+  });
+}
+
+export function normalizeVerificationBrowserDriverV2Result(
+  request: VerificationBrowserDriverV2Request,
+  rawResult: unknown,
+): NormalizedVerificationBrowserDriverV2Result {
+  const envelope = z
+    .object({
+      schema_version: z.literal(2),
+      contract_id: z.literal("verification_browser_driver_result_v2"),
+      screenshot: z.unknown(),
+    })
+    .passthrough()
+    .safeParse(rawResult);
+  if (!envelope.success) {
+    throw contractError("combined browser driver result is invalid", envelope.error);
+  }
+
+  const { screenshot: rawScreenshot, ...rawBrowserV2 } = envelope.data;
+  const rawBrowserV1 = {
+    ...rawBrowserV2,
+    schema_version: 1,
+    contract_id: "verification_browser_driver_result_v1",
+  };
+  const browser = normalizeVerificationBrowserDriverResult(
+    toV1BrowserRequest(request),
+    rawBrowserV1,
+  );
+
+  // The v1 normalizer above is the authority that validates same-origin before
+  // the raw final URL becomes the exact screenshot expectation.
+  const finalUrl = (
+    rawBrowserV1 as unknown as VerificationBrowserDriverResult
+  ).final_url;
+  let screenshot;
+  try {
+    const expectation = createVerificationScreenshotRuntimeV2Expectation({
+      plan: request.screenshot,
+      final_url: finalUrl,
+    });
+    screenshot = normalizeVerificationScreenshotRuntimeV2Result(
+      expectation,
+      rawScreenshot,
+    );
+  } catch (error) {
+    throw contractError("combined screenshot result is invalid", error);
+  }
+
+  return Object.freeze({
+    browser,
+    screenshot,
+    passed: browser.passed,
+    message: browser.message,
   });
 }
 
@@ -536,6 +661,73 @@ function assertResultIdentity(
   }
 }
 
+function assertCombinedRequestIdentity(
+  browser: VerificationBrowserDriverRequest,
+  screenshot: VerificationScreenshotRuntimeV2Plan,
+): void {
+  if (
+    screenshot.run_id !== browser.run_id ||
+    screenshot.snapshot_id !== browser.snapshot_id ||
+    screenshot.case_id !== browser.case_id ||
+    screenshot.attempt_id !== browser.attempt_id ||
+    screenshot.case_sha256 !== browser.case_sha256 ||
+    screenshot.adapter.name !== browser.adapter.name ||
+    screenshot.adapter.version !== browser.adapter.version ||
+    screenshot.browser_build !== browser.browser_build ||
+    screenshot.engine !== browser.engine ||
+    screenshot.execution.cwd !== browser.execution.cwd ||
+    screenshot.execution.shell !== browser.execution.shell ||
+    screenshot.origin !== browser.origin ||
+    screenshot.initial_url !== browser.url ||
+    screenshot.network.allowed_origin !== browser.network.allowed_origin ||
+    screenshot.readiness.selector !== browser.readiness.selector ||
+    screenshot.readiness.timeout_ms !== browser.readiness.timeout_ms
+  ) {
+    throw contractError(
+      "combined screenshot contract identity differs from the browser request",
+    );
+  }
+}
+
+function toV1BrowserRequest(
+  request: VerificationBrowserDriverV2Request,
+): VerificationBrowserDriverRequest {
+  return {
+    schema_version: 1,
+    contract_id: "verification_browser_driver_v1",
+    run_id: request.run_id,
+    snapshot_id: request.snapshot_id,
+    case_id: request.case_id,
+    attempt_id: request.attempt_id,
+    case_sha256: request.case_sha256,
+    adapter: { ...request.adapter },
+    browser_build: request.browser_build,
+    engine: request.engine,
+    execution: { ...request.execution },
+    origin: request.origin,
+    url: request.url,
+    context: {
+      ...request.context,
+      viewports: request.context.viewports.map((viewport) => ({ ...viewport })),
+    },
+    network: { ...request.network },
+    readiness: { ...request.readiness },
+    actions: request.actions.map((action) => structuredClone(action)),
+    assertions: request.assertions.map((assertion) => structuredClone(assertion)),
+    auto_wait_timeout_ms: request.auto_wait_timeout_ms,
+    case_timeout_ms: request.case_timeout_ms,
+    trace: { ...request.trace },
+    policy: {
+      llm_verdict: request.policy.llm_verdict,
+      visual_assertions: request.policy.visual_assertions,
+      screenshots: "disabled",
+      self_heal: request.policy.self_heal,
+      baseline_update: request.policy.baseline_update,
+      undeclared_actions: request.policy.undeclared_actions,
+    },
+  };
+}
+
 function assertExactContext(
   expected: VerificationBrowserDriverRequest["context"],
   actual: VerificationBrowserDriverResult["context"],
@@ -600,7 +792,7 @@ function assertRecordedOrigin(origin: string): void {
   const parsed = new URL(origin);
   if (
     parsed.protocol !== "http:" ||
-    parsed.hostname !== "dev" ||
+    parsed.hostname !== "devbox" ||
     parsed.username !== "" ||
     parsed.password !== "" ||
     parsed.pathname !== "/" ||
