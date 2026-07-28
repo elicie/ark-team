@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmod,
@@ -15,19 +16,27 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
+import { promisify } from "node:util";
 import { deflateSync } from "node:zlib";
+
+import { stringify } from "smol-toml";
 
 import type { RunRecord } from "../src/domain.js";
 import { ArkTeamError } from "../src/errors.js";
 import { DEFAULT_PROJECT_CONFIG } from "../src/project-config.js";
 import { RunStore } from "../src/state-store.js";
-import { VerificationArtifactStore } from "../src/verification-artifact-store.js";
+import {
+  resolveApprovedBaselineSelector,
+  VerificationArtifactStore,
+} from "../src/verification-artifact-store.js";
 import {
   APPROVED_VERIFICATION_PACKAGE,
   canonicalJson,
+  captureVerificationSource,
   sha256CanonicalJson,
   type VerificationApprovedBaselineManifest,
   type VerificationLinkedRecord,
+  type VerificationSourceIdentity,
   verificationApprovedBaselineManifestSchema,
   verificationBaselineSetSha256,
 } from "../src/verification-contract.js";
@@ -39,6 +48,7 @@ import {
 const TERMINAL_REPORT_AT = Date.parse("2026-07-27T18:00:00.000Z");
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const MAX_FILE_BYTES = 50 * 1_024 * 1_024;
+const execFileAsync = promisify(execFile);
 
 let testRoot: string;
 let stateRoot: string;
@@ -617,6 +627,146 @@ test("TEST-1706 verifies but never mutates an approved baseline set", async () =
   assert.equal((await stat(firstObjectPath)).mode & 0o222, 0);
 });
 
+test("UIR-TEST-008 resolves one ignored selector before snapshot persistence", async () => {
+  await initializeIgnoredBaselineRepository();
+  const inputCoordinator = validVerificationCoordinatorConfig();
+  assert.equal(inputCoordinator.ui.enabled, true);
+  if (!inputCoordinator.ui.enabled) {
+    assert.fail("fixture UI lane must be enabled");
+  }
+  const {
+    baseline_identity: selectorIdentity,
+    ...selectorUi
+  } = inputCoordinator.ui;
+  const ui = {
+    ...selectorUi,
+    baseline_selector: {
+      id: selectorIdentity.id,
+      environment: selectorIdentity.environment,
+    },
+  };
+  const projectConfig = structuredClone(DEFAULT_PROJECT_CONFIG);
+  projectConfig.verification.coordinator = {
+    ...inputCoordinator,
+    ui,
+  };
+  const configDirectory = path.join(projectRoot, ".codex");
+  await mkdir(configDirectory);
+  await writeFile(
+    path.join(configDirectory, "team-orchestrator.toml"),
+    stringify(projectConfig),
+    "utf8",
+  );
+  await execFileAsync(
+    "git",
+    ["add", ".codex/team-orchestrator.toml"],
+    { cwd: projectRoot },
+  );
+  await execFileAsync(
+    "git",
+    ["commit", "-m", "track stable QA selector"],
+    { cwd: projectRoot },
+  );
+  const source = await captureVerificationSource(projectRoot);
+  const baseline = await provisionBaseline(source);
+  assert.equal(baseline.config.ui.enabled, true);
+  if (!baseline.config.ui.enabled) {
+    assert.fail("fixture UI lane must be enabled");
+  }
+  const expectedIdentity = baseline.config.ui.baseline_identity;
+  const resolvedIdentity = await resolveApprovedBaselineSelector({
+    project_root: projectRoot,
+    baseline_root: ui.baseline_root,
+    selector: ui.baseline_selector,
+    source,
+    ui,
+  });
+  assert.deepEqual(resolvedIdentity, expectedIdentity);
+
+  const store = new RunStore({
+    root_path: stateRoot,
+    now: () => new Date(TERMINAL_REPORT_AT),
+    suffix: () => `${runSequence++}`.padStart(6, "0"),
+    verification_source_loader: captureVerificationSource,
+    verification_package_loader: loadApprovedVerificationPackage,
+  });
+  const created = await store.createRun({
+    objective: "Resolve a tracked baseline selector",
+    project_path: projectRoot,
+    project_config: projectConfig,
+  });
+  assert.equal(
+    (await store.advanceVerificationState(created.run_id, "configured"))
+      .accepted,
+    true,
+  );
+  const recorded = await store.recordVerificationSnapshot(created.run_id, {
+    package_fingerprint:
+      APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+    server_port: 10_001,
+  });
+  const snapshot = requireV2Snapshot(recorded);
+  assert.deepEqual(snapshot.baseline_identity, expectedIdentity);
+  assert.equal(snapshot.ui_contract.enabled, true);
+  if (!snapshot.ui_contract.enabled) {
+    assert.fail("resolved snapshot UI lane must be enabled");
+  }
+  assert.deepEqual(
+    snapshot.ui_contract.baseline_identity,
+    expectedIdentity,
+  );
+  assert.equal(
+    "baseline_selector" in snapshot.ui_contract,
+    false,
+  );
+  const verified = await store.verifyApprovedBaseline(recorded.run_id);
+  assert.deepEqual(verified.manifest, baseline.manifest);
+  assert.equal(
+    verified.baseline_set_sha256,
+    baseline.baselineSetSha256,
+  );
+  assert.deepEqual(await store.getRun(created.run_id), recorded);
+
+  const missingConfig = structuredClone(projectConfig);
+  const missingCoordinator =
+    missingConfig.verification.coordinator;
+  if (
+    missingCoordinator === null ||
+    missingCoordinator.schema_version !== 2 ||
+    !missingCoordinator.enabled ||
+    !missingCoordinator.ui.enabled ||
+    !("baseline_selector" in missingCoordinator.ui)
+  ) {
+    assert.fail("selector project fixture is invalid");
+  }
+  missingCoordinator.ui.baseline_selector.id = "missing-baseline";
+  const missing = await store.createRun({
+    objective: "Reject a missing baseline selector",
+    project_path: projectRoot,
+    project_config: missingConfig,
+  });
+  assert.equal(
+    (await store.advanceVerificationState(missing.run_id, "configured"))
+      .accepted,
+    true,
+  );
+  await assert.rejects(
+    () =>
+      store.recordVerificationSnapshot(missing.run_id, {
+        package_fingerprint:
+          APPROVED_VERIFICATION_PACKAGE.package_fingerprint,
+        server_port: 10_001,
+      }),
+    isArkError("BASELINE_NOT_APPROVED"),
+  );
+  assert.equal(
+    await pathExists(
+      path.join(stateRoot, missing.run_id, "verification"),
+    ),
+    false,
+  );
+});
+
 test("TEST-1706 retains before the boundary and cleans only the registered root", async () => {
   const baseline = await provisionBaseline();
   const success = await createCleanupRun(baseline.config, "success");
@@ -865,12 +1015,19 @@ function requireV2Snapshot(run: RunRecord) {
   return snapshot;
 }
 
-async function provisionBaseline(): Promise<BaselineFixture> {
+async function provisionBaseline(
+  source: VerificationSourceIdentity =
+    validVerificationSourceIdentity(projectRoot),
+): Promise<BaselineFixture> {
   const config = validVerificationCoordinatorConfig();
   assert.equal(config.ui.enabled, true);
   if (!config.ui.enabled) {
     assert.fail("fixture UI lane must be enabled");
   }
+  config.ui.baseline_identity.source_commit =
+    source.source_commit;
+  config.ui.baseline_identity.source_tree =
+    source.source_tree;
   const objectBytes = new Map<string, Buffer>();
   const entries = config.ui.viewports.map((viewport) => {
     const [width, height] = viewport.split("x").map(Number) as [
@@ -932,6 +1089,38 @@ async function provisionBaseline(): Promise<BaselineFixture> {
     objectBytes,
     baselineSetSha256,
   };
+}
+
+async function initializeIgnoredBaselineRepository(): Promise<void> {
+  await execFileAsync("git", ["init", "-b", "main"], {
+    cwd: projectRoot,
+  });
+  await execFileAsync(
+    "git",
+    ["config", "user.name", "Ark Team Test"],
+    { cwd: projectRoot },
+  );
+  await execFileAsync(
+    "git",
+    ["config", "user.email", "ark-team@example.invalid"],
+    { cwd: projectRoot },
+  );
+  await writeFile(
+    path.join(projectRoot, ".gitignore"),
+    "/.ark-team/\n",
+    "utf8",
+  );
+  await writeFile(
+    path.join(projectRoot, "tracked.txt"),
+    "tracked\n",
+    "utf8",
+  );
+  await execFileAsync("git", ["add", ".gitignore", "tracked.txt"], {
+    cwd: projectRoot,
+  });
+  await execFileAsync("git", ["commit", "-m", "test fixture"], {
+    cwd: projectRoot,
+  });
 }
 
 async function createCleanupRun(

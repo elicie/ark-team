@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
@@ -12,7 +13,7 @@ import {
   rmdir,
 } from "node:fs/promises";
 import path from "node:path";
-import { TextDecoder } from "node:util";
+import { promisify, TextDecoder } from "node:util";
 
 import { ArkTeamError } from "./errors.js";
 import {
@@ -20,8 +21,12 @@ import {
   verificationApprovedBaselineManifestSchema,
   verificationBaselineSetSha256,
   type VerificationApprovedBaselineManifest,
+  type VerificationBaselineIdentity,
+  type VerificationBaselineSelector,
+  type VerificationEnabledUiSelectorLane,
   type VerificationLinkedRecord,
   type VerificationRunSnapshot,
+  type VerificationSourceIdentity,
 } from "./verification-contract.js";
 
 export type VerificationArtifactPayload = Extract<
@@ -50,6 +55,14 @@ export interface VerificationApprovedBaselineResult {
   png_bytes_by_case: VerificationApprovedBaselinePngBytesByCase;
 }
 
+export interface ResolveApprovedBaselineSelectorInput {
+  project_root: string;
+  baseline_root: string;
+  selector: VerificationBaselineSelector;
+  source: VerificationSourceIdentity;
+  ui: VerificationEnabledUiSelectorLane;
+}
+
 export type VerificationApprovedBaselineViewport =
   | "375x812"
   | "768x1024"
@@ -74,6 +87,7 @@ const PNG_SIGNATURE = Buffer.from([
 ]);
 const CRC32_TABLE = buildCrc32Table();
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const execFileAsync = promisify(execFile);
 
 export class VerificationArtifactStore {
   readonly state_root: string;
@@ -392,120 +406,11 @@ export class VerificationArtifactStore {
       const root = this.snapshot.baseline_root;
       assertCanonicalAbsolutePath(root, "baseline root");
       await assertExactDirectory(root, "baseline root");
-      const identity = this.snapshot.baseline_identity;
-      const manifestRelativePath =
-        `manifests/${identity.id}/${identity.sha256}.json`;
-      const manifestFile = await readSafeRegularFile(
+      return await verifyApprovedBaselineIdentity(
         root,
-        manifestRelativePath,
-        true,
-        MAX_METADATA_BYTES,
+        this.snapshot.baseline_identity,
+        this.snapshot.ui_contract,
       );
-      let decoded: string;
-      let parsedJson: unknown;
-      try {
-        decoded = UTF8_DECODER.decode(manifestFile.bytes);
-        parsedJson = JSON.parse(decoded) as unknown;
-      } catch (error) {
-        throw baselineError("approved baseline manifest is not valid UTF-8 JSON", error);
-      }
-      const parsed =
-        verificationApprovedBaselineManifestSchema.safeParse(parsedJson);
-      if (!parsed.success) {
-        throw baselineError(
-          "approved baseline manifest does not match strict schema v1",
-          parsed.error,
-        );
-      }
-      const manifest = parsed.data;
-      if (decoded !== canonicalJson(manifest)) {
-        throw baselineError("approved baseline manifest is not canonical JSON");
-      }
-      const ui = this.snapshot.ui_contract;
-      if (
-        manifest.baseline_id !== identity.id ||
-        manifest.source_commit !== identity.source_commit ||
-        manifest.source_tree !== identity.source_tree ||
-        canonicalJson(manifest.environment) !==
-          canonicalJson(identity.environment) ||
-        manifest.adapter.name !== ui.deterministic_adapter ||
-        manifest.adapter.version !== ui.deterministic_adapter_version ||
-        manifest.browser_build !== ui.browser_build
-      ) {
-        throw baselineError(
-          "approved baseline manifest does not match the snapshot",
-        );
-      }
-      const expectedEntryKeys = [...ui.browser_cases]
-        .sort((left, right) => compareUtf8(left.id, right.id))
-        .flatMap((browserCase) =>
-          ui.viewports.map(
-            (viewport) => `${browserCase.id}\0${viewport}`,
-          ),
-        );
-      const actualEntryKeys = manifest.entries.map(
-        (entry) => `${entry.case_id}\0${entry.viewport}`,
-      );
-      if (actualEntryKeys.join("\0") !== expectedEntryKeys.join("\0")) {
-        throw baselineError(
-          "approved baseline manifest does not cover the exact case and viewport matrix",
-        );
-      }
-      const baselineSetSha256 = verificationBaselineSetSha256(manifest);
-      if (baselineSetSha256 !== identity.sha256) {
-        throw baselineError(
-          "approved baseline set hash does not match its identity",
-        );
-      }
-      const pngBytesByCase: Record<
-        string,
-        Partial<
-          Record<VerificationApprovedBaselineViewport, Uint8Array>
-        >
-      > = Object.create(null) as Record<
-        string,
-        Partial<
-          Record<VerificationApprovedBaselineViewport, Uint8Array>
-        >
-      >;
-      for (const entry of manifest.entries) {
-        const object = await readSafeRegularFile(
-          root,
-          entry.path,
-          true,
-          MAX_FILE_BYTES,
-        );
-        if (
-          object.bytes.byteLength === 0 ||
-          sha256(object.bytes) !== entry.sha256
-        ) {
-          throw baselineError(
-            "approved baseline PNG bytes do not match their object hash",
-          );
-        }
-        const dimensions = parsePngDimensions(object.bytes);
-        if (
-          dimensions.width !== entry.width ||
-          dimensions.height !== entry.height
-        ) {
-          throw baselineError(
-            "approved baseline PNG dimensions do not match its manifest",
-          );
-        }
-        const viewport =
-          entry.viewport as VerificationApprovedBaselineViewport;
-        const byViewport = pngBytesByCase[entry.case_id] ?? {};
-        byViewport[viewport] = Uint8Array.from(object.bytes);
-        pngBytesByCase[entry.case_id] = byViewport;
-      }
-      const immutablePngBytesByCase =
-        freezeApprovedBaselinePngBytesByCase(pngBytesByCase);
-      return {
-        manifest,
-        manifest_sha256: sha256(manifestFile.bytes),
-        baseline_set_sha256: baselineSetSha256,
-        png_bytes_by_case: immutablePngBytesByCase,
-      };
     } catch (error) {
       if (
         error instanceof ArkTeamError &&
@@ -722,6 +627,325 @@ export class VerificationArtifactStore {
     }
     return file.bytes;
   }
+}
+
+type ApprovedBaselineUiContract = Pick<
+  VerificationEnabledUiSelectorLane,
+  | "deterministic_adapter"
+  | "deterministic_adapter_version"
+  | "browser_build"
+  | "browser_cases"
+  | "viewports"
+>;
+
+export async function resolveApprovedBaselineSelector(
+  input: ResolveApprovedBaselineSelectorInput,
+): Promise<VerificationBaselineIdentity> {
+  try {
+    assertCanonicalAbsolutePath(input.project_root, "project root");
+    assertCanonicalRelativePath(input.baseline_root);
+    await assertExactDirectory(input.project_root, "project root");
+    const root = resolveBeneath(
+      input.project_root,
+      input.baseline_root,
+      "baseline root",
+    );
+    await assertExactDirectory(root, "baseline root");
+    await assertIgnoredUntrackedBaselineRoot(
+      input.project_root,
+      input.baseline_root,
+    );
+
+    const manifestDirectoryRelativePath =
+      `manifests/${input.selector.id}`;
+    const manifestDirectory = resolveBeneath(
+      root,
+      manifestDirectoryRelativePath,
+      "baseline manifest directory",
+    );
+    await assertExactDirectory(
+      manifestDirectory,
+      "baseline manifest directory",
+    );
+    const entries = await readdir(manifestDirectory, {
+      withFileTypes: true,
+    });
+    if (entries.length > MAX_FILES) {
+      throw baselineError(
+        "approved baseline selector exceeds the candidate limit",
+      );
+    }
+
+    const matching: VerificationBaselineIdentity[] = [];
+    for (const entry of entries.sort((left, right) =>
+      compareUtf8(left.name, right.name)
+    )) {
+      if (
+        !entry.isFile() ||
+        !/^[a-f0-9]{64}\.json$/.test(entry.name)
+      ) {
+        throw baselineError(
+          "approved baseline selector contains an invalid candidate entry",
+        );
+      }
+      const manifestRelativePath =
+        `${manifestDirectoryRelativePath}/${entry.name}`;
+      const { manifest } = await readApprovedBaselineManifest(
+        root,
+        manifestRelativePath,
+      );
+      const baselineSetSha256 =
+        verificationBaselineSetSha256(manifest);
+      if (
+        manifest.baseline_id !== input.selector.id ||
+        entry.name !== `${baselineSetSha256}.json`
+      ) {
+        throw baselineError(
+          "approved baseline candidate identity does not match its path",
+        );
+      }
+      if (
+        manifestMatchesSelector(
+          manifest,
+          input.selector,
+          input.source,
+          input.ui,
+        )
+      ) {
+        matching.push({
+          id: manifest.baseline_id,
+          sha256: baselineSetSha256,
+          source_commit: manifest.source_commit,
+          source_tree: manifest.source_tree,
+          environment: manifest.environment,
+        });
+      }
+    }
+    if (matching.length !== 1) {
+      throw baselineError(
+        "approved baseline selector must resolve exactly one candidate",
+      );
+    }
+    const identity = matching[0]!;
+    await verifyApprovedBaselineIdentity(root, identity, input.ui);
+    return identity;
+  } catch (error) {
+    if (
+      error instanceof ArkTeamError &&
+      error.code === "BASELINE_NOT_APPROVED"
+    ) {
+      throw error;
+    }
+    throw baselineError("approved baseline selector resolution failed", error);
+  }
+}
+
+async function assertIgnoredUntrackedBaselineRoot(
+  projectRoot: string,
+  baselineRoot: string,
+): Promise<void> {
+  try {
+    await execFileAsync(
+      "git",
+      [
+        "-C",
+        projectRoot,
+        "check-ignore",
+        "--no-index",
+        "--quiet",
+        "--",
+        baselineRoot,
+      ],
+      { encoding: "utf8", maxBuffer: MAX_METADATA_BYTES },
+    );
+    const tracked = await execFileAsync(
+      "git",
+      ["-C", projectRoot, "ls-files", "-z", "--", baselineRoot],
+      { encoding: "utf8", maxBuffer: MAX_METADATA_BYTES },
+    );
+    if (tracked.stdout.length > 0) {
+      throw baselineError(
+        "approved baseline root contains Git-tracked files",
+      );
+    }
+  } catch (error) {
+    if (
+      error instanceof ArkTeamError &&
+      error.code === "BASELINE_NOT_APPROVED"
+    ) {
+      throw error;
+    }
+    throw baselineError(
+      "approved baseline root must be Git-ignored and untracked",
+      error,
+    );
+  }
+}
+
+async function readApprovedBaselineManifest(
+  root: string,
+  manifestRelativePath: string,
+): Promise<{
+  manifest: VerificationApprovedBaselineManifest;
+  bytes: Buffer;
+}> {
+  const manifestFile = await readSafeRegularFile(
+    root,
+    manifestRelativePath,
+    true,
+    MAX_METADATA_BYTES,
+  );
+  let decoded: string;
+  let parsedJson: unknown;
+  try {
+    decoded = UTF8_DECODER.decode(manifestFile.bytes);
+    parsedJson = JSON.parse(decoded) as unknown;
+  } catch (error) {
+    throw baselineError(
+      "approved baseline manifest is not valid UTF-8 JSON",
+      error,
+    );
+  }
+  const parsed =
+    verificationApprovedBaselineManifestSchema.safeParse(parsedJson);
+  if (!parsed.success) {
+    throw baselineError(
+      "approved baseline manifest does not match strict schema v1",
+      parsed.error,
+    );
+  }
+  if (decoded !== canonicalJson(parsed.data)) {
+    throw baselineError("approved baseline manifest is not canonical JSON");
+  }
+  return { manifest: parsed.data, bytes: manifestFile.bytes };
+}
+
+function expectedBaselineEntryKeys(
+  ui: ApprovedBaselineUiContract,
+): string[] {
+  return [...ui.browser_cases]
+    .sort((left, right) => compareUtf8(left.id, right.id))
+    .flatMap((browserCase) =>
+      ui.viewports.map(
+        (viewport) => `${browserCase.id}\0${viewport}`,
+      ),
+    );
+}
+
+function manifestMatchesSelector(
+  manifest: VerificationApprovedBaselineManifest,
+  selector: VerificationBaselineSelector,
+  source: VerificationSourceIdentity,
+  ui: ApprovedBaselineUiContract,
+): boolean {
+  const actualEntryKeys = manifest.entries.map(
+    (entry) => `${entry.case_id}\0${entry.viewport}`,
+  );
+  return (
+    manifest.source_commit === source.source_commit &&
+    manifest.source_tree === source.source_tree &&
+    canonicalJson(manifest.environment) ===
+      canonicalJson(selector.environment) &&
+    manifest.adapter.name === ui.deterministic_adapter &&
+    manifest.adapter.version === ui.deterministic_adapter_version &&
+    manifest.browser_build === ui.browser_build &&
+    actualEntryKeys.join("\0") ===
+      expectedBaselineEntryKeys(ui).join("\0")
+  );
+}
+
+async function verifyApprovedBaselineIdentity(
+  root: string,
+  identity: VerificationBaselineIdentity,
+  ui: ApprovedBaselineUiContract,
+): Promise<VerificationApprovedBaselineResult> {
+  const manifestRelativePath =
+    `manifests/${identity.id}/${identity.sha256}.json`;
+  const manifestFile = await readApprovedBaselineManifest(
+    root,
+    manifestRelativePath,
+  );
+  const manifest = manifestFile.manifest;
+  if (
+    manifest.baseline_id !== identity.id ||
+    manifest.source_commit !== identity.source_commit ||
+    manifest.source_tree !== identity.source_tree ||
+    canonicalJson(manifest.environment) !==
+      canonicalJson(identity.environment) ||
+    manifest.adapter.name !== ui.deterministic_adapter ||
+    manifest.adapter.version !== ui.deterministic_adapter_version ||
+    manifest.browser_build !== ui.browser_build
+  ) {
+    throw baselineError(
+      "approved baseline manifest does not match the snapshot",
+    );
+  }
+  const actualEntryKeys = manifest.entries.map(
+    (entry) => `${entry.case_id}\0${entry.viewport}`,
+  );
+  if (
+    actualEntryKeys.join("\0") !==
+    expectedBaselineEntryKeys(ui).join("\0")
+  ) {
+    throw baselineError(
+      "approved baseline manifest does not cover the exact case and viewport matrix",
+    );
+  }
+  const baselineSetSha256 = verificationBaselineSetSha256(manifest);
+  if (baselineSetSha256 !== identity.sha256) {
+    throw baselineError(
+      "approved baseline set hash does not match its identity",
+    );
+  }
+
+  const pngBytesByCase: Record<
+    string,
+    Partial<
+      Record<VerificationApprovedBaselineViewport, Uint8Array>
+    >
+  > = Object.create(null) as Record<
+    string,
+    Partial<
+      Record<VerificationApprovedBaselineViewport, Uint8Array>
+    >
+  >;
+  for (const entry of manifest.entries) {
+    const object = await readSafeRegularFile(
+      root,
+      entry.path,
+      true,
+      MAX_FILE_BYTES,
+    );
+    if (
+      object.bytes.byteLength === 0 ||
+      sha256(object.bytes) !== entry.sha256
+    ) {
+      throw baselineError(
+        "approved baseline PNG bytes do not match their object hash",
+      );
+    }
+    const dimensions = parsePngDimensions(object.bytes);
+    if (
+      dimensions.width !== entry.width ||
+      dimensions.height !== entry.height
+    ) {
+      throw baselineError(
+        "approved baseline PNG dimensions do not match its manifest",
+      );
+    }
+    const viewport =
+      entry.viewport as VerificationApprovedBaselineViewport;
+    const byViewport = pngBytesByCase[entry.case_id] ?? {};
+    byViewport[viewport] = Uint8Array.from(object.bytes);
+    pngBytesByCase[entry.case_id] = byViewport;
+  }
+  return {
+    manifest,
+    manifest_sha256: sha256(manifestFile.bytes),
+    baseline_set_sha256: baselineSetSha256,
+    png_bytes_by_case:
+      freezeApprovedBaselinePngBytesByCase(pngBytesByCase),
+  };
 }
 
 function freezeApprovedBaselinePngBytesByCase(

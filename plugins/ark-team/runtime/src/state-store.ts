@@ -96,12 +96,15 @@ import {
   verificationEvidenceDisposition,
   verificationErrorCodeSchema,
   verificationErrorDisposition,
+  verificationCoordinatorConfigV2Schema,
   verificationRecordMatchesSnapshot,
+  verificationResolvedConfigMatchesProjectConfig,
   verificationRollbackRecordSchema,
   verificationRunSnapshotSha256,
   verificationSpecDeltaRecordSchema,
 } from "./verification-contract.js";
 import {
+  resolveApprovedBaselineSelector,
   VerificationArtifactStore,
   type VerificationApprovedBaselinePngBytesByCase,
 } from "./verification-artifact-store.js";
@@ -704,6 +707,42 @@ export class RunStore {
       const source = await this.verificationSourceLoader(
         persisted.run.project_path,
       );
+      let resolvedCoordinator;
+      if (
+        coordinator.ui.enabled &&
+        "baseline_selector" in coordinator.ui
+      ) {
+        const baselineIdentity =
+          await resolveApprovedBaselineSelector({
+            project_root: persisted.run.project_path,
+            baseline_root: coordinator.ui.baseline_root,
+            selector: coordinator.ui.baseline_selector,
+            source,
+            ui: coordinator.ui,
+          });
+        const {
+          baseline_selector: _baselineSelector,
+          ...resolvedUi
+        } = coordinator.ui;
+        resolvedCoordinator =
+          verificationCoordinatorConfigV2Schema.safeParse({
+            ...coordinator,
+            ui: {
+              ...resolvedUi,
+              baseline_identity: baselineIdentity,
+            },
+          });
+      } else {
+        resolvedCoordinator =
+          verificationCoordinatorConfigV2Schema.safeParse(coordinator);
+      }
+      if (!resolvedCoordinator.success) {
+        throw new ArkTeamError(
+          "CONFIG_INVALID",
+          "verification coordinator could not resolve an immutable baseline identity",
+          { cause: resolvedCoordinator.error },
+        );
+      }
       const timestamp = this.now().toISOString();
       const snapshot = buildVerificationRunSnapshot({
         run_id: persisted.run.run_id,
@@ -716,7 +755,7 @@ export class RunStore {
         created_at_utc: timestamp,
         package_fingerprint: input.package_fingerprint,
         source,
-        config: coordinator,
+        config: resolvedCoordinator.data,
       });
       const artifactStore = new VerificationArtifactStore({
         state_root: this.root_path,
@@ -5656,8 +5695,10 @@ export class RunStore {
     if (
       coordinator === null ||
       run.project_config_sha256 !== projectConfigSha256(run.project_config) ||
-      snapshot.resolved_config_sha256 !==
-        sha256CanonicalJson(coordinator) ||
+      !verificationResolvedConfigMatchesProjectConfig(
+        coordinator,
+        snapshot.resolved_config,
+      ) ||
       snapshot.resolved_config_sha256 !==
         sha256CanonicalJson(snapshot.resolved_config)
     ) {
